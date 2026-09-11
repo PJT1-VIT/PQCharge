@@ -12,11 +12,12 @@ that is Day 7, jointly with Track B, and crypto/stub.py raises on every
 call until then. Stage 1's job is to prove the protocol layer is
 correct before anything cryptographic can hide a bug inside it.
 
-Message handlers (BootNotification, Heartbeat, StatusNotification,
-Authorize, TransactionEvent) arrive in csms/handlers.py on Days 4-5.
-Until then a connected station is accepted, registered and tracked, but
-any OCPP action it sends is answered with a protocol-level "not
-supported" by the ocpp library. That is the correct Phase A1 behaviour.
+Message handlers live in csms/handlers.py. As of Phase A2 that covers
+BootNotification, Heartbeat and StatusNotification. Authorize and
+TransactionEvent arrive in Phase A3 (Day 5); until then a station
+sending either is answered with a protocol-level "not supported" by the
+ocpp library, which is the correct behaviour for an unimplemented
+action.
 
 --------------------------------------------------------------------
 ONE PORT, TWO PROTOCOLS
@@ -56,16 +57,15 @@ import logging
 import signal
 from http import HTTPStatus
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from websockets.datastructures import Headers
 from websockets.exceptions import ConnectionClosed
 from websockets.http11 import Response
 from websockets.asyncio.server import serve
 
-from ocpp.v201 import ChargePoint as CpBase
-
 from csms.events import EventLog, EventType, Outcome
+from csms.handlers import DEFAULT_HEARTBEAT_INTERVAL_S, CSMSHandlers
 from csms.registry import SessionRegistry
 from idmanager.stub import StubController
 
@@ -86,6 +86,35 @@ path after everything is built on top of it.
 
 The server does not branch on which was negotiated. That is Stage 6's
 work, and it belongs in the capability registry, not here.
+"""
+
+DEFAULT_WS_PING_INTERVAL_S: float | None = 20.0
+DEFAULT_WS_PING_TIMEOUT_S: float | None = 20.0
+"""WebSocket-level keepalive. NOT the OCPP Heartbeat.
+
+Two different mechanisms, one layer apart, and they must not be
+confused. OCPP Heartbeat is an application message a station sends on
+the interval the CSMS issued. This is the WebSocket protocol's own
+ping/pong: the server pings every open connection every
+ws_ping_interval seconds and CLOSES any connection that fails to pong
+within ws_ping_timeout.
+
+WHY THIS IS EXPOSED AS A FLAG, AND WHY E2 SHOULD DISABLE IT.
+
+E2 kills the CSMS and has the whole fleet reconnect at once, performing
+post-quantum handshakes. That is a CPU spike across hundreds of agent
+processes on one machine. An agent whose event loop is saturated may
+pong late -- and the server would then drop a station that was
+recovering perfectly well. That disconnection lands in the dataset as a
+station that failed to recover, and the reported cost of post-quantum
+migration would partly be the cost of our own keepalive.
+
+OCPP Heartbeat already provides liveness at the application layer, so
+the WebSocket ping adds nothing this system needs and can only add
+noise to the one measurement the project is built on. Run E2 with
+--ws-ping-interval 0.
+
+Set to None (via 0 on the command line) to disable entirely.
 """
 
 
@@ -114,14 +143,27 @@ def _station_id_from_path(path: str) -> str:
     """
     Extract the station identity from the connection path.
 
-    Convention, frozen with Track C so that agent/client.py matches:
+    Our own convention, frozen with Track C so that agent/client.py
+    matches experiments/smoke_test.py:
 
         ws://host:port/{station_id}
 
-    matching experiments/smoke_test.py. The query string is stripped,
-    so a station may append parameters without corrupting its own ID.
+    The LAST non-empty path segment is taken, not the whole stripped
+    path, and this is deliberate. E6 connects a third-party OCPP client
+    to this CSMS, and independent implementations commonly use a longer
+    path -- /ocpp/{id}, or a full service route. Stripping slashes off
+    the whole path would turn "/ocpp/CP001" into the station id
+    "ocpp/CP001": not a crash, just a silently wrong identity flowing
+    into the registry, the event log and the dashboard, discovered on
+    Day 10 under time pressure. Taking the last segment accepts both
+    shapes and costs nothing.
+
+    The query string is discarded, so a station may append parameters
+    without corrupting its own ID. Percent-encoding is decoded, because
+    a conformant client is entitled to encode the path segment.
     """
-    return urlparse(path).path.strip("/")
+    segments = [s for s in urlparse(path).path.split("/") if s]
+    return unquote(segments[-1]) if segments else ""
 
 
 class CSMS:
@@ -140,10 +182,18 @@ class CSMS:
         port: int = DEFAULT_PORT,
         crypto_mode: str = "classical",
         log_path: str = "logs/events.jsonl",
+        heartbeat_interval_s: int = DEFAULT_HEARTBEAT_INTERVAL_S,
+        log_messages: bool = False,
+        ws_ping_interval: float | None = DEFAULT_WS_PING_INTERVAL_S,
+        ws_ping_timeout: float | None = DEFAULT_WS_PING_TIMEOUT_S,
     ) -> None:
         self.host = host
         self.port = port
         self.crypto_mode = crypto_mode
+        self.heartbeat_interval_s = heartbeat_interval_s
+        self.log_messages = log_messages
+        self.ws_ping_interval = ws_ping_interval
+        self.ws_ping_timeout = ws_ping_timeout
 
         self.log = EventLog(path=log_path, crypto_mode=crypto_mode)
         """Contract 3. Created here and shared, because run_id must be
@@ -193,7 +243,14 @@ class CSMS:
             await websocket.close(code=1008, reason="station id required in path")
             return
 
-        charge_point = CpBase(station_id, websocket)
+        charge_point = CSMSHandlers(
+            station_id,
+            websocket,
+            registry=self.registry,
+            event_log=self.log,
+            heartbeat_interval_s=self.heartbeat_interval_s,
+            log_messages=self.log_messages,
+        )
         self.registry.register(station_id, charge_point)
         LOGGER.info("station connected: %s", station_id)
 
@@ -353,7 +410,15 @@ class CSMS:
             host=self.host,
             port=self.port,
             subprotocols=SUBPROTOCOLS,
+            heartbeat_interval_s=self.heartbeat_interval_s,
+            log_messages=self.log_messages,
+            ws_ping_interval=self.ws_ping_interval,
+            ws_ping_timeout=self.ws_ping_timeout,
         )
+        # Every parameter that can affect a measurement is recorded on the
+        # SERVER_STARTED event, so a run's configuration is recoverable from
+        # its own log rather than from someone's memory of which flags they
+        # typed. Section 18 asks for results reproducible from logged data.
 
         stop = asyncio.get_running_loop().create_future()
         self._install_signal_handlers(stop)
@@ -364,8 +429,8 @@ class CSMS:
             self.port,
             subprotocols=SUBPROTOCOLS,
             process_request=self.process_request,
-            ping_interval=20,
-            ping_timeout=20,
+            ping_interval=self.ws_ping_interval,
+            ping_timeout=self.ws_ping_timeout,
         ):
             LOGGER.info(
                 "CSMS listening — ws://%s:%d/{station_id} · "
@@ -413,6 +478,33 @@ def main() -> None:
         help="crypto mode recorded on every event; no crypto runs until Day 7",
     )
     parser.add_argument("--log", default="logs/events.jsonl")
+    parser.add_argument(
+        "--heartbeat-interval",
+        type=int,
+        default=DEFAULT_HEARTBEAT_INTERVAL_S,
+        help="seconds; handed to each station in its BootNotification response",
+    )
+    parser.add_argument(
+        "--log-messages",
+        action="store_true",
+        help="emit a MESSAGE_RECEIVED event per OCPP message; off by default "
+             "because at fleet scale it dominates the event log",
+    )
+    parser.add_argument(
+        "--ws-ping-interval",
+        type=float,
+        default=DEFAULT_WS_PING_INTERVAL_S,
+        help="WebSocket keepalive ping interval in seconds; 0 disables. "
+             "NOT the OCPP Heartbeat. Use 0 for E2 runs — see the module "
+             "docstring for why",
+    )
+    parser.add_argument(
+        "--ws-ping-timeout",
+        type=float,
+        default=DEFAULT_WS_PING_TIMEOUT_S,
+        help="seconds to wait for a pong before closing the connection; "
+             "0 disables",
+    )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -422,7 +514,14 @@ def main() -> None:
     )
 
     csms = CSMS(
-        host=args.host, port=args.port, crypto_mode=args.mode, log_path=args.log
+        host=args.host,
+        port=args.port,
+        crypto_mode=args.mode,
+        log_path=args.log,
+        heartbeat_interval_s=args.heartbeat_interval,
+        log_messages=args.log_messages,
+        ws_ping_interval=args.ws_ping_interval or None,
+        ws_ping_timeout=args.ws_ping_timeout or None,
     )
     try:
         asyncio.run(csms.run())
