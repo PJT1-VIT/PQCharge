@@ -64,6 +64,7 @@ from websockets.exceptions import ConnectionClosed
 from websockets.http11 import Response
 from websockets.asyncio.server import serve
 
+from csms.authorization import AUTH_MODES, AuthorizationPolicy
 from csms.events import EventLog, EventType, Outcome
 from csms.handlers import DEFAULT_HEARTBEAT_INTERVAL_S, CSMSHandlers
 from csms.registry import SessionRegistry
@@ -186,6 +187,7 @@ class CSMS:
         log_messages: bool = False,
         ws_ping_interval: float | None = DEFAULT_WS_PING_INTERVAL_S,
         ws_ping_timeout: float | None = DEFAULT_WS_PING_TIMEOUT_S,
+        auth_policy: AuthorizationPolicy | None = None,
     ) -> None:
         self.host = host
         self.port = port
@@ -194,6 +196,7 @@ class CSMS:
         self.log_messages = log_messages
         self.ws_ping_interval = ws_ping_interval
         self.ws_ping_timeout = ws_ping_timeout
+        self.auth_policy = auth_policy or AuthorizationPolicy()
 
         self.log = EventLog(path=log_path, crypto_mode=crypto_mode)
         """Contract 3. Created here and shared, because run_id must be
@@ -250,6 +253,7 @@ class CSMS:
             event_log=self.log,
             heartbeat_interval_s=self.heartbeat_interval_s,
             log_messages=self.log_messages,
+            auth_policy=self.auth_policy,
         )
         self.registry.register(station_id, charge_point)
         LOGGER.info("station connected: %s", station_id)
@@ -414,6 +418,7 @@ class CSMS:
             log_messages=self.log_messages,
             ws_ping_interval=self.ws_ping_interval,
             ws_ping_timeout=self.ws_ping_timeout,
+            **self.auth_policy.describe(),
         )
         # Every parameter that can affect a measurement is recorded on the
         # SERVER_STARTED event, so a run's configuration is recoverable from
@@ -505,12 +510,32 @@ def main() -> None:
         help="seconds to wait for a pong before closing the connection; "
              "0 disables",
     )
+    parser.add_argument(
+        "--auth-mode",
+        default="allowlist",
+        choices=AUTH_MODES,
+        help="allowlist uses the seeded token list; accept-all authorises "
+             "every token — the escape hatch for integrating with an agent "
+             "whose tokens have not been agreed yet",
+    )
+    parser.add_argument(
+        "--id-tokens",
+        default=None,
+        help='JSON file of {"TAG-0001": "Accepted", ...} replacing the '
+             "seeded token list",
+    )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+    )
+
+    auth_policy = (
+        AuthorizationPolicy.from_file(args.id_tokens, mode=args.auth_mode)
+        if args.id_tokens
+        else AuthorizationPolicy(mode=args.auth_mode)
     )
 
     csms = CSMS(
@@ -522,6 +547,7 @@ def main() -> None:
         log_messages=args.log_messages,
         ws_ping_interval=args.ws_ping_interval or None,
         ws_ping_timeout=args.ws_ping_timeout or None,
+        auth_policy=auth_policy,
     )
     try:
         asyncio.run(csms.run())

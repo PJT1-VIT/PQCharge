@@ -88,6 +88,25 @@ class StationSession:
     than recomputed at snapshot time so the dashboard's latency panel is
     a field read, not a log scan."""
 
+    last_meter_at: datetime | None = None
+    """The station's own timestamp on the most recent meter reading
+    applied to live state.
+
+    Exists to reject stale readings. A station that queued
+    TransactionEvents while the CSMS was down replays them on
+    reconnect, carrying timestamps minutes old. Without this guard a
+    replayed backlog would overwrite live power and energy with
+    historical values -- and aggregate_power_w, the number the whole E5
+    demonstration turns on, would jump backwards on the dashboard at
+    exactly the moment the fleet is being watched recover."""
+
+    last_seq_no: int | None = None
+    """seqNo of the last TransactionEvent seen for the active
+    transaction. OCPP increments it per transaction, so a jump in the
+    sequence is direct evidence that events were lost -- worth having
+    during an E2 reconnection storm, and impossible to reconstruct
+    afterwards."""
+
     bytes_tx: int = 0
     bytes_rx: int = 0
     """Day 7 instrumentation. Present now so that adding the counters
@@ -260,6 +279,8 @@ class SessionRegistry(FleetView):
             session.charging_state = charging_state
         if transaction_id is None:
             session.power_w = 0.0
+            session.last_meter_at = None
+            session.last_seq_no = None
 
     def record_meter(
         self,
@@ -267,16 +288,74 @@ class SessionRegistry(FleetView):
         *,
         power_w: float | None = None,
         energy_wh: float | None = None,
-    ) -> None:
-        """Meter values from TransactionEvent. Watts and watt-hours,
-        matching Contract 5's units."""
+        reading_at: datetime | None = None,
+    ) -> bool:
+        """
+        Apply meter values from a TransactionEvent to live state.
+
+        Watts and watt-hours, matching Contract 5's units.
+
+        Args:
+            reading_at: the station's own timestamp for the reading. A
+                reading older than the last one applied is REJECTED for
+                live state -- see StationSession.last_meter_at. The
+                caller still records it to the event log, so nothing is
+                lost from the dataset; it simply does not claim to be
+                the present.
+
+        Returns:
+            True if live state was updated, False if the reading was
+            stale. The caller logs the difference, which is how a run
+            can report how much offline replay actually occurred.
+        """
         session = self._sessions.get(station_id)
         if session is None:
-            return
+            return False
+
+        if (
+            reading_at is not None
+            and session.last_meter_at is not None
+            and reading_at < session.last_meter_at
+        ):
+            return False
+
         if power_w is not None:
             session.power_w = power_w
         if energy_wh is not None:
             session.energy_wh = energy_wh
+        if reading_at is not None:
+            session.last_meter_at = reading_at
+        return True
+
+    def record_sequence(self, station_id: str, seq_no: int) -> int:
+        """
+        Track a TransactionEvent's seqNo and report any gap.
+
+        Returns:
+            How many events appear to be missing before this one. 0 for
+            an in-order event, for the first event of a transaction, or
+            for a repeat -- a duplicate is not a loss.
+
+        A non-zero return during E2 is evidence that the reconnection
+        storm dropped messages, which is a finding rather than a bug to
+        hide. Out-of-order and duplicate events are both possible when
+        a station replays a queue, so only a forward jump counts.
+        """
+        session = self._sessions.get(station_id)
+        if session is None:
+            return 0
+        previous = session.last_seq_no
+        session.last_seq_no = seq_no
+        if previous is None or seq_no <= previous:
+            return 0
+        return seq_no - previous - 1
+
+    def reset_sequence(self, station_id: str) -> None:
+        """Start a fresh sequence. Called when a transaction starts."""
+        session = self._sessions.get(station_id)
+        if session is not None:
+            session.last_seq_no = None
+            session.last_meter_at = None
 
     # -- Contract 6: FleetView read ------------------------------------
 
