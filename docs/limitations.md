@@ -40,6 +40,23 @@ crypto provider interface, so an in-TLS or an application-layer
 post-quantum handshake satisfies the same contract, with a timeboxed
 decision point at Stage 4.
 
+
+
+### R4 — Certificates carry no Subject Alternative Name
+crypto/ca.py issues certificates with Common Name only. Verified that
+Python's ssl module accepts this via OpenSSL's CN-fallback (mutual TLS
+handshake tested end to end, Day 6). Not yet tested against a
+third-party TLS stack for E6 interoperability -- some implementations
+enforce SAN strictly. Revisit if E6 fails on certificate verification.
+
+### R5 — Windows-specific socket teardown race in test harnesses
+A TLS test client closing its socket immediately after reading the
+peer certificate can trigger WinError 10053 on the server side, if the
+server hasn't finished its own read before the closure arrives. Not
+present on Linux in the same code. Fixed by an explicit one-byte
+acknowledgment exchanged over the TLS channel before either side
+closes, rather than relying on timing.
+
 ---
 
 ## Limitations encountered during implementation
