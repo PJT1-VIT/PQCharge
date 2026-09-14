@@ -83,6 +83,14 @@ USAGE
     python tests/fixtures/fake_csms.py --delay-s 2.0
     python tests/fixtures/fake_csms.py --drop-after 5
     python tests/fixtures/fake_csms.py --reject-connections
+
+    # command dispatch (Phase C3) -- stands in for csms/dispatch.py
+    python -m tests.fixtures.fake_csms --set-limit-w 0        # curtail
+    python -m tests.fixtures.fake_csms --set-limit-w 3700
+    python -m tests.fixtures.fake_csms --set-limit-w 16 --limit-unit A
+    python -m tests.fixtures.fake_csms --set-limit-w 0 --clear-after 8
+    python -m tests.fixtures.fake_csms --stop-after 6
+    python -m tests.fixtures.fake_csms --trigger-after 5
 --------------------------------------------------------------------
 """
 
@@ -105,7 +113,7 @@ from websockets.exceptions import ConnectionClosed
 
 from ocpp.routing import on
 from ocpp.v201 import ChargePoint as CpBase
-from ocpp.v201 import call_result
+from ocpp.v201 import call, call_result
 
 # Track C's shared logging, so this fixture exercises the same setup the
 # real agent uses. If logging_setup is broken, running this file shows it
@@ -209,6 +217,117 @@ class FaultConfig:
     everything, mirroring the real server's --auth-mode escape hatch."""
 
 
+# =====================================================================
+# COMMAND DISPATCH (Phase C3)
+# =====================================================================
+#
+# *** WHY THIS LIVES IN A TEST FIXTURE ***
+#
+# csms/dispatch.py -- Track A's Days 8-9 work, the real server's
+# outbound command path -- DOES NOT EXIST YET. Phase C3 builds the
+# agent's half: the handlers that receive SetChargingProfile,
+# RequestStopTransaction and friends, and act on them physically.
+#
+# Waiting for Track A would mean either blocking C3 or, worse, writing
+# the agent's handlers untested and finding out at integration time.
+# Teaching this fixture to originate the same commands unblocks C3
+# completely, and when the real dispatcher lands NOTHING IN agent/
+# CHANGES -- the agent cannot tell which server sent the command.
+#
+# The rule from the top of this file still applies: this fixture proves
+# the agent's behaviour, it does not prove the integration. Once
+# csms/dispatch.py exists, the happy paths must be re-run against it.
+
+
+@dataclass
+class CommandPlan:
+    """
+    Commands to send to a station, and when.
+
+    "When" is measured in messages received from that station, not in
+    seconds. Timing a command by the clock makes a test that passes on a
+    fast machine and fails on a loaded one; counting messages puts the
+    command at a deterministic point in the session every time.
+    """
+
+    set_limit_w: float | None = None
+    """Send SetChargingProfile with this limit. 0 is the curtailment
+    case -- the one E5 is built on."""
+
+    limit_unit: str = "W"
+    """"W" or "A". Sending "A" exercises the agent's amps conversion,
+    which is the single most plausible place for a silent factor-of-230
+    error in the whole actuation path."""
+
+    after_messages: int = 3
+    """Fire once the station has sent this many messages. 3 puts it
+    shortly after the transaction starts (boot, status, authorize,
+    status, Started...) without depending on exact ordering."""
+
+    clear_after_messages: int = 0
+    """Send ClearChargingProfile at this message count. 0 disables."""
+
+    stop_after_messages: int = 0
+    """Send RequestStopTransaction at this message count. 0 disables."""
+
+    trigger_after_messages: int = 0
+    """Send TriggerMessage at this message count. 0 disables."""
+
+    trigger_message: str = "StatusNotification"
+    """What to ask for."""
+
+    def is_empty(self) -> bool:
+        return not any((
+            self.set_limit_w is not None,
+            self.clear_after_messages,
+            self.stop_after_messages,
+            self.trigger_after_messages,
+        ))
+
+
+def build_charging_profile(
+    limit: float,
+    *,
+    unit: str = "W",
+    profile_id: int = 100,
+    stack_level: int = 0,
+    purpose: str = "TxDefaultProfile",
+    number_phases: int | None = None,
+) -> dict:
+    """
+    A minimal, schema-valid OCPP 2.0.1 charging profile.
+
+    Written out in full rather than hidden behind defaults, because the
+    nesting is the part that is easy to get wrong and this is the
+    reference the real csms/dispatch.py should copy:
+
+        chargingProfile
+          └─ chargingSchedule            (a LIST)
+               └─ chargingSchedulePeriod (also a LIST)
+                    └─ limit             <- the number that matters
+
+    Keys are snake_case here. The ocpp library converts them to the
+    camelCase the wire requires, recursively, when the call is sent.
+    """
+    period: dict[str, Any] = {"start_period": 0, "limit": limit}
+    if number_phases is not None:
+        period["number_phases"] = number_phases
+
+    return {
+        "id": profile_id,
+        "stack_level": stack_level,
+        "charging_profile_purpose": purpose,
+        "charging_profile_kind": "Absolute",
+        "charging_schedule": [
+            {
+                "id": 1,
+                "charging_rate_unit": unit,
+                "charging_schedule_period": [period],
+            }
+        ],
+    }
+
+
 class FakeCSMSHandlers(CpBase):
     """
     One instance per connected station, for the length of that connection.
@@ -236,6 +355,44 @@ class FakeCSMSHandlers(CpBase):
         self.message_count = 0
         self.log = get_logger(__name__, station_id=station_id)
 
+        # -- what this server saw, for tests to assert on (Phase C3) ----
+        #
+        # A fake server that only logs is a fake server every test has to
+        # scrape stdout to use. Recording the interesting fields turns
+        # "did the curtailment take effect" into one list comparison.
+
+        self.statuses: list[str] = []
+        """Every connector_status received, in order."""
+
+        self.charging_states: list[str] = []
+        """Every charging_state received, in order."""
+
+        self.trigger_reasons: list[str] = []
+        """Every TransactionEvent trigger_reason, in order. This is how a
+        test proves a curtailment is IDENTIFIABLE in the event log and
+        not just present -- ChargingStateChanged rather than
+        MeterValuePeriodic."""
+
+        self.power_readings: list[float] = []
+        """Every Power.Active.Import value received, in watts. The
+        actual evidence that actuation worked."""
+
+        self.energy_readings: list[float] = []
+
+        self.last_transaction_id: str | None = None
+        """So a RequestStopTransaction can name the right transaction
+        without the test having to guess it."""
+
+        self.command_results: list[tuple[str, str]] = []
+        """(action, status) for every command this server SENT. A
+        command the agent rejected shows up here, which is the
+        difference between "the agent ignored us" and "the agent told us
+        why it would not comply"."""
+
+        self._message_event = asyncio.Event()
+        """Pulsed on every inbound message so wait_for_messages() can
+        fire a command at a deterministic point in the session."""
+
     # -- shared behaviour for every handler ------------------------------
 
     async def _pre(self, action: str) -> None:
@@ -247,6 +404,13 @@ class FakeCSMSHandlers(CpBase):
         """
         self.message_count += 1
         self.log.debug("<- %s (message #%d)", action, self.message_count)
+
+        # Wake anything waiting on a message count. Set-then-clear is a
+        # pulse: waiters re-check the count themselves, so a waiter that
+        # arrives late is not left hanging on an event that was already
+        # consumed.
+        self._message_event.set()
+        self._message_event.clear()
 
         if self.faults.delay_s > 0:
             self.log.debug("stalling %.2fs before answering %s",
@@ -324,6 +488,7 @@ class FakeCSMSHandlers(CpBase):
     ):
         """A physical connector state change — the CPS sensing path."""
         await self._pre("StatusNotification")
+        self.statuses.append(connector_status)
         self.log.info(
             "status -> %s (evse=%s connector=%s)",
             connector_status, evse_id, connector_id,
@@ -376,15 +541,159 @@ class FakeCSMSHandlers(CpBase):
         """
         await self._pre("TransactionEvent")
 
-        tx_id = (transaction_info or {}).get("transaction_id", "?")
-        readings = _summarise_meter_values(kwargs.get("meter_value") or [])
+        info = transaction_info or {}
+        tx_id = info.get("transaction_id", "?")
+        meter_values = kwargs.get("meter_value") or []
+        readings = _summarise_meter_values(meter_values)
+
+        # -- record, so tests can assert instead of scraping the log ----
+        self.last_transaction_id = info.get("transaction_id") or self.last_transaction_id
+        if info.get("charging_state"):
+            self.charging_states.append(info["charging_state"])
+        self.trigger_reasons.append(trigger_reason)
+
+        power, energy = _extract_power_and_energy(meter_values)
+        if power is not None:
+            self.power_readings.append(power)
+        if energy is not None:
+            self.energy_readings.append(energy)
 
         self.log.info(
-            "transaction %s seq=%s tx=%s%s",
-            event_type, seq_no, tx_id,
+            "transaction %s seq=%s tx=%s trigger=%s state=%s%s",
+            event_type, seq_no, tx_id, trigger_reason,
+            info.get("charging_state", "-"),
             f" [{readings}]" if readings else "",
         )
         return call_result.TransactionEvent()
+
+    # =================================================================
+    # OUTBOUND — the server telling the station what to do (Phase C3)
+    # =================================================================
+    #
+    # *** THESE MUST BE CALLED FROM A SEPARATE TASK, NEVER FROM A
+    #     HANDLER ABOVE. ***
+    #
+    # call() awaits a response that arrives through this ChargePoint's
+    # own receive loop -- the one running inside start(). A handler that
+    # calls one of these is waiting for a message that cannot be read
+    # until the handler returns. That is a deadlock, and it presents as
+    # the connection freezing until the response timeout fires.
+    #
+    # FakeCSMS._run_command_plan() runs them in their own task, which is
+    # the pattern csms/dispatch.py must also follow.
+
+    async def wait_for_messages(self, count: int, timeout: float = 15.0) -> bool:
+        """
+        Block until this station has sent `count` messages.
+
+        Returns False on timeout rather than raising, so a command plan
+        that never fires ends the run with a clear log line instead of a
+        traceback that buries whatever actually went wrong.
+        """
+        deadline = asyncio.get_running_loop().time() + timeout
+        while self.message_count < count:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                self.log.warning(
+                    "timed out waiting for %d messages (saw %d); the command "
+                    "plan will not fire", count, self.message_count,
+                )
+                return False
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self._message_event.wait(), remaining)
+        return True
+
+    async def _dispatch(self, action: str, request: Any) -> str:
+        """
+        Send one command and report the status the station answered.
+
+        suppress=False for the same reason agent/client.py uses it: a
+        CALLError would otherwise come back as None and this fixture
+        would record a command as having been delivered when the station
+        in fact refused to parse it.
+        """
+        self.log.info("-> %s", action)
+        try:
+            response = await self.call(request, suppress=False)
+        except Exception as exc:  # noqa: BLE001 - a fixture reports, never crashes
+            self.log.error("%s failed: %s: %s", action, type(exc).__name__, exc)
+            self.command_results.append((action, f"error:{type(exc).__name__}"))
+            return "error"
+
+        status = str(getattr(response, "status", "?"))
+        info = getattr(response, "status_info", None)
+        self.command_results.append((action, status))
+
+        if status in ("Accepted",):
+            self.log.info("%s -> %s", action, status)
+        else:
+            # The station refusing is a RESULT, not a fault. Logged at
+            # warning with the reason it gave, because "the agent said
+            # no and here is why" is the most useful line in the file
+            # when an actuation test fails.
+            self.log.warning("%s -> %s (%s)", action, status, info)
+        return status
+
+    async def send_set_charging_profile(
+        self,
+        limit: float,
+        *,
+        unit: str = "W",
+        evse_id: int = 1,
+        profile_id: int = 100,
+        purpose: str = "TxDefaultProfile",
+        number_phases: int | None = None,
+    ) -> str:
+        """Cap the station's power. limit=0 is curtailment."""
+        return await self._dispatch(
+            "SetChargingProfile",
+            call.SetChargingProfile(
+                evse_id=evse_id,
+                charging_profile=build_charging_profile(
+                    limit,
+                    unit=unit,
+                    profile_id=profile_id,
+                    purpose=purpose,
+                    number_phases=number_phases,
+                ),
+            ),
+        )
+
+    async def send_clear_charging_profile(
+        self, profile_id: int | None = None
+    ) -> str:
+        """Remove the cap; the station returns to its own maximum."""
+        request = (
+            call.ClearChargingProfile(charging_profile_id=profile_id)
+            if profile_id is not None
+            else call.ClearChargingProfile()
+        )
+        return await self._dispatch("ClearChargingProfile", request)
+
+    async def send_request_stop_transaction(
+        self, transaction_id: str | None = None
+    ) -> str:
+        """
+        Stop the transaction. OCPP 2.0.1 spelling.
+
+        NOTE FOR TRACK A: this action is RequestStopTransaction. OCPP
+        1.6's RemoteStopTransaction does not exist in 2.0.1 and the
+        library will not serialise it.
+        """
+        tx_id = transaction_id or self.last_transaction_id or ""
+        return await self._dispatch(
+            "RequestStopTransaction",
+            call.RequestStopTransaction(transaction_id=tx_id),
+        )
+
+    async def send_trigger_message(
+        self, requested_message: str = "StatusNotification"
+    ) -> str:
+        """Ask for one message to be re-sent now."""
+        return await self._dispatch(
+            "TriggerMessage",
+            call.TriggerMessage(requested_message=requested_message),
+        )
 
 
 def _summarise_meter_values(meter_values: list[dict]) -> str:
@@ -404,6 +713,30 @@ def _summarise_meter_values(meter_values: list[dict]) -> str:
     return " ".join(parts)
 
 
+def _extract_power_and_energy(
+    meter_values: list[dict],
+) -> tuple[float | None, float | None]:
+    """
+    Pull the two numbers a test actually cares about out of the nesting.
+
+    Matches by measurand label rather than by position, exactly as
+    csms/metering.py does, so a test asserting on these is asserting on
+    what the REAL server would have understood -- not on the order the
+    agent happened to put them in.
+    """
+    power: float | None = None
+    energy: float | None = None
+    for entry in meter_values:
+        for sample in entry.get("sampled_value", []) or []:
+            measurand = sample.get("measurand")
+            value = sample.get("value")
+            if measurand == "Power.Active.Import":
+                power = float(value) if value is not None else None
+            elif measurand == "Energy.Active.Import.Register":
+                energy = float(value) if value is not None else None
+    return power, energy
+
+
 class FakeCSMS:
     """The server itself: accepts connections and hands each to a handler."""
 
@@ -414,12 +747,14 @@ class FakeCSMS:
         interval_s: int = DEFAULT_HEARTBEAT_INTERVAL_S,
         faults: FaultConfig | None = None,
         tokens: dict[str, str] | None = None,
+        commands: CommandPlan | None = None,
     ) -> None:
         self.host = host
         self.port = port
         self.interval_s = interval_s
         self.faults = faults or FaultConfig()
         self.tokens = dict(tokens or DEFAULT_ID_TOKENS)
+        self.commands = commands or CommandPlan()
         self.log = get_logger(__name__)
 
         self.connections: list[FakeCSMSHandlers] = []
@@ -427,6 +762,7 @@ class FakeCSMS:
         the server saw."""
 
         self._server: Any = None
+        self._command_tasks: list[asyncio.Task] = []
 
     async def _on_connect(self, connection: Any) -> None:
         """
@@ -458,6 +794,15 @@ class FakeCSMS:
         self.connections.append(handler)
         self.log.info("connected: %s", station_id)
 
+        # The command plan runs in ITS OWN TASK, concurrently with the
+        # receive loop below. See the deadlock note on the outbound
+        # methods: a command awaited from inside a handler can never be
+        # answered.
+        if not self.commands.is_empty():
+            self._command_tasks.append(
+                asyncio.ensure_future(self._run_command_plan(handler))
+            )
+
         try:
             await handler.start()
         except ConnectionClosed:
@@ -471,6 +816,45 @@ class FakeCSMS:
                 station_id, handler.message_count,
             )
 
+    async def _run_command_plan(self, handler: FakeCSMSHandlers) -> None:
+        """
+        Fire the configured commands at the configured points.
+
+        Stands in for csms/dispatch.py. Ordered by message count, so the
+        sequence is deterministic regardless of machine speed.
+
+        Every failure is swallowed and logged: this is a fixture, and a
+        command plan that dies must not take the server down with it --
+        that would turn one broken assertion into every test in the file
+        failing for an unrelated reason.
+        """
+        plan = self.commands
+        try:
+            if plan.set_limit_w is not None:
+                if await handler.wait_for_messages(plan.after_messages):
+                    await handler.send_set_charging_profile(
+                        plan.set_limit_w, unit=plan.limit_unit
+                    )
+
+            if plan.trigger_after_messages:
+                if await handler.wait_for_messages(plan.trigger_after_messages):
+                    await handler.send_trigger_message(plan.trigger_message)
+
+            if plan.clear_after_messages:
+                if await handler.wait_for_messages(plan.clear_after_messages):
+                    await handler.send_clear_charging_profile()
+
+            if plan.stop_after_messages:
+                if await handler.wait_for_messages(plan.stop_after_messages):
+                    await handler.send_request_stop_transaction()
+
+        except asyncio.CancelledError:
+            raise
+        except ConnectionClosed:
+            self.log.info("command plan ended: the station disconnected")
+        except Exception:  # noqa: BLE001 - a fixture reports, never crashes
+            self.log.exception("command plan failed")
+
     async def start(self) -> None:
         """Begin listening. Returns once the socket is open."""
         self._server = await serve(
@@ -483,6 +867,19 @@ class FakeCSMS:
 
     async def stop(self) -> None:
         """Stop listening and wait for the socket to close."""
+        # Cancel command tasks first. A dispatch still in flight when the
+        # socket closes raises ConnectionClosed from inside a task nobody
+        # is awaiting, which asyncio reports at interpreter shutdown as
+        # "Task exception was never retrieved" -- noise that looks like a
+        # real fault in an otherwise clean test run.
+        for task in self._command_tasks:
+            if not task.done():
+                task.cancel()
+        for task in self._command_tasks:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        self._command_tasks.clear()
+
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
@@ -535,9 +932,19 @@ async def main_async(args: argparse.Namespace) -> None:
         reject_connections=args.reject_connections,
         auth_mode=args.auth_mode,
     )
+    commands = CommandPlan(
+        set_limit_w=args.set_limit_w,
+        limit_unit=args.limit_unit,
+        after_messages=args.after_messages,
+        clear_after_messages=args.clear_after,
+        stop_after_messages=args.stop_after,
+        trigger_after_messages=args.trigger_after,
+        trigger_message=args.trigger_message,
+    )
     server = FakeCSMS(
         host=args.host, port=args.port,
         interval_s=args.interval, faults=faults,
+        commands=commands,
     )
     async with server:
         # Sleep forever; Ctrl-C unwinds through the context manager and
@@ -573,6 +980,41 @@ def main() -> None:
                         help="close every connection immediately")
     faults.add_argument("--auth-mode", default="allowlist",
                         choices=["allowlist", "accept-all"])
+
+    # -- Phase C3: stand in for csms/dispatch.py ------------------------
+    commands = parser.add_argument_group(
+        "command dispatch",
+        "Send server-initiated commands to the station. Stands in for "
+        "csms/dispatch.py, which does not exist yet.",
+    )
+    commands.add_argument(
+        "--set-limit-w", type=float, default=None, metavar="WATTS",
+        help="send SetChargingProfile with this limit; 0 is curtailment",
+    )
+    commands.add_argument(
+        "--limit-unit", default="W", choices=["W", "A"],
+        help="units for --set-limit-w; A exercises the agent's conversion",
+    )
+    commands.add_argument(
+        "--after-messages", type=int, default=3, metavar="N",
+        help="fire --set-limit-w once the station has sent N messages",
+    )
+    commands.add_argument(
+        "--clear-after", type=int, default=0, metavar="N",
+        help="send ClearChargingProfile after N messages; 0 disables",
+    )
+    commands.add_argument(
+        "--stop-after", type=int, default=0, metavar="N",
+        help="send RequestStopTransaction after N messages; 0 disables",
+    )
+    commands.add_argument(
+        "--trigger-after", type=int, default=0, metavar="N",
+        help="send TriggerMessage after N messages; 0 disables",
+    )
+    commands.add_argument(
+        "--trigger-message", default="StatusNotification",
+        help="what --trigger-after asks for",
+    )
 
     args = parser.parse_args()
 
