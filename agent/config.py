@@ -168,6 +168,26 @@ class AgentConfig:
     max_power_w: float = DEFAULT_LIMIT_W
     """Ceiling passed to SimulatedPower. 7.4 kW is a typical AC charger."""
 
+    # -- protocol timing -------------------------------------------------
+
+    response_timeout_s: float = 30.0
+    """
+    How long to wait for the CSMS to answer one message.
+
+    30 seconds is the ocpp library's own default. It is set explicitly
+    here because it ends up in the results: during E2 a station whose
+    connection dies mid-message would otherwise wait the full timeout
+    before reacting, and that delay would be attributed to
+    post-quantum cost rather than to a client-side timeout.
+
+    agent/station.py also watches the socket directly, so a closed
+    connection is detected immediately rather than after this timeout --
+    but a server that stays connected and simply does not answer is
+    still bounded by this value. Track A flagged the same parameter on
+    their side as something that will appear in the results while not
+    being under anyone's deliberate control.
+    """
+
     # -- reconnection (used from Phase C4) -------------------------------
 
     reconnect_base_delay_s: float = 1.0
@@ -271,6 +291,11 @@ class AgentConfig:
             raise ValueError(
                 f"meter_every_s must be > 0, got {self.meter_every_s}; "
                 "zero would spin the meter loop without sleeping"
+            )
+
+        if self.response_timeout_s <= 0:
+            raise ValueError(
+                f"response_timeout_s must be > 0, got {self.response_timeout_s}"
             )
 
         if self.reconnect_base_delay_s <= 0:
@@ -398,6 +423,11 @@ class AgentConfig:
             default=cls.max_power_w, help="watts",
         )
         parser.add_argument(
+            "--response-timeout", dest="response_timeout_s", type=float,
+            default=cls.response_timeout_s,
+            help="seconds to wait for the CSMS to answer one message",
+        )
+        parser.add_argument(
             "--reconnect-base-delay", dest="reconnect_base_delay_s",
             type=float, default=cls.reconnect_base_delay_s,
         )
@@ -455,6 +485,7 @@ class AgentConfig:
             crypto_mode=ns.crypto_mode,
             supported_algorithms=algorithms,
             max_power_w=ns.max_power_w,
+            response_timeout_s=ns.response_timeout_s,
             reconnect_base_delay_s=ns.reconnect_base_delay_s,
             reconnect_max_delay_s=ns.reconnect_max_delay_s,
             reconnect_jitter=ns.reconnect_jitter,
