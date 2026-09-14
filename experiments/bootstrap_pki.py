@@ -62,7 +62,7 @@ def build_pki() -> CertificateAuthority:
     )
     print(f"  root CA written: {CERT_DIR / 'root.pem'}")
 
-    server_issued = ca.issue_station_certificate_with_new_key(SERVER_COMMON_NAME)
+    server_issued = ca.issue_server_certificate(SERVER_COMMON_NAME)
     save_certificate(server_issued.certificate_der, SERVER_COMMON_NAME, directory=CERT_DIR)
     save_private_key(server_issued.private_key_der, SERVER_COMMON_NAME, directory=CERT_DIR)
     print(f"  server identity written: {CERT_DIR / (SERVER_COMMON_NAME + '.crt.pem')}")

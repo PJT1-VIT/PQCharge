@@ -84,3 +84,41 @@ def test_revoke_raises_not_implemented_until_day5():
 def test_ca_rejects_non_classical_provider_for_now():
     with pytest.raises(NotImplementedError):
         CertificateAuthority(FakeNonClassicalProvider())
+
+# -- SAN tests (added when issue_server_certificate landed) --------------
+
+def test_server_certificate_has_default_san():
+    ca = CertificateAuthority(ClassicalProvider())
+    issued = ca.issue_server_certificate()
+    cert = x509.load_der_x509_certificate(issued.certificate_der)
+    san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+    assert san.value.get_values_for_type(x509.DNSName) == ["localhost"]
+
+
+def test_server_certificate_honours_custom_san_names():
+    ca = CertificateAuthority(ClassicalProvider())
+    issued = ca.issue_server_certificate(
+        san_names=["localhost", "drs-macbook-air.local"]
+    )
+    cert = x509.load_der_x509_certificate(issued.certificate_der)
+    san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+    assert san.value.get_values_for_type(x509.DNSName) == [
+        "localhost",
+        "drs-macbook-air.local",
+    ]
+
+
+def test_station_certificate_has_no_san_by_default():
+    # Station (client) certificates are not hostname-verified, so they carry
+    # no SAN unless one is explicitly requested.
+    ca = CertificateAuthority(ClassicalProvider())
+    issued = ca.issue_station_certificate_with_new_key("CP001")
+    cert = x509.load_der_x509_certificate(issued.certificate_der)
+    with pytest.raises(x509.ExtensionNotFound):
+        cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+
+
+def test_server_certificate_private_key_returned():
+    ca = CertificateAuthority(ClassicalProvider())
+    issued = ca.issue_server_certificate()
+    assert issued.private_key_der != b""
