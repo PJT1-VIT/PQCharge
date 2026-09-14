@@ -77,11 +77,32 @@ from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 from agent import messages as msg
-from agent.client import CallFailed, StationClient
+from agent.charging_profile import (
+    ProfileRejected,
+    cleared_limit_w,
+    parse_charging_profile,
+)
+from agent.client import CallFailed, StationClient, StationCommands
 from agent.config import AgentConfig
 from agent.logging_setup import configure_logging, get_logger
 from agent.power import PowerInterface
 from agent.simulated_power import SimulatedPower
+from agent.state_machine import StationState, StationStateMachine
+
+# Messages this station will re-send on demand when the CSMS sends a
+# TriggerMessage. Anything else is answered NotImplemented, which is the
+# spec's word for it and not an error.
+#
+# BootNotification is deliberately absent: re-booting mid-transaction
+# would mean re-negotiating the heartbeat interval while a session is
+# open, and the only caller that would want it is a CSMS trying to
+# recover a station it thinks is stuck -- for which StatusNotification
+# answers the question in one round trip without disturbing anything.
+TRIGGERABLE = (
+    "StatusNotification",
+    "Heartbeat",
+    "MeterValues",
+)
 
 # How many times to re-send BootNotification when the CSMS answers
 # Pending. Today it never does -- csms/handlers.py always accepts --
@@ -114,7 +135,7 @@ def describe_close(exc: BaseException) -> str:
     return repr(exc)
 
 
-class ChargingStation:
+class ChargingStation(StationCommands):
     """
     One simulated charging station.
 
@@ -162,6 +183,70 @@ class ChargingStation:
         here so run_once()'s finally block can cancel it even when the
         session task was cancelled before it could clean up itself."""
 
+        # ==============================================================
+        # PHASE C3 — physical state and the actuation path
+        # ==============================================================
+
+        self.state = StationStateMachine(station_id=config.station_id)
+        """
+        The single source of truth for both OCPP state fields.
+
+        STATION-scoped, like the power backend: a station whose socket
+        dies mid-charge is still physically charging, and in Phase C4 it
+        must resume reporting what it is actually doing rather than
+        starting again from Available.
+        """
+
+        self._limit_w: float = config.max_power_w
+        """
+        The power cap currently in force, in watts.
+
+        Distinct from what the power backend is set to. This is the
+        OPERATOR'S limit -- from a charging profile, or the station's own
+        maximum when none is installed. The backend is set to this only
+        while actually charging, and to zero while suspended, so that
+        lifting a suspension restores the right number without having to
+        remember it somewhere else.
+        """
+
+        self._last_charging_state_sent: str | None = None
+        """The charging_state carried by the last TransactionEvent. Used
+        to decide whether the next one is a state change or an ordinary
+        periodic reading -- see _next_trigger_reason()."""
+
+        self._limit_changed = False
+        """Set when a profile has been applied and the next meter event
+        should carry ChargingRateChanged rather than MeterValuePeriodic.
+        Track A reads trigger_reason, so this is how a curtailment is
+        identifiable in their log rather than looking like an ordinary
+        periodic sample that happened to read zero."""
+
+        self._stop_requested = False
+        self._stop_reason = ""
+        """Set by handle_request_stop(). Read by the metering loop."""
+
+        self._pending_triggers: list[str] = []
+        """Messages a TriggerMessage command asked for, waiting to be
+        sent by the loop rather than from inside the handler."""
+
+        self._wake = asyncio.Event()
+        """
+        Wakes the metering loop early when a command arrives.
+
+        Without it the loop sleeps up to meter_every_s -- five seconds by
+        default -- before noticing a curtailment. Five seconds of a
+        station still drawing full power after being told to stop is
+        both physically wrong and, in E5's timeline, the difference
+        between a command taking effect immediately and appearing to lag.
+
+        Created here rather than in the loop so the OCPP handlers, which
+        run before the loop starts on a reconnect, always have something
+        to set.
+        """
+
+        self.commands_received = 0
+        """Accumulated across connections, for the end-of-run summary."""
+
     # -- small helpers ------------------------------------------------------
 
     def _next_seq(self) -> int:
@@ -188,6 +273,287 @@ class ChargingStation:
             return
         await client.send_status(status)
         self.last_status = status
+
+    async def _sync_status(self, client: StationClient) -> None:
+        """
+        Report whatever connector status the state machine currently says.
+
+        The ONLY place StatusNotification is sent from, in Phase C3
+        onwards. Before C3 the status was passed in by hand at each call
+        site, which is exactly how connector_status and charging_state
+        came to be able to disagree. Now there is one state and one
+        place that reads it.
+        """
+        await self._send_status_if_changed(client, self.state.connector_status)
+
+    # =====================================================================
+    # ACTUATION — the state machine drives the physical model
+    # =====================================================================
+
+    def _apply_power_for_state(self) -> None:
+        """
+        Make the hardware match the state. Synchronous; no I/O.
+
+        Two rules, and every physical decision in the agent follows from
+        them:
+
+            contactor closed  <=>  a transaction is open
+            backend limit     ==   the operator's limit while CHARGING,
+                                   zero in every other state
+
+        Keeping the operator's limit in self._limit_w rather than in the
+        backend is what makes a suspension reversible: lifting it
+        restores the right number, with no separate "remembered limit"
+        that can drift out of step.
+
+        Note that the contactor STAYS CLOSED during SUSPENDED_EVSE. That
+        is deliberate and it is what a real charger does -- the contactor
+        is a mechanical part with a finite number of operations, and the
+        transaction has not ended. Power goes to zero because the limit
+        is zero, not because the circuit was broken. SimulatedPower
+        computes its draw as min(limit, max), so a zero limit reads zero
+        watts with the contactor still closed.
+        """
+        if self.state.in_transaction:
+            if not self.power.is_closed():
+                self.power.close_contactor()
+                self.log.info("contactor closed")
+        else:
+            if self.power.is_closed():
+                self.power.open_contactor()
+                self.log.info("contactor opened")
+
+        effective = self._limit_w if self.state.draws_power else 0.0
+        if effective != self.power.get_power_limit():
+            self.power.set_power_limit(effective)
+            self.log.info(
+                "power limit -> %.1fW (operator limit %.1fW, state %s)",
+                effective, self._limit_w, self.state.state.value,
+            )
+
+    # =====================================================================
+    # StationCommands — what the CSMS can make this station do
+    # =====================================================================
+    #
+    # *** EVERY METHOD IN THIS SECTION IS SYNCHRONOUS AND SENDS NOTHING. ***
+    #
+    # They are called from inside agent/client.py's @on handlers, which
+    # run inside the ocpp library's single receive loop. Awaiting an
+    # outbound call() from here would deadlock the connection -- see the
+    # long note on StationCommands in client.py.
+    #
+    # So each one: decides, changes state, actuates the hardware, sets
+    # self._wake, and returns (accepted, reason). The metering loop wakes
+    # immediately and sends whatever the new state requires.
+
+    def handle_request_stop(self, transaction_id: str | None) -> tuple[bool, str]:
+        """
+        The operator pressed stop.
+
+        Refused when there is no transaction, or when the id names a
+        different one. Both refusals are honest answers that let the CSMS
+        distinguish a stale command from a station ignoring it -- and
+        both are reachable in practice, because a stop command sent
+        during a reconnection storm may well arrive after the session it
+        referred to has already ended.
+        """
+        if self.transaction_id is None:
+            return False, "no transaction is in progress at this station"
+
+        if transaction_id and transaction_id != self.transaction_id:
+            return False, (
+                f"transaction {transaction_id} is not the one in progress "
+                f"({self.transaction_id})"
+            )
+
+        self._stop_requested = True
+        self._stop_reason = "RequestStopTransaction"
+        self._wake.set()
+        return True, f"stopping transaction {self.transaction_id}"
+
+    def handle_set_charging_profile(
+        self, evse_id: Any, charging_profile: Any
+    ) -> tuple[bool, str]:
+        """
+        Cap this station's power. The command E5 is built on.
+
+        A limit of zero suspends the session without ending it:
+        SUSPENDED_EVSE, power to nothing, connector still Occupied,
+        transaction still open. Lifting it later resumes charging on the
+        same transaction, with the energy counter carrying on from where
+        it paused -- which is what makes the curtailment visible as a
+        flat section in the energy curve rather than a gap in the data.
+        """
+        try:
+            limit = parse_charging_profile(
+                charging_profile,
+                max_power_w=self.config.max_power_w,
+                evse_id=evse_id,
+                station_evse_id=msg.DEFAULT_EVSE_ID,
+            )
+        except ProfileRejected as exc:
+            # Not an error on our side -- the command was malformed or
+            # not for us. WARNING, not ERROR, and the reason goes back on
+            # the wire so the operator sees it too.
+            self.log.warning("charging profile rejected: %s", exc.reason)
+            return False, exc.reason
+
+        self.log.info("charging profile: %s", limit.describe())
+        self._limit_w = limit.watts
+        self._limit_changed = True
+
+        # -- does this change the state, not just the number? ------------
+        if self.state.in_transaction:
+            if limit.is_curtailment and self.state.state is StationState.CHARGING:
+                self.state.transition_to(
+                    StationState.SUSPENDED_EVSE,
+                    "charging profile set the limit to 0 W",
+                )
+            elif (
+                not limit.is_curtailment
+                and self.state.state is StationState.SUSPENDED_EVSE
+            ):
+                self.state.transition_to(
+                    StationState.CHARGING,
+                    f"charging profile raised the limit to {limit.watts:.0f} W",
+                )
+
+        self._apply_power_for_state()
+        self._wake.set()
+        return True, limit.describe()
+
+    def handle_clear_charging_profile(self, criteria: dict) -> tuple[bool, str]:
+        """
+        Remove the cap; return to the station's own maximum.
+
+        Answers Unknown -- not Rejected -- when no profile is installed,
+        because that is what ClearChargingProfileStatus offers and it is
+        the accurate word: there was nothing matching to clear. A station
+        that was never curtailed saying so is correct behaviour, not a
+        failure, and Track A's dispatcher should not treat it as one.
+
+        The criteria (profile id, purpose, stack level) are logged but
+        not matched against. This station holds at most one profile at a
+        time, so there is nothing to select between; matching would be
+        code that is never exercised and therefore never known to work.
+        """
+        if criteria:
+            self.log.debug("clear criteria (not matched, one profile only): %s",
+                           criteria)
+
+        maximum = cleared_limit_w(self.config.max_power_w)
+        if self._limit_w >= maximum:
+            return False, "no charging profile is installed at this station"
+
+        previous = self._limit_w
+        self._limit_w = maximum
+        self._limit_changed = True
+
+        if (
+            self.state.in_transaction
+            and self.state.state is StationState.SUSPENDED_EVSE
+        ):
+            self.state.transition_to(
+                StationState.CHARGING, "charging profile cleared"
+            )
+
+        self._apply_power_for_state()
+        self._wake.set()
+        return True, f"limit restored from {previous:.0f}W to {maximum:.0f}W"
+
+    def handle_trigger_message(
+        self, requested_message: str, evse: Any
+    ) -> tuple[bool, str]:
+        """
+        Queue a message to be re-sent on the loop's next tick.
+
+        Queued rather than sent, for the deadlock reason above. The delay
+        is bounded by the wake event, so "shortly" means milliseconds,
+        not up to a meter interval.
+        """
+        if requested_message not in TRIGGERABLE:
+            return False, (
+                f"{requested_message} cannot be triggered on this station "
+                f"(available: {', '.join(TRIGGERABLE)})"
+            )
+
+        if (
+            requested_message == "MeterValues"
+            and not self.state.in_transaction
+        ):
+            return False, "no transaction is in progress, so there are no meter values"
+
+        self._pending_triggers.append(requested_message)
+        self._wake.set()
+        return True, f"{requested_message} will be sent shortly"
+
+    # -- serving what the commands asked for -------------------------------
+
+    async def _sleep_or_wake(self, seconds: float) -> None:
+        """
+        Sleep, but return the instant a command arrives.
+
+        asyncio.sleep() would make every command wait out the rest of the
+        meter interval. Racing it against the wake event turns a
+        multi-second lag into a sub-millisecond one, which matters
+        because E5 times how quickly the fleet's aggregate power responds
+        to a curtailment -- and a lag introduced by our own polling
+        interval would be reported as the cost of the command path.
+        """
+        if seconds <= 0:
+            return
+        try:
+            await asyncio.wait_for(self._wake.wait(), timeout=seconds)
+        except asyncio.TimeoutError:
+            return  # ordinary tick, nothing was waiting
+        finally:
+            # Consume the wake either way. Leaving it set would make the
+            # next sleep return instantly and spin the loop.
+            self._wake.clear()
+
+    async def _serve_triggers(self, client: StationClient) -> None:
+        """Send whatever TriggerMessage asked for, then forget it."""
+        while self._pending_triggers:
+            requested = self._pending_triggers.pop(0)
+            self.log.info("serving TriggerMessage: %s", requested)
+
+            if requested == "StatusNotification":
+                # Forced, not "if changed" -- the CSMS asked for it
+                # precisely because it does not know the current value.
+                await client.send_status(self.state.connector_status)
+                self.last_status = self.state.connector_status
+
+            elif requested == "Heartbeat":
+                await client.send_heartbeat()
+
+            elif requested == "MeterValues":
+                await self._send_meter_event(
+                    client, trigger_reason=msg.TRIGGER_METER_PERIODIC
+                )
+
+    def _next_trigger_reason(self) -> str:
+        """
+        Why the next meter event is being sent.
+
+        Track A stores trigger_reason verbatim, so this is what makes a
+        curtailment identifiable in their event log. Without it, the
+        moment a station's power drops to zero on command is
+        indistinguishable from an ordinary periodic sample that happened
+        to read zero -- and E5's whole finding is about a deliberate
+        change being visible.
+
+        Precedence: a state change outranks a rate change, which outranks
+        the periodic tick. Only one reason fits in the field.
+        """
+        charging_state = self.state.charging_state or msg.CHARGING_STATE_IDLE
+
+        if charging_state != self._last_charging_state_sent:
+            return msg.TRIGGER_CHARGING_STATE_CHANGED
+
+        if self._limit_changed:
+            return msg.TRIGGER_CHARGING_RATE_CHANGED
+
+        return msg.TRIGGER_METER_PERIODIC
 
     # -- boot, with the Pending case handled ---------------------------------
 
@@ -249,7 +615,9 @@ class ChargingStation:
         """
         cfg = self.config
 
-        await self._send_status_if_changed(client, msg.STATUS_AVAILABLE)
+        # Every status now comes from the state machine. Nothing in this
+        # method names a wire string.
+        await self._sync_status(client)
 
         # -- the driver presents a card ----------------------------------
         accepted, status = await client.send_authorize(cfg.id_token)
@@ -262,10 +630,16 @@ class ChargingStation:
             return
 
         # -- a car is plugged in -------------------------------------------
-        await self._send_status_if_changed(client, msg.STATUS_OCCUPIED)
+        self.state.transition_to(StationState.OCCUPIED, "vehicle plugged in")
+        await self._sync_status(client)
 
         self.transaction_id = self._new_transaction_id()
         self.seq_no = 0
+        self._last_charging_state_sent = None
+        self._stop_requested = False
+        self._stop_reason = ""
+        self._pending_triggers.clear()
+        self._wake.clear()
 
         # Energy must start from zero for this transaction, or the first
         # reading carries over the previous session's total and Track
@@ -274,10 +648,23 @@ class ChargingStation:
 
         try:
             # -- current starts flowing -----------------------------------
-            self.power.close_contactor()
-            self.log.info(
-                "contactor closed, limit %.0fW", self.power.get_power_limit()
-            )
+            #
+            # A profile that arrived BEFORE the transaction started is
+            # already in self._limit_w, so a station curtailed to 0 W
+            # while idle begins the session suspended rather than
+            # charging for one tick and then dropping. This is reachable
+            # in E5, where profiles are pushed across the fleet without
+            # regard for which stations happen to be mid-session.
+            if self._limit_w <= 0:
+                self.state.transition_to(
+                    StationState.SUSPENDED_EVSE,
+                    "a 0 W profile was already in force when the session began",
+                )
+            else:
+                self.state.transition_to(
+                    StationState.CHARGING, "transaction started"
+                )
+            self._apply_power_for_state()
 
             await client.send_transaction_event(
                 msg.TX_STARTED,
@@ -286,40 +673,65 @@ class ChargingStation:
                 self.power.read_power(),
                 self.power.read_energy(),
                 trigger_reason=msg.TRIGGER_AUTHORIZED,
-                charging_state=msg.CHARGING_STATE_CHARGING,
+                charging_state=self.state.charging_state
+                or msg.CHARGING_STATE_CHARGING,
                 token=cfg.id_token,
             )
+            self._last_charging_state_sent = self.state.charging_state
+            self._limit_changed = False
 
-            # -- periodic meter readings ------------------------------------
+            # -- the session loop ---------------------------------------------
             #
             # Deadline arithmetic rather than counting iterations: a slow
             # server, a long CALLError timeout or an OS scheduling hiccup
             # would each make a naive loop overshoot, and E1's handshake
             # figures are compared against session durations.
+            #
+            # PHASE C3 CHANGED THE SLEEP. It is now a race against the
+            # wake event, so an inbound command is acted on immediately
+            # instead of at the next meter tick. Everything else about
+            # the loop's shape is unchanged.
             deadline = time.monotonic() + cfg.charge_for_s
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
-                await asyncio.sleep(min(cfg.meter_every_s, remaining))
 
-                # Values come from Contract 5, not from a counter we
-                # increment ourselves. SimulatedPower accumulates energy
-                # from elapsed time and the active limit, so a charging
-                # profile applied mid-session (Phase C3) is reflected in
-                # the readings automatically.
-                await client.send_transaction_event(
-                    msg.TX_UPDATED,
-                    self.transaction_id,
-                    self._next_seq(),
-                    self.power.read_power(),
-                    self.power.read_energy(),
-                    trigger_reason=msg.TRIGGER_METER_PERIODIC,
-                    charging_state=msg.CHARGING_STATE_CHARGING,
+                await self._sleep_or_wake(min(cfg.meter_every_s, remaining))
+
+                # 1. The operator may have pressed stop.
+                if self._stop_requested:
+                    self.log.info(
+                        "ending the session early: %s", self._stop_reason
+                    )
+                    break
+
+                # 2. A command may have moved the connector status --
+                #    Occupied/Charging both report Occupied, so in
+                #    practice this fires on faults, but it is the only
+                #    correct place for it and costs one comparison.
+                await self._sync_status(client)
+
+                # 3. A TriggerMessage may be waiting.
+                await self._serve_triggers(client)
+
+                # 4. The meter reading. Values come from Contract 5, not
+                #    from a counter we increment ourselves, so a profile
+                #    applied mid-session is reflected here automatically:
+                #    SimulatedPower integrates energy from elapsed time
+                #    and the ACTIVE limit, which the command already
+                #    changed.
+                await self._send_meter_event(
+                    client, trigger_reason=self._next_trigger_reason()
                 )
 
-            # -- the driver unplugs -------------------------------------------
-            await self._end_transaction(client, msg.TRIGGER_STOP_AUTHORIZED)
+            # -- the session ends -------------------------------------------
+            await self._end_transaction(
+                client,
+                msg.TRIGGER_REMOTE_STOP
+                if self._stop_requested
+                else msg.TRIGGER_STOP_AUTHORIZED,
+            )
 
         finally:
             # Safety rule 1. Reached on success, on CALLError, on a
@@ -331,7 +743,39 @@ class ChargingStation:
                     "contactor opened on the way out of an unfinished session"
                 )
 
-        await self._send_status_if_changed(client, msg.STATUS_AVAILABLE)
+        # The car leaves. reset() rather than transition_to() because
+        # this runs on every exit path, including ones where the state
+        # machine is somewhere the transition table would not allow
+        # AVAILABLE from -- and "nothing is plugged in" is always a
+        # physically reachable truth.
+        self.state.reset("vehicle unplugged")
+        await self._sync_status(client)
+
+    async def _send_meter_event(
+        self, client: StationClient, *, trigger_reason: str
+    ) -> None:
+        """
+        One TransactionEvent Updated carrying the current readings.
+
+        Factored out of the loop because TriggerMessage MeterValues needs
+        exactly the same message on demand, and two call sites building
+        the same event by hand is how the seq_no discipline in safety
+        rule 2 gets broken.
+        """
+        charging_state = self.state.charging_state or msg.CHARGING_STATE_IDLE
+
+        await client.send_transaction_event(
+            msg.TX_UPDATED,
+            self.transaction_id or "",
+            self._next_seq(),
+            self.power.read_power(),
+            self.power.read_energy(),
+            trigger_reason=trigger_reason,
+            charging_state=charging_state,
+        )
+
+        self._last_charging_state_sent = charging_state
+        self._limit_changed = False
 
     async def _end_transaction(
         self, client: StationClient, trigger_reason: str
@@ -347,7 +791,12 @@ class ChargingStation:
         if self.transaction_id is None:
             return
 
-        self.power.open_contactor()
+        # The car is still plugged in; the transaction is what ended. The
+        # state machine moving out of a transaction state is what opens
+        # the contactor, via _apply_power_for_state -- there is no
+        # separate "open the contactor" decision to get wrong.
+        self.state.transition_to(StationState.OCCUPIED, f"transaction ended ({trigger_reason})")
+        self._apply_power_for_state()
 
         await client.send_transaction_event(
             msg.TX_ENDED,
@@ -360,10 +809,11 @@ class ChargingStation:
         )
 
         self.log.info(
-            "transaction %s ended, %.1fWh delivered",
-            self.transaction_id, self.power.read_energy(),
+            "transaction %s ended, %.1fWh delivered (%s)",
+            self.transaction_id, self.power.read_energy(), trigger_reason,
         )
         self.transaction_id = None
+        self._last_charging_state_sent = None
 
     # -- one connection ---------------------------------------------------------
 
@@ -391,7 +841,14 @@ class ChargingStation:
             self.log.info("connected in %.1fms", elapsed_ms)
 
             client = StationClient(
-                cfg.station_id, ws, response_timeout=cfg.response_timeout_s
+                cfg.station_id,
+                ws,
+                response_timeout=cfg.response_timeout_s,
+                # Phase C3: this object is what answers server-initiated
+                # commands. ChargingStation subclasses StationCommands,
+                # so the four handle_* methods above are what the CSMS
+                # actually reaches.
+                commands=self,
             )
 
             # The ocpp library's receive loop. It MUST be running before
@@ -467,9 +924,15 @@ class ChargingStation:
                 self._heartbeat_task = None
 
                 self.callerror_count += client.callerror_count
+                self.commands_received += client.commands_received
                 self.log.info(
-                    "session finished: %d messages sent, %d CALLErrors",
-                    client.messages_sent, client.callerror_count,
+                    "session finished: %d messages sent, %d CALLErrors, "
+                    "%d commands received, %d state transitions, final state %s",
+                    client.messages_sent,
+                    client.callerror_count,
+                    client.commands_received,
+                    self.state.transition_count,
+                    self.state.describe(),
                 )
 
     async def _connected_lifecycle(self, client: StationClient) -> bool:

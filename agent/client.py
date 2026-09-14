@@ -69,8 +69,9 @@ import asyncio
 from typing import Any
 
 from ocpp.exceptions import OCPPError, UnknownCallErrorCodeError
+from ocpp.routing import on
 from ocpp.v201 import ChargePoint as CpBase
-from ocpp.v201 import call
+from ocpp.v201 import call, call_result
 
 from agent import messages as msg
 from agent.logging_setup import get_logger
@@ -144,6 +145,67 @@ class BootResult:
         return f"BootResult(status={self.status!r}, interval={self.interval})"
 
 
+class StationCommands:
+    """
+    What this connection does when the CSMS tells it to do something.
+
+    Phase C3. agent/station.py subclasses nothing -- it simply provides
+    an object with these four methods, because the station is what owns
+    the state machine and the power backend, and this class is only the
+    shape of the conversation between them.
+
+    --------------------------------------------------------------
+    *** EVERY METHOD HERE IS SYNCHRONOUS, AND THAT IS NOT OPTIONAL ***
+
+    The ocpp library's start() is a single receive loop:
+
+        while True:
+            message = await self._connection.recv()
+            await self.route_message(message)
+
+    One message is handled at a time, and the NEXT recv() does not
+    happen until the current handler returns. So a handler that awaits
+    an outbound call() -- say, sending a StatusNotification to report
+    the state it just changed -- waits for a response that can only
+    arrive through the recv() that is waiting for the handler. That is a
+    deadlock, and it would present as "the station froze the first time
+    the operator curtailed it", thirty seconds before the response
+    timeout eventually fires.
+
+    So these methods CHANGE STATE AND RETURN. They send nothing. The
+    station's metering loop notices the change on its next tick -- woken
+    immediately, not on the next sleep -- and sends whatever the new
+    state requires. See agent/station.py's _charging_session().
+    --------------------------------------------------------------
+
+    Each method returns (accepted, reason). The reason is sent back
+    inside statusInfo so it reaches Track A's event log, where an
+    operator can read why their command did not take effect.
+
+    The defaults refuse everything, politely and in valid OCPP.
+    """
+
+    def handle_request_stop(self, transaction_id: str | None) -> tuple[bool, str]:
+        """The CSMS wants this transaction stopped."""
+        return False, "no station is attached to this connection"
+
+    def handle_set_charging_profile(
+        self, evse_id: Any, charging_profile: Any
+    ) -> tuple[bool, str]:
+        """The CSMS is capping this station's power. The actuation path."""
+        return False, "no station is attached to this connection"
+
+    def handle_clear_charging_profile(self, criteria: dict) -> tuple[bool, str]:
+        """The CSMS is removing a cap it set earlier."""
+        return False, "no station is attached to this connection"
+
+    def handle_trigger_message(
+        self, requested_message: str, evse: Any
+    ) -> tuple[bool, str]:
+        """The CSMS wants a particular message re-sent right now."""
+        return False, "no station is attached to this connection"
+
+
 class StationClient(CpBase):
     """
     One station's OCPP conversation over one WebSocket connection.
@@ -162,9 +224,21 @@ class StationClient(CpBase):
         station_id: str,
         connection: Any,
         response_timeout: int = DEFAULT_RESPONSE_TIMEOUT_S,
+        commands: "StationCommands | None" = None,
     ) -> None:
         super().__init__(station_id, connection, response_timeout=response_timeout)
         self.log = get_logger(__name__, station_id=station_id)
+
+        # Phase C3. Where server-initiated commands are decided. None
+        # means "refuse everything politely", which is the correct
+        # behaviour for a client with no station behind it -- a test
+        # constructing a bare StationClient still answers valid OCPP.
+        self.commands: StationCommands = commands or StationCommands()
+
+        self.commands_received = 0
+        """How many server-initiated commands arrived on this connection.
+        Part of the session summary: a run where the dispatcher fired and
+        nothing arrived is a run whose actuation results mean nothing."""
 
         self.callerror_count = 0
         """
@@ -480,15 +554,186 @@ class StationClient(CpBase):
                 " [offline replay]" if offline else "",
             )
 
-    # -- server-initiated messages -------------------------------------------------
+    # =====================================================================
+    # SERVER-INITIATED MESSAGES — the actuation path (Phase C3)
+    # =====================================================================
     #
-    # SetChargingProfile and RemoteStopTransaction handlers are NOT here.
-    # They arrive in Phase C3, wired to the state machine and the power
-    # backend, because answering them correctly means changing physical
-    # state -- which is C3's job.
+    # Everything above this line is the station TALKING. Everything below
+    # is the station LISTENING. This is the half that makes PQCharge a
+    # cyber-physical system rather than a telemetry feed: a command
+    # arrives here and, milliseconds later, current stops flowing.
     #
-    # Until then, if the CSMS sends one, the ocpp library answers with a
-    # NotSupported CALLError of its own accord. That is the correct
-    # protocol behaviour for an unimplemented action and it is visible
-    # in the server's log rather than silent. It also cannot happen yet:
-    # csms/dispatch.py is Track A's Days 8-9 work and does not exist.
+    # THREE RULES, ALL OF THEM LEARNED THE EXPENSIVE WAY:
+    #
+    # 1. NO HANDLER AWAITS AN OUTBOUND CALL. See StationCommands above
+    #    for the deadlock. Handlers mutate state and return; the
+    #    station's loop sends the consequences.
+    #
+    # 2. NO HANDLER RAISES. An exception here becomes a CALLError, which
+    #    tells the CSMS "this station is broken" when the truth is
+    #    "that command was not valid". Every failure path returns a
+    #    Rejected response with a reason instead. The blanket
+    #    try/except in each handler is the backstop for a bug in
+    #    station.py, not the primary mechanism.
+    #
+    # 3. THE ANSWER IS THE TRUTH. If the station cannot honour a
+    #    command, it says Rejected. It never accepts and then quietly
+    #    does nothing -- Track A's dispatcher records what it was told,
+    #    and a lie here becomes a fabricated result in the E5 dataset.
+    #
+    # ON ACTION NAMES: OCPP 2.0.1 renamed 1.6's RemoteStopTransaction to
+    # RequestStopTransaction. Both names appear in conversation, only one
+    # appears on the wire, and the 1.6 spelling in agent/power.py's
+    # docstring is a comment rather than a signature -- Contract 5 is
+    # unaffected either way.
+
+    def _command_log(self, action: str, accepted: bool, reason: str) -> None:
+        """
+        One line per inbound command, at INFO, always.
+
+        These are the rarest and most consequential messages in a run --
+        a handful across a whole experiment, each one changing physical
+        state. They are never logged at DEBUG, because a run where the
+        curtailment did not arrive must be distinguishable from a run
+        where it arrived and was refused, using the default log level.
+        """
+        self.commands_received += 1
+        if accepted:
+            self.log.info("<- %s accepted (%s)", action, reason)
+        else:
+            self.log.warning("<- %s REJECTED: %s", action, reason)
+
+    def _decide(
+        self, action: str, decide: Any, *args: Any
+    ) -> tuple[bool, str]:
+        """
+        Run one StationCommands method, converting any escape into a
+        refusal rather than a CALLError. Rule 2 above.
+        """
+        try:
+            accepted, reason = decide(*args)
+        except Exception as exc:  # noqa: BLE001 - deliberate backstop
+            self.log.exception(
+                "handler for %s raised; answering Rejected rather than "
+                "returning a CALLError, which would tell the CSMS this "
+                "station is faulty", action,
+            )
+            accepted, reason = False, f"internal error: {type(exc).__name__}: {exc}"
+        self._command_log(action, accepted, reason)
+        return accepted, reason
+
+    @staticmethod
+    def _status_info(reason: str) -> dict[str, str]:
+        """
+        statusInfo for a refusal.
+
+        reasonCode is capped at 20 characters by the OCPP schema and
+        additionalInfo at 512 -- exceeding either is a schema violation
+        that the library rejects locally, turning a polite refusal into
+        the CALLError this file exists to avoid.
+        """
+        return {"reason_code": "Rejected", "additional_info": reason[:512]}
+
+    # -- RequestStopTransaction ---------------------------------------------
+
+    @on("RequestStopTransaction")
+    async def on_request_stop_transaction(
+        self, transaction_id: str | None = None, **kwargs: Any
+    ):
+        """
+        Stop the transaction now. The operator pressed stop.
+
+        Rejected when this station has no such transaction open, which
+        is the honest answer and lets the CSMS tell a stale command from
+        a station that ignored it.
+        """
+        accepted, reason = self._decide(
+            "RequestStopTransaction",
+            self.commands.handle_request_stop,
+            transaction_id,
+        )
+        if accepted:
+            return call_result.RequestStopTransaction(status="Accepted")
+        return call_result.RequestStopTransaction(
+            status="Rejected", status_info=self._status_info(reason)
+        )
+
+    # -- SetChargingProfile --------------------------------------------------
+
+    @on("SetChargingProfile")
+    async def on_set_charging_profile(
+        self, evse_id: Any = None, charging_profile: Any = None, **kwargs: Any
+    ):
+        """
+        Cap this station's power. THE experiment-critical command.
+
+        E5's visible payload is the fleet's aggregate power moving on
+        command. This handler is where that begins, and a limit of 0 is
+        the curtailment case -- power to nothing, transaction still
+        open, connector still reporting Occupied.
+        """
+        accepted, reason = self._decide(
+            "SetChargingProfile",
+            self.commands.handle_set_charging_profile,
+            evse_id,
+            charging_profile,
+        )
+        if accepted:
+            return call_result.SetChargingProfile(status="Accepted")
+        return call_result.SetChargingProfile(
+            status="Rejected", status_info=self._status_info(reason)
+        )
+
+    # -- ClearChargingProfile -------------------------------------------------
+
+    @on("ClearChargingProfile")
+    async def on_clear_charging_profile(self, **kwargs: Any):
+        """
+        Remove a cap set earlier; go back to the station's own maximum.
+
+        ClearChargingProfileStatus has no "Rejected" member -- it is
+        Accepted or Unknown, where Unknown means "no matching profile
+        was installed". A station that was never curtailed answering
+        Unknown is correct and is not an error.
+        """
+        accepted, reason = self._decide(
+            "ClearChargingProfile",
+            self.commands.handle_clear_charging_profile,
+            kwargs,
+        )
+        if accepted:
+            return call_result.ClearChargingProfile(status="Accepted")
+        return call_result.ClearChargingProfile(
+            status="Unknown", status_info=self._status_info(reason)
+        )
+
+    # -- TriggerMessage --------------------------------------------------------
+
+    @on("TriggerMessage")
+    async def on_trigger_message(
+        self, requested_message: str = "", evse: Any = None, **kwargs: Any
+    ):
+        """
+        "Send me a <X> right now."
+
+        Included in C3 because it is the cheapest possible probe during
+        an E2 reconnection storm: Track A can ask a station that looks
+        stalled for a StatusNotification and find out in one round trip
+        whether it is alive, without waiting a heartbeat interval.
+
+        Accepting means the message WILL be sent shortly, by the
+        station's loop. It is not sent from inside this handler -- rule
+        1. "NotImplemented" is the spec's word for a message this
+        station will not produce on demand, and is not a failure.
+        """
+        accepted, reason = self._decide(
+            "TriggerMessage",
+            self.commands.handle_trigger_message,
+            requested_message,
+            evse,
+        )
+        if accepted:
+            return call_result.TriggerMessage(status="Accepted")
+        return call_result.TriggerMessage(
+            status="NotImplemented", status_info=self._status_info(reason)
+        )
