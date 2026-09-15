@@ -100,10 +100,25 @@ class CallFailed(Exception):
     is not. The original library exception is kept as __cause__.
     """
 
-    def __init__(self, action: str, reason: str) -> None:
+    def __init__(self, action: str, reason: str, timeout: bool = False) -> None:
         super().__init__(f"{action} failed: {reason}")
         self.action = action
         self.reason = reason
+
+        self.timeout = timeout
+        """
+        Whether the CSMS failed to ANSWER, as opposed to answering with
+        an error.
+
+        Phase C4 needs the distinction and it is not cosmetic. No answer
+        means the server may be overloaded or gone -- during an E2 storm
+        that is the expected condition, and the right response is to
+        back off and try again. A CALLError means the server is right
+        there and is refusing: reconnecting would produce the same
+        refusal immediately, forever, in a loop that never sleeps.
+
+        So: timeouts retry, refusals stop.
+        """
 
 
 class BootResult:
@@ -310,7 +325,7 @@ class StationClient(CpBase):
                 "timeout after %ss waiting for a response to %s",
                 self._response_timeout, action,
             )
-            raise CallFailed(action, "response timeout") from exc
+            raise CallFailed(action, "response timeout", timeout=True) from exc
 
         if response is None:
             # Belt and braces. With suppress=False this should be
@@ -491,6 +506,7 @@ class StationClient(CpBase):
         charging_state: str,
         token: str | None = None,
         offline: bool = False,
+        timestamp: str | None = None,
     ) -> None:
         """
         Report a charging session starting, progressing or ending.
@@ -510,9 +526,33 @@ class StationClient(CpBase):
         unreachable and is being replayed now. Track A records the flag
         and refuses to let a replayed reading overwrite newer live
         state, so setting it honestly lets a run *measure* how much
-        replay occurred instead of guessing. Phase C4 adds the queue;
-        the parameter exists now so that adding it later does not change
-        this signature.
+        replay occurred instead of guessing. Phase C4 added the queue in
+        agent/offline_queue.py.
+
+        *** timestamp IS WHAT MAKES THE REPLAY HONEST (Phase C4). ***
+
+        Live events pass None and get stamped now, which is correct: the
+        reading was taken a moment ago. A REPLAYED event must pass the
+        time the reading was actually TAKEN, or two things break.
+
+        The obvious one: forty seconds of readings would all carry the
+        same instant, and the energy curve would show a vertical jump
+        instead of the outage that really happened.
+
+        The one that is easy to miss: csms/registry.py has a
+        last_meter_at staleness guard whose whole job is to stop a
+        replayed backlog overwriting newer live state -- Track A's note
+        says aggregate_power_w "would jump backwards on the dashboard at
+        exactly the moment the fleet is being watched recover". That
+        guard compares incoming timestamps against the last one applied.
+        Replaying with now() would make every stale event look newer
+        than everything, the guard would never fire, and Track A's
+        defence against this exact problem would be silently disabled by
+        us -- with no error anywhere to say so.
+
+        The meter value inside the event carries the same timestamp, for
+        the same reason: csms/metering.py reads that one, not the outer
+        one, when deciding what a reading is worth.
         """
         if event_type not in msg.TX_EVENT_TYPES:
             raise ValueError(
@@ -520,14 +560,20 @@ class StationClient(CpBase):
                 f"expected one of {msg.TX_EVENT_TYPES}"
             )
 
+        # One timestamp for the whole event: the outer field and the
+        # meter value must agree, or Track A's registry and their
+        # metering module would disagree about when this reading
+        # happened -- and the two are compared during analysis.
+        when = timestamp or msg.now_iso()
+
         payload: dict[str, Any] = {
             "event_type": event_type,
-            "timestamp": msg.now_iso(),
+            "timestamp": when,
             "trigger_reason": trigger_reason,
             "seq_no": seq_no,
             "transaction_info": msg.transaction_info(transaction_id, charging_state),
             "evse": msg.evse(),
-            "meter_value": [msg.meter_value(power_w, energy_wh)],
+            "meter_value": [msg.meter_value(power_w, energy_wh, timestamp=when)],
         }
 
         # Only Started carries the driver's token, matching what a real

@@ -147,14 +147,34 @@ TRIGGER_CHARGING_RATE_CHANGED = "ChargingRateChanged"
 # -- boot reasons ---------------------------------------------------------
 
 BOOT_POWER_UP = "PowerUp"
-BOOT_RECONNECT = "RemoteReset"
+
+BOOT_RECONNECT = "PowerUp"
 """
-OCPP has no "I reconnected after the server went away" boot reason, so
-PowerUp is used for reconnects too. Recorded here as a named constant
-because Phase C4 will want to distinguish a first boot from a
-post-outage reboot in the logs, and the decision about which reason to
-send belongs in one place rather than scattered through the reconnect
-loop.
+*** CHANGED IN PHASE C4. It used to be "RemoteReset". ***
+
+OCPP 2.0.1's BootReasonEnumType has no "I reconnected after the server
+went away" member. The options are ApplicationReset, FirmwareUpdate,
+LocalReset, PowerUp, RemoteReset, ScheduledReset, Triggered, Unknown
+and Watchdog -- and none of them means "the network came back".
+
+"RemoteReset" was wrong in a way that mattered. On the wire it asserts
+that an operator remotely reset this station. Nobody did. Track A logs
+the reason verbatim into the Contract 3 event log, so every one of the
+hundreds of reconnections in a single E2 run would have recorded a
+remote reset that never happened -- and at Stage 9 a log full of them
+reads as a CSMS issuing resets under load, which is a finding, and a
+false one.
+
+"PowerUp" is what a real charger sends after any restart, including one
+caused by losing and regaining its uplink. It is the least wrong true
+statement available. The alternative, "Unknown", is defensible but
+carries no information at all.
+
+The constant is kept as a separate name rather than collapsed into
+BOOT_POWER_UP so the intent stays visible at the call site in
+station.py, and so the decision can be revisited in one place if Track
+A ever wants reconnects distinguishable in their log by some other
+means.
 """
 
 
