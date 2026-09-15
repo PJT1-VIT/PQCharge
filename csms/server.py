@@ -67,7 +67,26 @@ from websockets.asyncio.server import serve
 from csms.authorization import AUTH_MODES, AuthorizationPolicy
 from csms.events import EventLog, EventType, Outcome
 from csms.handlers import DEFAULT_HEARTBEAT_INTERVAL_S, CSMSHandlers
+from csms.persistence import (
+    DEFAULT_DB_PATH,
+    DEFAULT_FLUSH_INTERVAL_S,
+    DEFAULT_SYNCHRONOUS,
+    SYNCHRONOUS_MODES,
+    open_store,
+)
 from csms.registry import SessionRegistry
+from csms.transport import (
+    CLIENT_CERT_MODES,
+    DEFAULT_CERT_DIR,
+    DEFAULT_CLIENT_CERT_MODE,
+    DEFAULT_IDENTITY_CHECK,
+    DEFAULT_SERVER_NAME,
+    IDENTITY_CHECK_MODES,
+    TlsConfigError,
+    build_server_context,
+    check_identity,
+    default_paths,
+)
 from idmanager.stub import StubController
 
 LOGGER = logging.getLogger("csms")
@@ -188,6 +207,11 @@ class CSMS:
         ws_ping_interval: float | None = DEFAULT_WS_PING_INTERVAL_S,
         ws_ping_timeout: float | None = DEFAULT_WS_PING_TIMEOUT_S,
         auth_policy: AuthorizationPolicy | None = None,
+        db_path: str | None = DEFAULT_DB_PATH,
+        db_flush_interval_s: float = DEFAULT_FLUSH_INTERVAL_S,
+        db_synchronous: str = DEFAULT_SYNCHRONOUS,
+        ssl_context: Any | None = None,
+        identity_check: str = DEFAULT_IDENTITY_CHECK,
     ) -> None:
         self.host = host
         self.port = port
@@ -211,12 +235,42 @@ class CSMS:
         and rollback() raise NotImplementedError, which the HTTP layer
         turns into a 501 rather than a stack trace."""
 
+        self.store = open_store(
+            db_path,
+            run_id=self.log.run_id,
+            synchronous=db_synchronous,
+        )
+        """Station state that survives a restart. A NullStore when
+        --no-db is passed, or when the file cannot be opened -- a CSMS
+        that refuses to accept charging stations because a cache file is
+        unwritable is worse than one that forgets what it knew."""
+
+        self.db_flush_interval_s = db_flush_interval_s
+
+        self.ssl_context = ssl_context
+        """The Security Profile 3 context, or None for plain ws://.
+        Built in main() so a bad certificate path stops the server at
+        startup rather than at the first connection."""
+
+        self.identity_check = identity_check
+        """How strictly the certificate's Common Name must match the
+        station id from the path. See csms/transport.py -- without this
+        check, any holder of a valid certificate can claim any station's
+        identity, which is the impersonation E5 demonstrates."""
+
         self.registry = SessionRegistry(
             event_log=self.log,
             crypto_mode=crypto_mode,
             run_id=self.log.run_id,
             migration_controller=self.controller,
+            store=self.store,
         )
+        restored = self.registry.load()
+        if restored:
+            LOGGER.info(
+                "restored %d station(s) from %s -- fleet known before anyone "
+                "reconnects", restored, db_path,
+            )
 
     # -- OCPP WebSocket side --------------------------------------------
 
@@ -245,6 +299,25 @@ class CSMS:
             )
             await websocket.close(code=1008, reason="station id required in path")
             return
+
+        if self.ssl_context is not None:
+            ok, common_name = check_identity(
+                station_id, websocket, mode=self.identity_check
+            )
+            self.log.emit(
+                EventType.CONNECTION_ATTEMPT,
+                station_id,
+                outcome=Outcome.SUCCESS if ok else Outcome.REJECTED,
+                transition="identity_check",
+                certificate_common_name=common_name,
+                identity_matches=common_name == station_id,
+                identity_check=self.identity_check,
+            )
+            if not ok:
+                await websocket.close(
+                    code=1008, reason="certificate identity mismatch"
+                )
+                return
 
         charge_point = CSMSHandlers(
             station_id,
@@ -419,6 +492,10 @@ class CSMS:
             ws_ping_interval=self.ws_ping_interval,
             ws_ping_timeout=self.ws_ping_timeout,
             **self.auth_policy.describe(),
+            db_enabled=self.store.enabled,
+            db_flush_interval_s=self.db_flush_interval_s,
+            tls=self.ssl_context is not None,
+            identity_check=self.identity_check,
         )
         # Every parameter that can affect a measurement is recorded on the
         # SERVER_STARTED event, so a run's configuration is recoverable from
@@ -427,27 +504,59 @@ class CSMS:
 
         stop = asyncio.get_running_loop().create_future()
         self._install_signal_handlers(stop)
+        flusher = asyncio.ensure_future(self._flush_loop())
 
         async with serve(
             self.on_connect,
             self.host,
             self.port,
             subprotocols=SUBPROTOCOLS,
+            ssl=self.ssl_context,
             process_request=self.process_request,
             ping_interval=self.ws_ping_interval,
             ping_timeout=self.ws_ping_timeout,
         ):
+            scheme_ws = "wss" if self.ssl_context is not None else "ws"
+            scheme_http = "https" if self.ssl_context is not None else "http"
             LOGGER.info(
-                "CSMS listening — ws://%s:%d/{station_id} · "
-                "http://%s:%d/api/fleet · mode=%s · run_id=%s",
-                self.host, self.port, self.host, self.port,
+                "CSMS listening — %s://%s:%d/{station_id} · "
+                "%s://%s:%d/api/fleet · mode=%s · run_id=%s",
+                scheme_ws, self.host, self.port,
+                scheme_http, self.host, self.port,
                 self.crypto_mode, self.log.run_id,
             )
+            if self.ssl_context is not None:
+                LOGGER.info(
+                    "the /api surface is behind the same TLS socket: use "
+                    "--cacert %s, and a client certificate if client certs "
+                    "are required",
+                    "certs/root.pem",
+                )
             await stop
 
+        flusher.cancel()
+        self.registry.close()
         self.log.emit(EventType.SERVER_STOPPING, None)
         self.log.close()
         LOGGER.info("CSMS stopped")
+
+    async def _flush_loop(self) -> None:
+        """
+        Push buffered station state to disk on a timer.
+
+        Separate from the connection handlers on purpose: a disk write
+        on the path that accepts a connection is a disk write inside the
+        measurement E2 is taking. This task is the only thing that
+        touches the database during a run, and cancelling it costs at
+        most one interval of state.
+        """
+        if self.db_flush_interval_s <= 0:
+            return
+        while True:
+            await asyncio.sleep(self.db_flush_interval_s)
+            written = self.registry.flush()
+            if written:
+                LOGGER.debug("persistence flush: %d row(s)", written)
 
     def _install_signal_handlers(self, stop: asyncio.Future) -> None:
         """
@@ -524,6 +633,62 @@ def main() -> None:
         help='JSON file of {"TAG-0001": "Accepted", ...} replacing the '
              "seeded token list",
     )
+    parser.add_argument(
+        "--db",
+        default=DEFAULT_DB_PATH,
+        help="SQLite file holding station state across restarts",
+    )
+    parser.add_argument(
+        "--no-db",
+        action="store_true",
+        help="run without persistence; a restarted CSMS then starts with an "
+             "empty fleet and E2 has no recovery denominator",
+    )
+    parser.add_argument(
+        "--db-flush-interval",
+        type=float,
+        default=DEFAULT_FLUSH_INTERVAL_S,
+        help="seconds between buffered writes reaching disk; also the upper "
+             "bound on how much state a hard kill can lose",
+    )
+    parser.add_argument(
+        "--db-synchronous",
+        default=DEFAULT_SYNCHRONOUS,
+        choices=SYNCHRONOUS_MODES,
+        help="SQLite durability. Exposed because it is the same "
+             "durability-versus-speed trade-off the Day 6 event-log "
+             "experiment measures, and the two should be measured together",
+    )
+    parser.add_argument(
+        "--tls",
+        action="store_true",
+        help="enable OCPP Security Profile 3 (mutual TLS). Certificates come "
+             "from `python -m experiments.bootstrap_pki`",
+    )
+    parser.add_argument(
+        "--cert-dir",
+        default=DEFAULT_CERT_DIR,
+        help="directory bootstrap_pki wrote the PKI into",
+    )
+    parser.add_argument("--cert", default=None, help="server certificate PEM")
+    parser.add_argument("--key", default=None, help="server private key PEM")
+    parser.add_argument("--ca", default=None, help="CA root PEM")
+    parser.add_argument(
+        "--tls-client-certs",
+        default=DEFAULT_CLIENT_CERT_MODE,
+        choices=CLIENT_CERT_MODES,
+        help="'required' is Security Profile 3. Anything else is a documented "
+             "deviation — and note every caller of /api, including the "
+             "dashboard, then needs a client certificate too",
+    )
+    parser.add_argument(
+        "--tls-identity-check",
+        default=DEFAULT_IDENTITY_CHECK,
+        choices=IDENTITY_CHECK_MODES,
+        help="compare the certificate Common Name against the station id in "
+             "the path. 'enforce' refuses a mismatch — without it any valid "
+             "certificate can claim any station's identity",
+    )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -531,6 +696,19 @@ def main() -> None:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
     )
+
+    ssl_context = None
+    if args.tls:
+        cert, key, ca = default_paths(args.cert_dir, DEFAULT_SERVER_NAME)
+        try:
+            ssl_context = build_server_context(
+                args.cert or cert,
+                args.key or key,
+                args.ca or ca,
+                client_certs=args.tls_client_certs,
+            )
+        except TlsConfigError as exc:
+            parser.error(str(exc))
 
     auth_policy = (
         AuthorizationPolicy.from_file(args.id_tokens, mode=args.auth_mode)
@@ -548,6 +726,11 @@ def main() -> None:
         ws_ping_interval=args.ws_ping_interval or None,
         ws_ping_timeout=args.ws_ping_timeout or None,
         auth_policy=auth_policy,
+        db_path=None if args.no_db else args.db,
+        db_flush_interval_s=args.db_flush_interval,
+        db_synchronous=args.db_synchronous,
+        ssl_context=ssl_context,
+        identity_check=args.tls_identity_check,
     )
     try:
         asyncio.run(csms.run())

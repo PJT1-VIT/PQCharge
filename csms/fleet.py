@@ -173,6 +173,12 @@ class StationView:
     """When the current connection opened. None when not connected.
     Timezone-aware UTC."""
 
+    last_seen_at: datetime | None = None
+    """When this station was last connected, set on connect and again on
+    disconnect. Unlike connected_since it survives the disconnection, so
+    a dashboard can render "7400 W, last seen 40 s ago" instead of
+    presenting a stale figure as current. None if never seen."""
+
     last_heartbeat_at: datetime | None = None
     """Timestamp of the most recent Heartbeat. Timezone-aware UTC."""
 
@@ -212,6 +218,19 @@ class StationView:
     """Cumulative energy for the active transaction, in watt-hours.
     Matching Contract 5."""
 
+    power_is_stale: bool = False
+    """True when power_w and energy_wh are last-known rather than current
+    -- i.e. the station is not connected.
+
+    A station keeps its last reading after disconnecting, by decision, so
+    the fleet table can show what it was drawing when it vanished. This
+    flag is what stops that being mistaken for a live figure.
+    FleetSnapshot.aggregate_power_w and charging_count exclude stale
+    stations for the same reason: a fleet total inflated by stations
+    nobody can currently see is not a number that survives being asked
+    about, and E5's claim rests on that total meaning real present
+    draw."""
+
     # -- cryptographic identity, owned by Track B ----------------------
 
     current_algorithm: str | None = None
@@ -241,7 +260,12 @@ class StationView:
     def to_dict(self) -> dict[str, Any]:
         """JSON-serialisable form. Datetimes become ISO-8601 strings."""
         d = asdict(self)
-        for key in ("connected_since", "last_heartbeat_at", "certificate_expiry"):
+        for key in (
+            "connected_since",
+            "last_seen_at",
+            "last_heartbeat_at",
+            "certificate_expiry",
+        ):
             value = d.get(key)
             d[key] = value.isoformat() if isinstance(value, datetime) else None
         return d
@@ -291,11 +315,18 @@ class FleetSnapshot:
     charging_count: int = 0
 
     aggregate_power_w: float = 0.0
-    """Sum of power_w across all stations drawing power.
+    """Sum of power_w across CONNECTED stations only.
 
     The headline number of the E5 attack demonstration: a forged
     identity issues a fleet-wide charging profile and this figure spikes
-    on screen. The cyber-to-physical consequence, in one value."""
+    on screen. The cyber-to-physical consequence, in one value.
+
+    Stations keep their last reading after disconnecting -- see
+    StationView.power_is_stale -- but they are excluded here. A total
+    that counted stations nobody can currently see would claim present
+    draw the CSMS cannot observe, and this figure is the one the whole
+    attack demonstration rests on. charging_count is scoped the same
+    way, for the same reason."""
 
     stations: list[StationView] = field(default_factory=list)
 
