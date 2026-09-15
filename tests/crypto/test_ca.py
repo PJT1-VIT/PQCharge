@@ -9,7 +9,7 @@ from cryptography.x509.oid import NameOID
 
 from crypto.ca import CertificateAuthority
 from crypto.classical import ClassicalProvider
-from crypto.pq_placeholder_for_tests import FakeNonClassicalProvider
+from crypto.pq import PQProvider
 
 
 def test_root_certificate_is_self_signed_and_valid():
@@ -82,8 +82,13 @@ def test_revoke_raises_not_implemented_until_day5():
 
 
 def test_ca_rejects_non_classical_provider_for_now():
+    # The CA rejects any non-classical provider at __init__ (mode check),
+    # before any crypto method is called -- so the real PQProvider, whose
+    # methods still raise Day 8 markers, works as the input here. When Day 8
+    # gives ca.py a real PQC signing path, this test changes to assert
+    # success instead.
     with pytest.raises(NotImplementedError):
-        CertificateAuthority(FakeNonClassicalProvider())
+        CertificateAuthority(PQProvider())
 
 # -- SAN tests (added when issue_server_certificate landed) --------------
 
