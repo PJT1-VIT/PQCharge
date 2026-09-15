@@ -1,29 +1,35 @@
 """
 Post-quantum cryptographic backend — ML-DSA-44 signatures, ML-KEM-768 key
-establishment, via liboqs.
+establishment.
 
-SCAFFOLDING ONLY (Days 3-6). Every method raises NotImplementedError with a
-message naming the Day 8 task. The class STRUCTURE is fixed now -- it subclasses
-Contract 1 exactly as ClassicalProvider does, so Day 8 is filling in method
-bodies against liboqs, not designing the interface. Nothing imports this yet;
-it is inert.
+Implements Contract 1 (CryptoProvider) for mode "pqc".
 
-DO NOT `pip install liboqs-python` to write this file. The import is deferred
-into the methods (not at module top level) precisely so this scaffolding can be
-committed, imported, and unit-tested for its structure WITHOUT liboqs present.
-The install is a Day 8 task and is the one dependency that can fail on Windows.
+BACKEND: quantcrypt (PQClean precompiled binaries), NOT liboqs.
+liboqs-python requires building the liboqs C library from source, which needs
+CMake + an MSVC toolchain not present on the Track B Windows machine. quantcrypt
+ships prebuilt PQClean wheels (quantcrypt==1.0.0 has a cp310 win_amd64 wheel),
+installs with no compiler, and implements the same NIST FIPS 203/204 parameter
+sets. Artifact sizes are standard-defined and therefore identical to liboqs
+(verified on this machine: ML-DSA-44 sig 2420 B, ML-KEM-768 ct 1088 B). Because
+everything sits behind Contract 1, the backend is swappable: final E1 *timing*
+numbers may later be produced on a liboqs machine (the Pi, or Track A's Mac)
+without changing this file's interface. Flagged to the team and recorded in
+docs/limitations.md.
 
-Algorithm choices, fixed:
-  - Signatures:        ML-DSA-44  (FIPS 204, liboqs name "ML-DSA-44")
-  - Key establishment: ML-KEM-768 (FIPS 203, liboqs name "ML-KEM-768")
-Changing them changes every E1 and E4 figure, so they are named here once.
+TWO PLACES THIS BACKEND DIVERGES FROM Contract 1 / ClassicalProvider, both
+adapted here so callers see a uniform interface:
 
-DAY 8 CERTIFICATE-SIGNING NOTE: crypto/ca.py cannot sign an X.509 certificate
-with an ML-DSA key through cryptography's CertificateBuilder -- this version has
-no ml_dsa key type (verified). The two resolutions are recorded in ca.py's
-_signing_key docstring and docs/limitations.md. This file provides sign()/verify()
-over raw bytes regardless; whether those feed an X.509 cert or an
-application-layer handshake is decided when the Day 8 signing path is chosen.
+  1. quantcrypt keygen() returns (public, secret) -- PUBLIC FIRST. Contract 1
+     and ClassicalProvider return (private, public). This module SWAPS the order
+     so PQProvider.generate_keypair() returns (private, public) like every other
+     provider. A caller must never see the quantcrypt order.
+
+  2. quantcrypt verify() RAISES DSSVerifyFailedError on a bad signature. Contract
+     1 requires verify() to RETURN False and never raise, because Track A treats
+     it as an authentication decision. This module catches and returns False.
+
+Key material crosses the Contract 1 boundary as raw bytes, exactly as
+ClassicalProvider's does.
 """
 
 from __future__ import annotations
@@ -33,22 +39,35 @@ from crypto.provider import CryptoProvider, CryptoMode
 SIG_ALG = "ML-DSA-44"
 KEM_ALG = "ML-KEM-768"
 
-_DAY8 = "Track B Day 8: liboqs post-quantum backend not implemented yet"
-
 
 class PQProvider(CryptoProvider):
     """
-    Pure post-quantum provider (mode "pqc"): ML-DSA-44 + ML-KEM-768.
+    Pure post-quantum provider (mode "pqc"): ML-DSA-44 + ML-KEM-768 via
+    quantcrypt/PQClean.
 
     Hybrid mode (classical + PQC together) is a separate concern and, if built,
-    will be its own subclass -- this class is pure PQC only, so a measurement
-    tagged "pqc" is unambiguously the post-quantum algorithms alone.
+    is its own subclass -- this class is pure PQC only, so a measurement tagged
+    "pqc" is unambiguously the post-quantum algorithms alone.
+
+    quantcrypt objects are constructed per call rather than held as instance
+    state: the library's DSS/KEM objects are cheap to make and constructing
+    fresh avoids any hidden per-object state leaking across the CryptoProvider's
+    stateless-by-contract methods.
     """
 
     def __init__(self, mode: CryptoMode = "pqc") -> None:
         if mode != "pqc":
             raise ValueError(f"PQProvider serves mode 'pqc', not {mode!r}")
         super().__init__(mode)
+        # Import here, not at module top level, so the rest of the package -- and
+        # every test that does not exercise PQ crypto -- imports without
+        # quantcrypt installed. Matches the deferred-import discipline the
+        # scaffolding established.
+        from quantcrypt.dss import MLDSA_44
+        from quantcrypt.kem import MLKEM_768
+
+        self._MLDSA_44 = MLDSA_44
+        self._MLKEM_768 = MLKEM_768
 
     @property
     def signature_algorithm(self) -> str:
@@ -61,21 +80,57 @@ class PQProvider(CryptoProvider):
     # -- signatures (ML-DSA-44) ---------------------------------------
 
     def generate_keypair(self) -> tuple[bytes, bytes]:
-        raise NotImplementedError(_DAY8)
+        """
+        Returns (private_key, public_key) as raw bytes.
+
+        NOTE: quantcrypt's keygen() returns (public, secret). We swap to
+        Contract 1's (private, public) order so callers see the same shape as
+        every other provider.
+        """
+        public_key, private_key = self._MLDSA_44().keygen()
+        return private_key, public_key
 
     def sign(self, private_key: bytes, message: bytes) -> bytes:
-        raise NotImplementedError(_DAY8)
+        return self._MLDSA_44().sign(private_key, message)
 
     def verify(self, public_key: bytes, message: bytes, signature: bytes) -> bool:
-        raise NotImplementedError(_DAY8)
+        """
+        Returns True / False. quantcrypt raises DSSVerifyFailedError on a bad
+        signature; Contract 1 requires a bool, so the exception is caught here.
+        Any malformed input also returns False rather than propagating.
+        """
+        try:
+            return bool(self._MLDSA_44().verify(public_key, message, signature))
+        except Exception:
+            # DSSVerifyFailedError on a bad/forged signature, plus any parse
+            # error on malformed key/signature bytes -- all are "not valid",
+            # never a raised exception, because Track A reads this as an
+            # authentication decision.
+            return False
 
     # -- key establishment (ML-KEM-768) -------------------------------
 
     def generate_kem_keypair(self) -> tuple[bytes, bytes]:
-        raise NotImplementedError(_DAY8)
+        """
+        Returns (private_key, public_key) as raw bytes -- swapped from
+        quantcrypt's (public, secret) order, as generate_keypair() is.
+        """
+        public_key, private_key = self._MLKEM_768().keygen()
+        return private_key, public_key
 
     def encapsulate(self, public_key: bytes) -> tuple[bytes, bytes]:
-        raise NotImplementedError(_DAY8)
+        """
+        Returns (shared_secret, ciphertext).
+
+        NOTE: quantcrypt's encaps() returns (ciphertext, shared_secret).
+        Contract 1 (and ClassicalProvider) order it (shared_secret, ciphertext),
+        so we swap. The ciphertext is transmitted to the peer; the shared secret
+        is not.
+        """
+        ciphertext, shared_secret = self._MLKEM_768().encaps(public_key)
+        return shared_secret, ciphertext
 
     def decapsulate(self, private_key: bytes, ciphertext: bytes) -> bytes:
-        raise NotImplementedError(_DAY8)
+        """Recover the shared secret. Identical to the value encapsulate()
+        produced on the other side."""
+        return self._MLKEM_768().decaps(private_key, ciphertext)
