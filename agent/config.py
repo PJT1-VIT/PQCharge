@@ -188,6 +188,72 @@ class AgentConfig:
     being under anyone's deliberate control.
     """
 
+    connect_timeout_s: float = 5.0
+    """
+    How long ONE connection attempt may take before it is abandoned.
+
+    *** TRACK A ASKED FOR THIS TO BE CONFIGURABLE (their §9.5). ***
+
+    Phase C4 introduced it as a constant because the websockets default
+    of 10 seconds was measurably too long: on Windows a connect() to a
+    dead port blocked for most of an outage instead of being refused,
+    and the station does not meter while an attempt is in flight, so a
+    slow-failing connect is a hole in the offline readings.
+
+    Track A's concern is the other direction and it is the one that
+    matters at scale. Their words: the algorithms are not the risk, five
+    hundred Python processes contending for one laptop's CPU is. If a
+    handshake -- classical today, post-quantum at Stage 8 -- takes
+    longer than this under load, agents abandon attempts that would have
+    succeeded, and the abandoned attempts are recorded as failed
+    recoveries.
+
+    So it is a config field, and harness/load_generator.py reports how
+    many attempts hit it. MEASURE THIS AT N=50 AND N=100 BEFORE THE
+    500-NODE RUN, with --tls on and off. Do not discover it during E2.
+    """
+
+    # -- TLS (Phase C5 transport seam; C8 adds certificate lifecycle) -----
+    #
+    # Whether TLS is used at all is decided by the URL SCHEME, not by a
+    # separate flag -- see the uses_tls property. One source of truth:
+    # a --tls flag that disagreed with a ws:// URL would be a silent
+    # misconfiguration, and during E2 it would look like a server fault.
+
+    cert_dir: str = "certs"
+    """Where Track B's bootstrap_pki.py writes the PKI."""
+
+    cert: str | None = None
+    key: str | None = None
+    ca: str | None = None
+    """
+    Explicit overrides for this station's TLS material.
+
+    Normally left None, so the station id picks the files and five
+    hundred agents need no per-agent arguments. Setting --cert to
+    ANOTHER station's certificate is how the identity-binding attack
+    Track A demonstrated (their §6.2) gets shown from the client side.
+    """
+
+    tls_server_name: str | None = None
+    """
+    The hostname to verify the server's certificate against.
+
+    None means "use the host from the URL", which is right for
+    localhost. The Raspberry Pi case needs the CSMS machine's mDNS
+    .local name here, and that name must be in the server certificate's
+    SAN -- Track B built san_names for exactly this and the value is
+    still to be chosen.
+    """
+
+    tls_check_hostname: bool = True
+    """
+    Leave this on. Off means the station stops verifying it is talking
+    to the CSMS it thinks it is, which is half of mutual authentication
+    -- and the half that fails first at Pi integration, where it is
+    tempting to switch off rather than fix the SAN.
+    """
+
     # -- reconnection (used from Phase C4) -------------------------------
 
     reconnect_base_delay_s: float = 1.0
@@ -334,12 +400,47 @@ class AgentConfig:
         if self.log_level not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
             raise ValueError(f"unknown log_level {self.log_level!r}")
 
+        # Phase C5. Validated here rather than at first connect, because
+        # a bad value discovered on attempt one of a 500-agent run is a
+        # bad value discovered after the run has already started.
+        if self.connect_timeout_s <= 0:
+            raise ValueError(
+                f"connect_timeout_s must be > 0, got {self.connect_timeout_s}"
+            )
+
+        if self.uses_tls and not (self.cert and self.key and self.ca):
+            # Not an error -- the defaults derive all three from the
+            # station id and cert_dir. This only checks the partial case,
+            # which is the one that silently does something unintended.
+            provided = [n for n, v in
+                        (("cert", self.cert), ("key", self.key), ("ca", self.ca))
+                        if v]
+            if provided and len(provided) < 3:
+                raise ValueError(
+                    "TLS overrides must be given together or not at all; got "
+                    f"only {', '.join(provided)}. Omit all three to derive them "
+                    f"from cert_dir and station_id."
+                )
+
         # A run id is always present after construction, so nothing
         # downstream has to handle None.
         if self.run_id is None:
             self.run_id = uuid.uuid4().hex[:12]
 
     # -- derived values ---------------------------------------------------
+
+    @property
+    def uses_tls(self) -> bool:
+        """
+        Whether this station connects over TLS.
+
+        Derived from the URL scheme and from nothing else. A separate
+        --tls flag could disagree with the URL, and a station that was
+        told to use TLS while pointed at ws:// would fail in a way that
+        reads as a server fault -- during E2, with five hundred of them,
+        it would read as a post-quantum fault.
+        """
+        return self.csms_url.lower().startswith("wss://")
 
     @property
     def ws_url(self) -> str:
@@ -381,6 +482,8 @@ class AgentConfig:
         return (
             f"station={self.station_id} url={self.ws_url} "
             f"mode={self.crypto_mode} token={self.id_token} "
+            f"tls={'on' if self.uses_tls else 'off'} "
+            f"connect_timeout={self.connect_timeout_s}s "
             f"run_id={self.run_id} log_level={self.log_level}"
         )
 
@@ -445,6 +548,44 @@ class AgentConfig:
             help="seconds to wait for the CSMS to answer one message",
         )
         parser.add_argument(
+            "--connect-timeout", dest="connect_timeout_s", type=float,
+            default=cls.connect_timeout_s,
+            help="seconds one connection ATTEMPT may take before it is "
+                 "abandoned. Raise it if a loaded run shows abandoned "
+                 "attempts; see the field docstring",
+        )
+
+        tls = parser.add_argument_group(
+            "TLS",
+            "Whether TLS is used is decided by the URL scheme: use a "
+            "wss:// --csms-url. These control WHICH material is presented.",
+        )
+        tls.add_argument(
+            "--cert-dir", dest="cert_dir", default=cls.cert_dir,
+            help="directory written by `python -m experiments.bootstrap_pki`",
+        )
+        tls.add_argument(
+            "--cert", dest="cert", default=None,
+            help="override this station's certificate; use ANOTHER station's "
+                 "to demonstrate the identity-binding attack",
+        )
+        tls.add_argument("--key", dest="key", default=None,
+                         help="override this station's private key")
+        tls.add_argument("--ca", dest="ca", default=None,
+                         help="override the CA root")
+        tls.add_argument(
+            "--tls-server-name", dest="tls_server_name", default=None,
+            help="hostname to verify the server certificate against; needs to "
+                 "be in the certificate's SAN (the Raspberry Pi .local case)",
+        )
+        tls.add_argument(
+            "--tls-no-hostname-check", dest="tls_no_hostname_check",
+            action="store_true",
+            help="stop verifying the server's identity. Deliberate "
+                 "experiments only; belongs in docs/limitations.md",
+        )
+
+        parser.add_argument(
             "--reconnect-base-delay", dest="reconnect_base_delay_s",
             type=float, default=cls.reconnect_base_delay_s,
         )
@@ -503,6 +644,13 @@ class AgentConfig:
             supported_algorithms=algorithms,
             max_power_w=ns.max_power_w,
             response_timeout_s=ns.response_timeout_s,
+            connect_timeout_s=getattr(ns, "connect_timeout_s", 5.0),
+            cert_dir=getattr(ns, "cert_dir", "certs"),
+            cert=getattr(ns, "cert", None),
+            key=getattr(ns, "key", None),
+            ca=getattr(ns, "ca", None),
+            tls_server_name=getattr(ns, "tls_server_name", None),
+            tls_check_hostname=not getattr(ns, "tls_no_hostname_check", False),
             reconnect_base_delay_s=ns.reconnect_base_delay_s,
             reconnect_max_delay_s=ns.reconnect_max_delay_s,
             reconnect_jitter=ns.reconnect_jitter,
