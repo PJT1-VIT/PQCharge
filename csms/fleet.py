@@ -218,6 +218,22 @@ class StationView:
     """Cumulative energy for the active transaction, in watt-hours.
     Matching Contract 5."""
 
+    bytes_tx: int = 0
+    bytes_rx: int = 0
+    """OCPP payload bytes on the CURRENT connection, application layer
+    only -- TLS framing, the handshake and TCP overhead are not visible
+    above the socket and are not counted. Wire-level bandwidth comes
+    from Wireshark. Zero when not connected."""
+
+    tls_version: str | None = None
+    peer_cert_bytes: int | None = None
+    """What the station actually presented on this connection. None when
+    the connection is plain ws://, or when the figure could not be read
+    -- never zero, because a zero certificate size would read as a
+    measurement. peer_cert_bytes is a live-connection input to E4,
+    beside Track B's static measurement of certificates on disk; on
+    Day 8 the same field shows the post-quantum certificate arriving."""
+
     power_is_stale: bool = False
     """True when power_w and energy_wh are last-known rather than current
     -- i.e. the station is not connected.

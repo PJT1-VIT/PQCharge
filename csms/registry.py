@@ -119,6 +119,16 @@ class StationSession:
     """Day 7 instrumentation. Present now so that adding the counters
     later is wiring, not a schema change."""
 
+    tls_version: str | None = None
+    tls_cipher: str | None = None
+    peer_cert_bytes: int | None = None
+    """TLS facts for THIS connection, captured once at connect.
+
+    peer_cert_bytes is the DER size of the certificate the station
+    actually presented -- a live-connection input to E4, alongside
+    Track B's static measurement of certificates on disk. None means
+    not measured, never zero: a zero would read as a measurement."""
+
     store_session_id: str = ""
     """Row identifier for this connection in the sessions table, minted
     by the store when the connection opened. Empty when persistence is
@@ -335,6 +345,8 @@ class SessionRegistry(FleetView):
         connection: Any,
         *,
         handshake_ms: float | None = None,
+        security: dict[str, Any] | None = None,
+        extra: dict[str, Any] | None = None,
     ) -> StationSession:
         """
         Record a newly opened connection.
@@ -356,12 +368,16 @@ class SessionRegistry(FleetView):
                 reason="superseded_by_reconnect",
             )
 
+        security = security or {}
         session = StationSession(
             station_id=station_id,
             connection=connection,
             connected_since=_now(),
             connected_monotonic_ns=time.monotonic_ns(),
             last_handshake_ms=handshake_ms,
+            tls_version=security.get("tls_version"),
+            tls_cipher=security.get("tls_cipher"),
+            peer_cert_bytes=security.get("peer_cert_bytes"),
         )
         self._sessions[station_id] = session
         self._ever_connected.add(station_id)
@@ -389,6 +405,8 @@ class SessionRegistry(FleetView):
                 handshake_ms=handshake_ms,
                 outcome=Outcome.SUCCESS,
                 superseded_stale_session=stale is not None,
+                **{k: v for k, v in security.items() if k != "peer_common_name"},
+                **(extra or {}),
             )
         return session
 
@@ -440,6 +458,8 @@ class SessionRegistry(FleetView):
                 session_duration_ms=(
                     (time.monotonic_ns() - session.connected_monotonic_ns) / 1e6
                 ),
+                bytes_tx=session.bytes_tx,
+                bytes_rx=session.bytes_rx,
             )
         return True
 
@@ -460,6 +480,26 @@ class SessionRegistry(FleetView):
         session = self._sessions.get(station_id)
         if session is not None:
             session.boot_accepted = True
+
+    def record_bytes(
+        self, station_id: str, *, tx: int = 0, rx: int = 0
+    ) -> None:
+        """
+        Accumulate OCPP payload bytes for this connection.
+
+        APPLICATION-LAYER BYTES ONLY: the JSON this server sent and
+        received. TLS record framing, the handshake itself and TCP
+        overhead are NOT included, because nothing above the socket can
+        see them. True wire bandwidth comes from Wireshark, which the
+        project's tool table already lists. Reporting these as "bytes on
+        the wire" would understate the post-quantum cost, since the
+        handshake is exactly where the large artifacts travel.
+        """
+        session = self._sessions.get(station_id)
+        if session is None:
+            return
+        session.bytes_tx += tx
+        session.bytes_rx += rx
 
     def record_heartbeat(self, station_id: str) -> None:
         session = self._sessions.get(station_id)
@@ -803,6 +843,10 @@ class SessionRegistry(FleetView):
             last_heartbeat_at=session.last_heartbeat_at if session else None,
             seconds_since_heartbeat=seconds_since_heartbeat,
             last_handshake_ms=session.last_handshake_ms if session else None,
+            bytes_tx=session.bytes_tx if session else 0,
+            bytes_rx=session.bytes_rx if session else 0,
+            tls_version=session.tls_version if session else None,
+            peer_cert_bytes=session.peer_cert_bytes if session else None,
             ocpp_status=state.ocpp_status,
             charging_state=state.charging_state,
             active_transaction_id=state.active_transaction_id,
