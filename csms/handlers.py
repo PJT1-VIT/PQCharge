@@ -80,6 +80,41 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+HAS_ROUTE_MESSAGE = hasattr(CpBase, "route_message")
+HAS_SEND = hasattr(CpBase, "_send")
+"""Whether the installed ocpp library still has the hooks byte counting
+rides on.
+
+These are the library's own methods, not a documented API. Overriding
+them is how every OCPP message can be measured in one place instead of
+by hand in each handler -- but a library upgrade could move them, and
+then the overrides would simply never be called and every byte count
+would be zero.
+
+A zero that looks like a measurement is the failure this project keeps
+running into. So the flags are exported, csms/server.py records them on
+SERVER_STARTED, and a run whose byte counts are absent says so in its
+own log rather than quietly reporting nothing."""
+
+if not (HAS_ROUTE_MESSAGE and HAS_SEND):  # pragma: no cover
+    LOGGER.warning(
+        "the installed ocpp library is missing %s -- OCPP byte counts and "
+        "MESSAGE_SENT/MESSAGE_RECEIVED events will be ABSENT for this run. "
+        "Do not read the resulting zeros as measurements.",
+        [n for n, ok in (("route_message", HAS_ROUTE_MESSAGE),
+                         ("_send", HAS_SEND)) if not ok],
+    )
+
+
+def _wire_size(message: object) -> int:
+    """Bytes one OCPP message occupies as UTF-8 JSON."""
+    if isinstance(message, bytes):
+        return len(message)
+    if isinstance(message, str):
+        return len(message.encode("utf-8"))
+    return len(str(message).encode("utf-8"))
+
+
 RESERVED_EMIT_KEYS: frozenset[str] = frozenset(
     {
         "event_type",
@@ -151,6 +186,15 @@ class CSMSHandlers(CpBase):
         self.log_messages = log_messages
         self.auth_policy = auth_policy or AuthorizationPolicy()
 
+        self.handling_message = False
+        """True while an @on handler is executing on this connection.
+
+        csms/dispatch.py reads it and REFUSES to send rather than
+        deadlocking. A command awaits a response that can only arrive
+        through the receive loop -- which, inside a handler, is the loop
+        currently blocked waiting for that handler to return. Refusing
+        turns a hang into a stack trace naming the caller."""
+
     # -- helpers --------------------------------------------------------
 
     def _log_message(self, action: str, **detail) -> None:
@@ -176,6 +220,62 @@ class CSMSHandlers(CpBase):
                 action=action,
                 **_safe_payload(detail),
             )
+
+    # -- instrumentation (Day 7) -----------------------------------------
+
+    async def route_message(self, raw_msg):
+        """
+        Every inbound OCPP message passes through here.
+
+        Counting in one place rather than per handler means a message
+        this server does not implement is still measured -- which
+        matters for E6, where a third-party client sends actions we may
+        not handle, and for any message that arrives malformed.
+
+        The counter is updated BEFORE routing, so a message that raises
+        inside its handler is still counted as received. It did arrive;
+        whether we processed it is a separate question the outcome field
+        already answers.
+        """
+        size = _wire_size(raw_msg)
+        self.registry.record_bytes(self.id, rx=size)
+        if self.log_messages:
+            self.event_log.emit(
+                EventType.MESSAGE_RECEIVED,
+                self.id,
+                bytes_rx=size,
+                direction="inbound",
+            )
+        # Marked busy for the whole of routing, not just the handler
+        # body, because the receive loop is blocked for that entire
+        # span -- and it is the receive loop, not the handler, that a
+        # dispatched command would be waiting on.
+        self.handling_message = True
+        try:
+            return await super().route_message(raw_msg)
+        finally:
+            self.handling_message = False
+
+    async def _send(self, message):
+        """
+        Every outbound OCPP message passes through here.
+
+        This is where MESSAGE_SENT belongs -- the A2 note deferred it to
+        "the Day 7 instrumentation wrapper rather than a hand call in
+        every handler", and this is that wrapper. One override covers
+        responses, and from Days 8-9 it covers dispatched commands too
+        with no further change.
+        """
+        size = _wire_size(message)
+        self.registry.record_bytes(self.id, tx=size)
+        if self.log_messages:
+            self.event_log.emit(
+                EventType.MESSAGE_SENT,
+                self.id,
+                bytes_tx=size,
+                direction="outbound",
+            )
+        return await super()._send(message)
 
     # -- BootNotification -----------------------------------------------
 

@@ -55,6 +55,7 @@ import asyncio
 import json
 import logging
 import signal
+import time
 from http import HTTPStatus
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
@@ -65,8 +66,14 @@ from websockets.http11 import Response
 from websockets.asyncio.server import serve
 
 from csms.authorization import AUTH_MODES, AuthorizationPolicy
+from csms.dispatch import DEFAULT_DISPATCH_TIMEOUT_S, CommandDispatcher
 from csms.events import EventLog, EventType, Outcome
-from csms.handlers import DEFAULT_HEARTBEAT_INTERVAL_S, CSMSHandlers
+from csms.handlers import (
+    DEFAULT_HEARTBEAT_INTERVAL_S,
+    HAS_ROUTE_MESSAGE,
+    HAS_SEND,
+    CSMSHandlers,
+)
 from csms.persistence import (
     DEFAULT_DB_PATH,
     DEFAULT_FLUSH_INTERVAL_S,
@@ -86,6 +93,7 @@ from csms.transport import (
     build_server_context,
     check_identity,
     default_paths,
+    describe_connection_security,
 )
 from idmanager.stub import StubController
 
@@ -136,6 +144,37 @@ noise to the one measurement the project is built on. Run E2 with
 
 Set to None (via 0 on the command line) to disable entirely.
 """
+
+
+HANDSHAKE_SCOPE = "server_upgrade"
+"""What this server's handshake_ms actually measures, stamped on every
+connection event so no analysis can mistake it for the full figure.
+
+THE SERVER CANNOT TIME ITS OWN TLS HANDSHAKE. By the time any of our
+code runs on a connection, process_request has already been reached --
+which is after the certificate exchange and after the HTTP request line
+is parsed. The websockets library exposes no earlier hook.
+
+So the server measures the WebSocket UPGRADE, from the first moment it
+sees the connection to the moment the handler starts. That is a real
+number and it belongs in the log, but it is NOT the cost of exchanging
+post-quantum certificates, which is what E1 is about.
+
+The full handshake is measured CLIENT-side, where one process owns the
+whole sequence -- TCP connect, TLS handshake, WebSocket upgrade. Track C
+already logs it, and their harness timing log is joined to this one on
+station_id + run_id at analysis time (their plan §6.1). Their figure is
+E1's headline; this one cross-checks it and covers the server's view.
+
+Recording the scope in the data rather than only in a document means the
+distinction survives someone reading the log six weeks from now.
+"""
+
+CONNECTION_START_ATTR = "_pqcharge_seen_at_ns"
+"""Monotonic reading stamped on the connection in process_request, read
+back in on_connect. An attribute on the library's object rather than a
+dictionary keyed by connection, so it cannot leak if a connection is
+dropped between the two points."""
 
 
 def _json_response(status: HTTPStatus, payload: Any) -> Response:
@@ -212,6 +251,7 @@ class CSMS:
         db_synchronous: str = DEFAULT_SYNCHRONOUS,
         ssl_context: Any | None = None,
         identity_check: str = DEFAULT_IDENTITY_CHECK,
+        dispatch_timeout_s: float = DEFAULT_DISPATCH_TIMEOUT_S,
     ) -> None:
         self.host = host
         self.port = port
@@ -265,6 +305,16 @@ class CSMS:
             migration_controller=self.controller,
             store=self.store,
         )
+        self.dispatcher = CommandDispatcher(
+            self.registry, self.log, timeout_s=dispatch_timeout_s
+        )
+        """Sends OCPP commands down to stations.
+
+        Handed to Track B's migration orchestrator when it lands: its
+        certificate messages go through the same generic send() as the
+        charging commands, so Stage 5 rotation is not a second path
+        built under time pressure."""
+
         restored = self.registry.load()
         if restored:
             LOGGER.info(
@@ -319,6 +369,18 @@ class CSMS:
                 )
                 return
 
+        seen_at_ns = getattr(websocket, CONNECTION_START_ATTR, None)
+        setup_ms = (
+            (time.monotonic_ns() - seen_at_ns) / 1e6
+            if seen_at_ns is not None
+            else None
+        )
+        security = (
+            describe_connection_security(websocket)
+            if self.ssl_context is not None
+            else {}
+        )
+
         charge_point = CSMSHandlers(
             station_id,
             websocket,
@@ -328,7 +390,14 @@ class CSMS:
             log_messages=self.log_messages,
             auth_policy=self.auth_policy,
         )
-        self.registry.register(station_id, charge_point)
+        self.registry.register(
+            station_id,
+            charge_point,
+            handshake_ms=setup_ms,
+            security={k: v for k, v in security.items()
+                      if k != "peer_common_name"},
+            extra={"handshake_scope": HANDSHAKE_SCOPE},
+        )
         LOGGER.info("station connected: %s", station_id)
 
         try:
@@ -358,6 +427,15 @@ class CSMS:
         walk over in-memory state. Nothing here touches SQLite, and
         nothing here awaits.
         """
+        # First moment this server sees the connection. Stamped for every
+        # request, WebSocket upgrade or /api call alike, because the cost
+        # of one monotonic read is nothing and branching here would mean
+        # the OCPP path -- the one being measured -- carried the branch.
+        try:
+            setattr(connection, CONNECTION_START_ATTR, time.monotonic_ns())
+        except (AttributeError, TypeError):  # pragma: no cover
+            pass
+
         parsed = urlparse(request.path)
         path = parsed.path
 
@@ -496,6 +574,9 @@ class CSMS:
             db_flush_interval_s=self.db_flush_interval_s,
             tls=self.ssl_context is not None,
             identity_check=self.identity_check,
+            handshake_scope=HANDSHAKE_SCOPE,
+            byte_counting_available=HAS_ROUTE_MESSAGE and HAS_SEND,
+            dispatch_timeout_s=dispatch_timeout_s,
         )
         # Every parameter that can affect a measurement is recorded on the
         # SERVER_STARTED event, so a run's configuration is recoverable from
@@ -689,6 +770,14 @@ def main() -> None:
              "the path. 'enforce' refuses a mismatch — without it any valid "
              "certificate can claim any station's identity",
     )
+    parser.add_argument(
+        "--dispatch-timeout",
+        type=float,
+        default=DEFAULT_DISPATCH_TIMEOUT_S,
+        help="seconds to wait for a station to answer a command. Shorter "
+             "than the ocpp library's own 30 s, which is what a dead "
+             "connection blocks for; it lands in E3's migration duration",
+    )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -731,6 +820,7 @@ def main() -> None:
         db_synchronous=args.db_synchronous,
         ssl_context=ssl_context,
         identity_check=args.tls_identity_check,
+        dispatch_timeout_s=args.dispatch_timeout,
     )
     try:
         asyncio.run(csms.run())

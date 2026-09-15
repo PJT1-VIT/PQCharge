@@ -239,52 +239,44 @@ def peer_common_name(peer_cert: dict[str, Any] | None) -> str | None:
     return None
 
 
-def peer_certificate(connection: Any) -> dict[str, Any] | None:
+def _ssl_objects(connection: Any) -> list[Any]:
     """
-    Best-effort read of the peer certificate from a live connection.
+    Every plausible route from a websockets connection to its SSL object.
 
-    Reaches through the websockets connection object to the asyncio
-    transport underneath it. That path is library internals rather than
-    a documented API, and it has moved between versions, so several
-    routes are tried in order:
-
-        transport.get_extra_info("peercert")     the asyncio-documented key
-        transport.get_extra_info("ssl_object")   then .getpeercert()
-
-    Written defensively because a CSMS must not drop a charging station
-    because an attribute moved between library releases. But a silent
-    None here would mean the identity check quietly does nothing, which
-    is worse than either -- so the caller logs loudly when it cannot
-    read an identity while TLS is on.
+    Library internals, not a documented API, and the layout has moved
+    between releases -- so several routes are tried rather than one. A
+    CSMS must not drop a charging station because an attribute moved.
     """
     transports = []
-    for attr in ("transport", "_transport"):
-        candidate = getattr(connection, attr, None)
-        if candidate is not None and candidate not in transports:
-            transports.append(candidate)
-
-    # Some versions nest the transport one level down, under the
-    # protocol object rather than the connection.
-    protocol = getattr(connection, "protocol", None)
-    if protocol is not None:
+    for holder in (connection, getattr(connection, "protocol", None)):
+        if holder is None:
+            continue
         for attr in ("transport", "_transport"):
-            candidate = getattr(protocol, attr, None)
+            candidate = getattr(holder, attr, None)
             if candidate is not None and candidate not in transports:
                 transports.append(candidate)
+    return transports
 
-    for transport in transports:
+
+def peer_certificate(connection: Any) -> dict[str, Any] | None:
+    """
+    Best-effort read of the parsed peer certificate.
+
+    Tries the asyncio-documented "peercert" key first, then the SSL
+    object. A silent None here would mean the identity check quietly
+    does nothing, which is worse than it being absent -- so the caller
+    logs loudly when it cannot read an identity while TLS is on.
+    """
+    for transport in _ssl_objects(connection):
         get_extra_info = getattr(transport, "get_extra_info", None)
         if get_extra_info is None:
             continue
-
         try:
             cert = get_extra_info("peercert")
         except Exception:  # noqa: BLE001 - library internals
             cert = None
         if cert:
-            LOGGER.debug("peer certificate read via peercert")
             return cert
-
         try:
             ssl_object = get_extra_info("ssl_object")
         except Exception:  # noqa: BLE001
@@ -296,14 +288,64 @@ def peer_certificate(connection: Any) -> dict[str, Any] | None:
         except Exception:  # noqa: BLE001
             cert = None
         if cert:
-            LOGGER.debug("peer certificate read via ssl_object.getpeercert()")
             return cert
-
-    LOGGER.debug(
-        "no peer certificate found on %s (tried %d transport object(s))",
-        type(connection).__name__, len(transports),
-    )
     return None
+
+
+def describe_connection_security(connection: Any) -> dict[str, Any]:
+    """
+    TLS facts about one live connection, for the event log.
+
+    Returns keys tls_version, tls_cipher, peer_cert_bytes and
+    peer_common_name; each is None when unavailable. Empty dict values
+    are never invented -- an absent figure must read as absent, not as
+    zero, because a zero certificate size would look like a measurement.
+
+    WHY peer_cert_bytes IS WORTH CAPTURING. Experiment E4 asks whether
+    post-quantum certificates cross OCPP 2.0.1's documented size limits
+    (5,500 bytes for a certificate, 10,000 for a chain). Track B's
+    crypto/store.py measures that statically, from certificates on disk.
+    This measures the certificate a station ACTUALLY presented on a real
+    connection. Two independent sources for the same finding, one of
+    them from the running system -- and on Day 8 the same field shows
+    the ML-DSA certificate arriving without any extra work.
+    """
+    facts: dict[str, Any] = {
+        "tls_version": None,
+        "tls_cipher": None,
+        "peer_cert_bytes": None,
+        "peer_common_name": None,
+    }
+
+    for transport in _ssl_objects(connection):
+        get_extra_info = getattr(transport, "get_extra_info", None)
+        if get_extra_info is None:
+            continue
+        try:
+            ssl_object = get_extra_info("ssl_object")
+        except Exception:  # noqa: BLE001
+            ssl_object = None
+        if ssl_object is None:
+            continue
+
+        try:
+            facts["tls_version"] = ssl_object.version()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            cipher = ssl_object.cipher()
+            facts["tls_cipher"] = cipher[0] if cipher else None
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            der = ssl_object.getpeercert(binary_form=True)
+            facts["peer_cert_bytes"] = len(der) if der else None
+        except Exception:  # noqa: BLE001
+            pass
+        break
+
+    facts["peer_common_name"] = peer_common_name(peer_certificate(connection))
+    return facts
 
 
 def check_identity(
