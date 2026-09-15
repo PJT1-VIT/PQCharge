@@ -267,6 +267,14 @@ class CSMSHandlers(CpBase):
         notifications arriving at once; logging them as transitions
         would put five hundred phantom state changes into the data.
 
+        Until Day 6 that guard did not work across a reconnect, because
+        the status it compared against lived on the session and a fresh
+        session held None -- so every reconnecting station looked like a
+        transition, which is exactly the case the guard exists for.
+        Track C measured it. record_status now reads and writes
+        StationState, which outlives the socket, and returns the value
+        it displaced.
+
         MODELLING DECISION: one EVSE, one connector per station.
         StationView carries a single ocpp_status and Contract 5 gives
         the agent a single contactor, so the station's status is the
@@ -274,16 +282,13 @@ class CSMSHandlers(CpBase):
         into the event payload, so nothing is lost if a multi-connector
         station is ever modelled. Recorded in docs/limitations.md.
         """
-        session = self.registry.get_session(self.id)
-        previous = session.ocpp_status if session else None
-
         self._log_message(
             "StatusNotification",
             connector_status=connector_status,
             evse_id=evse_id,
             connector_id=connector_id,
         )
-        self.registry.record_status(self.id, connector_status)
+        previous = self.registry.record_status(self.id, connector_status)
 
         if connector_status != previous:
             self.event_log.emit(
@@ -402,6 +407,16 @@ class CSMSHandlers(CpBase):
 
         missing = self.registry.record_sequence(self.id, int(seq_no))
         if missing:
+            # WHERE the loss happened is the finding, not just that it
+            # happened. A gap on a replayed event means the agent's own
+            # bounded offline queue overflowed and dropped its oldest
+            # entries -- a documented limitation of the agent, not a
+            # network effect. A gap on a live event means the message
+            # was lost in transit, which is what E2 is measuring.
+            # Reporting them as one number would let a client-side
+            # queue overflow be read as evidence that post-quantum
+            # handshakes cost messages.
+            loss_site = "agent_offline_queue" if offline else "in_transit"
             self.event_log.emit(
                 EventType.TRANSACTION_UPDATED,
                 self.id,
@@ -410,10 +425,13 @@ class CSMSHandlers(CpBase):
                 transaction_id=transaction_id,
                 seq_no=seq_no,
                 missing_events=missing,
+                loss_site=loss_site,
+                offline=offline,
             )
             LOGGER.warning(
-                "sequence gap: %s transaction=%s missing %d event(s) before seq %s",
-                self.id, transaction_id, missing, seq_no,
+                "sequence gap: %s transaction=%s missing %d event(s) "
+                "before seq %s (%s)",
+                self.id, transaction_id, missing, seq_no, loss_site,
             )
 
         reading = parse_meter_values(kwargs.get("meter_value"))
@@ -422,6 +440,8 @@ class CSMSHandlers(CpBase):
             power_w=reading.power_w,
             energy_wh=reading.energy_wh,
             reading_at=reading.reading_at,
+            seq_no=int(seq_no),
+            offline=offline,
         )
 
         if reading.unrecognised or reading.unknown_units:
@@ -451,6 +471,7 @@ class CSMSHandlers(CpBase):
                 self.id,
                 transaction_id=transaction_id,
                 charging_state=charging_state,
+                id_token=(kwargs.get("id_token") or {}).get("id_token"),
             )
         else:
             emitted = EventType.TRANSACTION_UPDATED

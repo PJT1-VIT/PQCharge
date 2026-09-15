@@ -26,11 +26,17 @@ The station stops after Authorize if the CSMS refuses the token, which
 is the behaviour a real charger has and what makes --token TAG-BLOCKED
 a useful demonstration rather than a crash.
 
-Usage:
-    python tests/fixtures/fake_station.py CP001
-    python tests/fixtures/fake_station.py CP001 CP002 CP003 --hold 90
-    python tests/fixtures/fake_station.py CP001 --token TAG-BLOCKED
-    python tests/fixtures/fake_station.py CP001 --charge-for 40 --meter-every 5
+Usage (either form works; the -m form is the repo convention):
+    python -m tests.fixtures.fake_station CP001
+    python -m tests.fixtures.fake_station CP001 CP002 CP003 --charge-for 40
+    python -m tests.fixtures.fake_station CP001 --token TAG-BLOCKED
+
+Day 7, over mutual TLS -- certificates from `python -m experiments.bootstrap_pki`:
+    python -m tests.fixtures.fake_station CP001 --tls
+    python -m tests.fixtures.fake_station CP001 --tls --cert-as CP002
+        ^ connects as CP001 while presenting CP002's certificate, to prove
+          the server's identity check catches one certificate holder
+          claiming another station's identity.
 """
 
 from __future__ import annotations
@@ -40,10 +46,34 @@ import asyncio
 import uuid
 from datetime import datetime, timezone
 
+from pathlib import Path
+
 from websockets.asyncio.client import connect
 
 from ocpp.v201 import ChargePoint as CpBase
 from ocpp.v201 import call
+
+if __package__ in (None, ""):
+    # Run as a plain script, Python puts only THIS directory on sys.path,
+    # so `import csms` fails. The repo convention is
+    # `python -m tests.fixtures.fake_station` from the root, which needs no
+    # help -- this keeps the shorter `python tests/fixtures/fake_station.py`
+    # working too, because that is what the whole of Stage 1 was tested with.
+    #
+    # A dev-only fixture may do this. Shipped code may not: it is the symptom
+    # of the repo having no pyproject.toml, which all three tracks have now
+    # flagged and which this is not the place to fix.
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    _sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
+
+from csms.transport import (
+    DEFAULT_CERT_DIR,
+    DEFAULT_SERVER_NAME,
+    TlsConfigError,
+    build_client_context,
+)
 
 DEFAULT_URL = "ws://localhost:9000"
 DEFAULT_TOKEN = "TAG-0001"
@@ -212,16 +242,44 @@ class FakeStation(CpBase):
             print(f"  [{self.id}] heartbeat")
 
 
+def _client_tls(station_id: str, cert_dir: str):
+    """
+    This station's TLS material, or None for plain ws://.
+
+    Each station presents its OWN certificate -- certs/<id>.crt.pem --
+    because Security Profile 3 authenticates the station, not the
+    fleet. Using one shared client certificate would make every station
+    indistinguishable to the CSMS, and the identity check on the server
+    side exists precisely to catch that.
+    """
+    directory = Path(cert_dir)
+    return build_client_context(
+        directory / f"{station_id}.crt.pem",
+        directory / f"{station_id}.key.pem",
+        directory / "root.pem",
+    )
+
+
 async def run_station(
     station_id: str,
     url: str,
     token: str,
     charge_for_s: float,
     meter_every_s: float,
+    *,
+    tls: bool = False,
+    cert_dir: str = DEFAULT_CERT_DIR,
+    cert_as: str | None = None,
+    server_name: str = DEFAULT_SERVER_NAME,
 ) -> None:
     """One station's whole life: connect, boot, charge, close."""
     uri = f"{url}/{station_id}"
-    async with connect(uri, subprotocols=["ocpp2.0.1"]) as ws:
+    kwargs = {}
+    if tls:
+        kwargs["ssl"] = _client_tls(cert_as or station_id, cert_dir)
+        kwargs["server_hostname"] = server_name
+
+    async with connect(uri, subprotocols=["ocpp2.0.1"], **kwargs) as ws:
         station = FakeStation(station_id, ws, token)
         print(f"  [{station_id}] connected to {uri}")
 
@@ -265,7 +323,15 @@ async def main_async(args) -> None:
     await asyncio.gather(
         *(
             run_station(
-                sid, args.url, args.token, args.charge_for, args.meter_every
+                sid,
+                args.url,
+                args.token,
+                args.charge_for,
+                args.meter_every,
+                tls=args.tls,
+                cert_dir=args.cert_dir,
+                cert_as=args.cert_as,
+                server_name=args.server_name,
             )
             for sid in args.station_ids
         )
@@ -283,7 +349,22 @@ def main() -> None:
                         help="seconds to charge before ending the transaction")
     parser.add_argument("--meter-every", type=float, default=10.0,
                         help="seconds between TransactionEvent Updated")
+    parser.add_argument("--tls", action="store_true",
+                        help="connect over wss:// with a client certificate")
+    parser.add_argument("--cert-dir", default=DEFAULT_CERT_DIR,
+                        help="directory bootstrap_pki wrote the PKI into")
+    parser.add_argument("--server-name", default=DEFAULT_SERVER_NAME,
+                        help="name to verify the server certificate against; "
+                             "must appear in its Subject Alternative Name")
+    parser.add_argument("--cert-as", default=None,
+                        help="present ANOTHER station's certificate while "
+                             "connecting under this station's id. Exists to "
+                             "test the server's identity check -- one valid "
+                             "certificate holder impersonating another is "
+                             "what E5 demonstrates")
     args = parser.parse_args()
+    if args.tls and args.url.startswith("ws://"):
+        args.url = "wss://" + args.url[len("ws://"):]
 
     print(
         f"connecting {len(args.station_ids)} station(s), "
