@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pqcharge"
+version = "0.1.0"
+description = "Post-quantum migration infrastructure for OCPP 2.0.1 EV charging networks"
+requires-python = ">=3.10"
+
+# Dependencies stay in requirements.txt on purpose. Declaring them here too
+# would create a second list to keep in step, and the pinned websockets range
+# is the thing least able to afford drifting between three machines.
+
+[tool.setuptools]
+packages = [
+    "agent",
+    "analysis",
+    "crypto",
+    "csms",
+    "dashboard",
+    "harness",
+    "idmanager",
+]
