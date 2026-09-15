@@ -251,10 +251,14 @@ async def test_connection_refused_is_handled_not_raised():
     """
     Nothing listening. During E2 this is a NORMAL condition — the
     experiment kills the CSMS on purpose — so it must be caught and
-    reported, never allowed to crash the agent. Phase C4 turns this into
-    a retry; today it is a clean False.
+    reported, never allowed to crash the agent.
+
+    PHASE C4 TURNED THIS INTO A RETRY, as the note here said it would.
+    reconnect_max_attempts=1 pins the old single-shot behaviour so this
+    test still asserts what it was written to assert; the retry path
+    itself is covered in test_reconnect.py.
     """
-    station = ChargingStation(make_config(9221))
+    station = ChargingStation(make_config(9221, reconnect_max_attempts=1))
     ok = await station.run()
 
     assert ok is False
@@ -267,7 +271,8 @@ async def test_server_rejecting_the_upgrade_is_handled():
     differently."""
     faults = FaultConfig(reject_connections=True)
     async with FakeCSMS(port=9222, faults=faults):
-        station = ChargingStation(make_config(9222))
+        # max_attempts=1 since Phase C4 — see the note above.
+        station = ChargingStation(make_config(9222, reconnect_max_attempts=1))
         ok = await station.run()
 
     assert ok is False
@@ -275,13 +280,16 @@ async def test_server_rejecting_the_upgrade_is_handled():
 
 async def test_connection_dropped_mid_session_is_handled():
     """
-    The Phase C4 precursor. The socket dies four messages in; the agent
-    must notice, stop cleanly and leave nothing energised. C4 turns this
-    into a reconnect.
+    The socket dies four messages in; the agent must notice, stop
+    cleanly and leave nothing energised.
+
+    PHASE C4 TURNED THIS INTO A RECONNECT. Pinned to a single attempt
+    here so it still tests "notices and stops safely"; the reconnect
+    itself is covered in test_reconnect.py.
     """
     faults = FaultConfig(drop_after=4)
     async with FakeCSMS(port=9223, faults=faults):
-        station = ChargingStation(make_config(9223))
+        station = ChargingStation(make_config(9223, reconnect_max_attempts=1))
         ok = await station.run()
 
     assert ok is False

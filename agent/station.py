@@ -77,6 +77,8 @@ from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 from agent import messages as msg
+from agent.backoff import BackoffPolicy
+from agent.offline_queue import OfflineQueue, QueuedEvent
 from agent.charging_profile import (
     ProfileRejected,
     cleared_limit_w,
@@ -114,6 +116,28 @@ MAX_BOOT_ATTEMPTS = 3
 # interval the server issued. Without it, a server answering Pending
 # with a 300-second interval would stall a test run for five minutes.
 MAX_BOOT_RETRY_WAIT_S = 30.0
+
+# How long one connection ATTEMPT may take before it is abandoned.
+#
+# websockets defaults open_timeout to 10 seconds. That is far too long
+# here, and the reason is a platform difference measured on Windows
+# during C4: when the fake CSMS closed its listener, a connect() to the
+# dead port did not fail promptly -- it blocked for most of the outage
+# before returning. On Linux the same connect is refused in
+# microseconds.
+#
+# While a connect is in flight the station is NOT metering: _wait_offline
+# only runs between attempts. So a slow-failing connect is a gap in the
+# offline readings, and at the 10-second default a single hung attempt
+# would swallow an entire short outage's worth of data. During E2, with
+# five hundred agents, it would also serialise reconnection behind the
+# OS's connect behaviour rather than behind the server's capacity --
+# which is the thing being measured.
+#
+# Five seconds is comfortably longer than any healthy handshake,
+# including a post-quantum one at Stage 8, and short enough that a hung
+# attempt costs one backoff cycle rather than an outage.
+CONNECT_TIMEOUT_S = 5.0
 
 
 def describe_close(exc: BaseException) -> str:
@@ -246,6 +270,75 @@ class ChargingStation(StationCommands):
 
         self.commands_received = 0
         """Accumulated across connections, for the end-of-run summary."""
+
+        # ==============================================================
+        # PHASE C4 — surviving an outage
+        # ==============================================================
+
+        self.backoff = BackoffPolicy.from_config(config)
+        """How long to wait between connection attempts. See
+        agent/backoff.py for why the jitter in here is the
+        highest-risk line of code in Track C."""
+
+        self.offline_queue = OfflineQueue(station_id=config.station_id)
+        """
+        Readings taken while the CSMS was unreachable.
+
+        STATION-scoped, so it survives the very disconnection it exists
+        to handle. Drained and replayed after the next accepted boot.
+        """
+
+        self._charge_deadline: float | None = None
+        """
+        monotonic() at which this transaction should end.
+
+        Set when the transaction starts and NOT reset on reconnect. A
+        session interrupted by a sixty-second outage still ends at the
+        time it was always going to end -- it does not get sixty extra
+        seconds of charging because the server went away, which would
+        make every E2 run's energy totals depend on how long the outage
+        was.
+        """
+
+        self._session_complete = False
+        """
+        True once the station has finished, successfully or not.
+
+        run()'s retry loop needs to tell "the connection failed, try
+        again" apart from "the session finished, stop". Without it a
+        station with max_attempts=0 would charge, finish, disconnect,
+        and immediately reconnect to charge again, forever.
+        """
+
+        self._session_ok = False
+        """
+        Whether that finish was a success.
+
+        Separate from _session_complete because "stop retrying" and "it
+        worked" are different facts, and run()'s return value becomes
+        the process exit code. A station refused at BootNotification has
+        finished -- there is nothing to retry -- but it has not
+        succeeded, and a load generator counting successes in C5 needs
+        to be able to tell those apart.
+        """
+
+        self._disconnected_at: float | None = None
+        """monotonic() when the last connection ended, for measuring
+        downtime across the gap."""
+
+        self.connection_attempts = 0
+        self.reconnections = 0
+        self.total_downtime_s = 0.0
+        """
+        The E2 numbers, measured from the station's own side.
+
+        Track A measures recovery server-side via
+        StationView.is_recovered, which is the authoritative figure.
+        These are the client's view, and they cover the part the server
+        cannot see: attempts that never arrived. A station that tried
+        eleven times before getting through is invisible in the server's
+        log -- it only ever sees the twelfth.
+        """
 
     # -- small helpers ------------------------------------------------------
 
@@ -627,6 +720,16 @@ class ChargingStation(StationCommands):
             # screen, and then the session simply ends.
             self.log.info("session ends without charging (authorize: %s)", status)
             await asyncio.sleep(min(cfg.charge_for_s, 5.0))
+            # Phase C4: this station's work IS done -- it asked, it was
+            # refused, that is the answer. Without this flag run()'s
+            # retry loop would reconnect and ask again forever, turning
+            # one blocked card into a station that hammers the CSMS for
+            # the length of the run.
+            #
+            # Successful, though: the station asked and got an answer.
+            # A refused card is a working station, not a failed one.
+            self._session_complete = True
+            self._session_ok = True
             return
 
         # -- a car is plugged in -------------------------------------------
@@ -645,6 +748,20 @@ class ChargingStation(StationCommands):
         # reading carries over the previous session's total and Track
         # A's registry sees a jump it cannot explain.
         self.power.reset_meter()
+
+        # Anything still queued belongs to a transaction that is over.
+        # Replaying it against this one would attach old readings to a
+        # new transaction id -- which Track A would accept without
+        # complaint, and which would be unfindable at analysis.
+        self.offline_queue.clear()
+
+        # Phase C4: on the station, not in a local, so that a session
+        # interrupted by an outage resumes toward the SAME end time. A
+        # local would restart the clock on reconnect and give every
+        # interrupted session extra charging time proportional to the
+        # outage -- which would put the outage length into the energy
+        # totals E5 compares.
+        self._charge_deadline = time.monotonic() + cfg.charge_for_s
 
         try:
             # -- current starts flowing -----------------------------------
@@ -680,76 +797,232 @@ class ChargingStation(StationCommands):
             self._last_charging_state_sent = self.state.charging_state
             self._limit_changed = False
 
-            # -- the session loop ---------------------------------------------
-            #
-            # Deadline arithmetic rather than counting iterations: a slow
-            # server, a long CALLError timeout or an OS scheduling hiccup
-            # would each make a naive loop overshoot, and E1's handshake
-            # figures are compared against session durations.
-            #
-            # PHASE C3 CHANGED THE SLEEP. It is now a race against the
-            # wake event, so an inbound command is acted on immediately
-            # instead of at the next meter tick. Everything else about
-            # the loop's shape is unchanged.
-            deadline = time.monotonic() + cfg.charge_for_s
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-
-                await self._sleep_or_wake(min(cfg.meter_every_s, remaining))
-
-                # 1. The operator may have pressed stop.
-                if self._stop_requested:
-                    self.log.info(
-                        "ending the session early: %s", self._stop_reason
-                    )
-                    break
-
-                # 2. A command may have moved the connector status --
-                #    Occupied/Charging both report Occupied, so in
-                #    practice this fires on faults, but it is the only
-                #    correct place for it and costs one comparison.
-                await self._sync_status(client)
-
-                # 3. A TriggerMessage may be waiting.
-                await self._serve_triggers(client)
-
-                # 4. The meter reading. Values come from Contract 5, not
-                #    from a counter we increment ourselves, so a profile
-                #    applied mid-session is reflected here automatically:
-                #    SimulatedPower integrates energy from elapsed time
-                #    and the ACTIVE limit, which the command already
-                #    changed.
-                await self._send_meter_event(
-                    client, trigger_reason=self._next_trigger_reason()
-                )
-
-            # -- the session ends -------------------------------------------
-            await self._end_transaction(
-                client,
-                msg.TRIGGER_REMOTE_STOP
-                if self._stop_requested
-                else msg.TRIGGER_STOP_AUTHORIZED,
-            )
+            await self._charge_until_deadline(client)
 
         finally:
-            # Safety rule 1. Reached on success, on CALLError, on a
-            # dropped socket, on Ctrl-C and on any unexpected exception.
-            # Idempotent, so calling it after a clean end is harmless.
-            if self.power.is_closed():
-                self.power.open_contactor()
-                self.log.warning(
-                    "contactor opened on the way out of an unfinished session"
-                )
+            # Safety. See _charge_until_deadline for why this is
+            # conditional in Phase C4 rather than unconditional.
+            self._open_contactor_if_session_over()
 
-        # The car leaves. reset() rather than transition_to() because
-        # this runs on every exit path, including ones where the state
-        # machine is somewhere the transition table would not allow
-        # AVAILABLE from -- and "nothing is plugged in" is always a
-        # physically reachable truth.
+    # -- resuming after an outage (Phase C4) -------------------------------
+
+    async def _resume_transaction(self, client: StationClient) -> None:
+        """
+        Pick a transaction back up on a fresh connection.
+
+        Reached when the socket died mid-charge and the station got back
+        in. The car never stopped charging; from the driver's point of
+        view nothing happened. What has to be rebuilt is the SERVER's
+        picture, which is empty: csms/registry.py created a brand new
+        StationSession on this connection, with no status, no
+        transaction and no meter reading.
+
+        So: re-announce the status, replay what was missed, then carry
+        on to the same deadline.
+        """
+        self.reconnections += 1
+
+        if self._disconnected_at is not None:
+            downtime = time.monotonic() - self._disconnected_at
+            self.total_downtime_s += downtime
+            # THE E2 LINE. One per rejoin, with the measured gap. Track
+            # A measures recovery server-side and that figure is
+            # authoritative; this is the client's view, and it is the
+            # only record of how long this particular station was away.
+            self.log.info(
+                "REJOINED after %.2fs offline (reconnection #%d, "
+                "%d event(s) to replay)",
+                downtime, self.reconnections, len(self.offline_queue),
+            )
+            self._disconnected_at = None
+
+        # The server has no idea what this connector is doing -- it has
+        # never seen a StatusNotification on this connection. last_status
+        # was cleared in run_once() so this always sends.
+        await self._sync_status(client)
+
+        await self._replay_offline_events(client)
+
+        try:
+            if self._charge_deadline is None:
+                # Should not happen: a transaction is open, so a
+                # deadline was set. Treated as "time is up" rather than
+                # charging forever, because an unbounded session in a
+                # 500-agent run is a load generator that never finishes.
+                self.log.error(
+                    "resumed with a transaction but no deadline; ending it"
+                )
+                await self._end_transaction(client, msg.TRIGGER_STOP_AUTHORIZED)
+                await self._finish_session(client)
+                return
+
+            if time.monotonic() >= self._charge_deadline:
+                # The outage outlasted the session. The transaction ends
+                # now, with the readings that were queued during it
+                # already replayed above -- so the energy total is
+                # complete even though the last stretch was reported
+                # late.
+                self.log.info(
+                    "the outage outlasted this session; closing the "
+                    "transaction on reconnect"
+                )
+                await self._end_transaction(client, msg.TRIGGER_STOP_AUTHORIZED)
+                await self._finish_session(client)
+                return
+
+            await self._charge_until_deadline(client)
+
+        finally:
+            self._open_contactor_if_session_over()
+
+    async def _replay_offline_events(self, client: StationClient) -> None:
+        """
+        Send everything that happened while the CSMS was away.
+
+        Each event keeps ITS OWN TIMESTAMP and carries offline=True.
+        Both matter, and the second one is not cosmetic: Track A's
+        registry refuses to let a replayed reading overwrite newer live
+        state, using the timestamp to decide. Replaying with now() would
+        disable that guard silently. See agent/offline_queue.py.
+
+        Replay happens BEFORE any new live event, so seq_no reaches the
+        server in order. Track A logs a forward jump in seq_no as
+        evidence of message loss during a storm -- a real finding worth
+        having -- and events arriving out of order would manufacture one.
+        """
+        events = self.offline_queue.drain()
+        if not events:
+            return
+
+        started = time.monotonic()
+        for event in events:
+            await client.send_transaction_event(
+                event.event_type,
+                event.transaction_id,
+                event.seq_no,
+                event.power_w,
+                event.energy_wh,
+                trigger_reason=event.trigger_reason,
+                charging_state=event.charging_state,
+                token=event.token,
+                offline=True,
+                timestamp=event.timestamp,
+            )
+
+        self.log.info(
+            "replayed %d offline event(s) in %.0fms",
+            len(events), (time.monotonic() - started) * 1000.0,
+        )
+
+    # -- the metering loop, shared by a fresh session and a resumed one -----
+
+    async def _charge_until_deadline(self, client: StationClient) -> None:
+        """
+        Meter until the deadline, a stop command, or the socket dies.
+
+        Deadline arithmetic rather than counting iterations: a slow
+        server, a long CALLError timeout or an OS scheduling hiccup
+        would each make a naive loop overshoot, and E1's handshake
+        figures are compared against session durations.
+
+        PHASE C3 CHANGED THE SLEEP to a race against the wake event, so
+        an inbound command is acted on immediately.
+
+        PHASE C4 SPLIT THIS OUT of _charging_session so that a resumed
+        transaction runs exactly the same loop as a fresh one. Two
+        copies of a metering loop is how a replayed session ends up
+        subtly different from a normal one in ways that only show up in
+        the analysis.
+        """
+        cfg = self.config
+        assert self._charge_deadline is not None
+
+        while True:
+            remaining = self._charge_deadline - time.monotonic()
+            if remaining <= 0:
+                break
+
+            await self._sleep_or_wake(min(cfg.meter_every_s, remaining))
+
+            # 1. The operator may have pressed stop.
+            if self._stop_requested:
+                self.log.info("ending the session early: %s", self._stop_reason)
+                break
+
+            # 2. A command may have moved the connector status.
+            await self._sync_status(client)
+
+            # 3. A TriggerMessage may be waiting.
+            await self._serve_triggers(client)
+
+            # 4. The meter reading. Values come from Contract 5, not
+            #    from a counter we increment ourselves, so a profile
+            #    applied mid-session is reflected here automatically.
+            await self._send_meter_event(
+                client, trigger_reason=self._next_trigger_reason()
+            )
+
+        await self._end_transaction(
+            client,
+            msg.TRIGGER_REMOTE_STOP
+            if self._stop_requested
+            else msg.TRIGGER_STOP_AUTHORIZED,
+        )
+        await self._finish_session(client)
+
+    async def _finish_session(self, client: StationClient) -> None:
+        """
+        The car leaves and the station goes back to Available.
+
+        reset() rather than transition_to() because this runs on every
+        exit path, including ones where the state machine is somewhere
+        the transition table would not allow AVAILABLE from -- and
+        "nothing is plugged in" is always a physically reachable truth.
+        """
         self.state.reset("vehicle unplugged")
         await self._sync_status(client)
+        self._session_complete = True
+        self._session_ok = True
+
+    def _open_contactor_if_session_over(self) -> None:
+        """
+        Safety rule 1, as Phase C4 changed it.
+
+        *** READ THIS BEFORE "SIMPLIFYING" IT BACK. ***
+
+        Up to C3 the rule was absolute: every exit path opened the
+        contactor. C4 makes it conditional, and the condition is whether
+        a TRANSACTION is still open -- not whether a connection is.
+
+        The reason is physical. A station charging when the CSMS dies is
+        still charging. The car is drawing current, the cable is live,
+        and nothing about a server going away is a reason to interrupt
+        it -- a real charger does not dump the driver's session because
+        it lost its uplink. Opening the contactor here would mean every
+        E2 run cut power to five hundred cars, and the energy curve
+        would show the outage as a real loss of supply rather than a
+        loss of reporting.
+
+        So this opens the contactor when the transaction is over, and
+        leaves it closed when the transaction is merely unreported. The
+        absolute guarantee has not gone away -- it moved to run()'s
+        finally, which is the point at which the STATION stops, and
+        which is reached on Ctrl-C, on giving up, and on any unexpected
+        exception.
+        """
+        if self.transaction_id is not None:
+            self.log.debug(
+                "leaving the contactor closed: transaction %s is still open "
+                "(the car is still charging; only reporting stopped)",
+                self.transaction_id,
+            )
+            return
+
+        if self.power.is_closed():
+            self.power.open_contactor()
+            self.log.warning(
+                "contactor opened on the way out of an unfinished session"
+            )
 
     async def _send_meter_event(
         self, client: StationClient, *, trigger_reason: str
@@ -833,10 +1106,26 @@ class ChargingStation(StationCommands):
         """
         cfg = self.config
         started = time.monotonic()
+        self.connection_attempts += 1
 
-        self.log.info("connecting to %s", cfg.ws_url)
+        # PHASE C4: the server has never seen this connection before, so
+        # it holds no status for us. csms/registry.py creates a fresh
+        # StationSession with ocpp_status=None on every connect.
+        # Remembering what we sent on the PREVIOUS socket would suppress
+        # the first StatusNotification of this one, and the station
+        # would be connected and charging while the dashboard showed a
+        # blank connector state for the rest of the run.
+        self.last_status = None
 
-        async with connect(cfg.ws_url, subprotocols=[cfg.subprotocol]) as ws:
+        self.log.info(
+            "connecting to %s (attempt %d)", cfg.ws_url, self.connection_attempts
+        )
+
+        async with connect(
+            cfg.ws_url,
+            subprotocols=[cfg.subprotocol],
+            open_timeout=CONNECT_TIMEOUT_S,
+        ) as ws:
             elapsed_ms = (time.monotonic() - started) * 1000.0
             self.log.info("connected in %.1fms", elapsed_ms)
 
@@ -946,87 +1235,296 @@ class ChargingStation(StationCommands):
         """
         interval = await self._boot(client)
         if interval is None:
+            # A refused boot is an answer, not a connection failure. The
+            # station must not spin reconnecting to a CSMS that has
+            # already said no -- from Stage 6 that refusal is
+            # meaningful (capabilities excluding the migration target)
+            # and retrying would put a station into a wave it cannot
+            # complete.
+            #
+            # Finished but NOT successful: the station never charged.
+            self._session_complete = True
+            self._session_ok = False
             return False
 
         self._heartbeat_task = asyncio.ensure_future(
             client.heartbeat_loop(interval)
         )
-        await self._charging_session(client)
+
+        # PHASE C4: the fork. A transaction already open means this is a
+        # reconnection into a session that never stopped happening
+        # physically -- resume it. Otherwise it is a fresh arrival.
+        if self.transaction_id is not None:
+            await self._resume_transaction(client)
+        else:
+            await self._charging_session(client)
         return True
 
     # -- the station's whole life -------------------------------------------------
 
     async def run(self) -> bool:
         """
-        Run this station until its work is done.
+        Run this station until its work is done, reconnecting as needed.
 
-        Phase C2: exactly one connection attempt, and a failure to
-        connect is a failure to run.
+        PHASE C4 REPLACED THE BODY OF THIS METHOD, exactly as the C2
+        version said it would, and nothing in client.py changed --
+        because run_once() already isolated one connection's lifetime.
+        That was the point of the station/connection split.
 
-        PHASE C4 REPLACES THE BODY OF THIS METHOD with a retry loop --
-        exponential backoff plus jitter, around run_once(). Nothing else
-        in this file or in client.py changes, because the connection
-        lifecycle is already isolated inside run_once(). E2 kills the
-        CSMS deliberately, so a refused connection is a normal condition
-        there rather than an error, and the retry loop is what the
-        experiment actually measures.
+        --------------------------------------------------------------
+        THE LOOP
+
+            attempt -> run_once()
+              session finished?          -> return, we are done
+              connection problem?        -> wait a JITTERED delay,
+                                            metering into the offline
+                                            queue while we wait, then
+                                            attempt again
+              out of attempts?           -> give up, cleanly
+
+        E2 kills the CSMS on purpose, so ConnectionRefusedError here is
+        a NORMAL condition and is logged at WARNING rather than ERROR.
+        An agent that treated it as a fault would fill the log with
+        hundreds of errors during the very measurement the experiment
+        exists to take.
+
+        --------------------------------------------------------------
+        WHAT COUNTS AS "RETRY" AND WHAT DOES NOT
+
+        Retryable -- the server is unreachable or went away:
+            ConnectionRefusedError, ConnectionClosed, OSError,
+            CallFailed, InvalidStatus.
+
+        NOT retryable -- the server answered and said no:
+            a rejected boot, a refused authorization. Those set
+            _session_complete inside the lifecycle, and the loop stops.
+
+        InvalidStatus is the awkward one. It covers both "the server is
+        up but shedding load" (1013 -- retry, and during E2 this is
+        expected) and "your subprotocol is wrong" (a configuration
+        error that will never succeed). It is retried, because getting
+        E2 wrong is expensive and a misconfigured subprotocol is loud in
+        the log and obvious within two attempts. The ERROR line below
+        says so explicitly rather than leaving someone to wonder why the
+        agent is retrying something hopeless.
         """
+        attempt = 0
+
         try:
-            return await self.run_once()
+            while True:
+                attempt += 1
 
-        except ConnectionRefusedError:
-            # Normal during E2, fatal today. Logged as a warning rather
-            # than an error so that C4 does not have to re-tune the
-            # level when this becomes an expected condition.
-            self.log.warning(
-                "connection refused by %s -- the CSMS is not listening. "
-                "Phase C4 will retry with backoff; for now this ends the run.",
-                self.config.ws_url,
-            )
-            return False
+                if not self.backoff.should_retry(attempt):
+                    self.log.error(
+                        "giving up after %d attempt(s) -- the CSMS at %s never "
+                        "became reachable. %d event(s) were never delivered.",
+                        attempt - 1, self.config.ws_url, len(self.offline_queue),
+                    )
+                    return False
 
-        except InvalidStatus as exc:
-            # The server answered the HTTP upgrade with a refusal, e.g.
-            # 1013 from fake_csms.py's --reject-connections, or a
-            # subprotocol mismatch. Distinct from "nothing is listening"
-            # and worth saying so: the two have completely different
-            # causes and fixes.
-            self.log.error(
-                "server refused the WebSocket upgrade: %s. Check the "
-                "subprotocol (%s) and the URL path.",
-                exc, self.config.subprotocol,
-            )
-            return False
+                try:
+                    await self.run_once()
 
-        except ConnectionClosed as exc:
-            self.log.warning(
-                "connection closed during the session: %s", describe_close(exc)
-            )
-            return False
+                except ConnectionRefusedError:
+                    # Nothing listening. The headline E2 condition.
+                    self.log.warning(
+                        "connection refused by %s -- the CSMS is not listening",
+                        self.config.ws_url,
+                    )
 
-        except CallFailed as exc:
-            # A message the session could not continue without -- boot,
-            # authorize, or a transaction event. Already logged at ERROR
-            # inside client.py with the action and error code, so this
-            # only records the consequence.
-            self.log.error("session aborted: %s", exc)
-            return False
+                except InvalidStatus as exc:
+                    # Retried; see the docstring for why, and for why
+                    # this one is ERROR while the others are WARNING.
+                    self.log.error(
+                        "server refused the WebSocket upgrade: %s. If this "
+                        "repeats, check the subprotocol (%s) and the URL path "
+                        "-- retrying will not fix a configuration error.",
+                        exc, self.config.subprotocol,
+                    )
+
+                except ConnectionClosed as exc:
+                    self.log.warning(
+                        "connection closed: %s", describe_close(exc)
+                    )
+
+                except TimeoutError:
+                    # The connection attempt itself took too long -- see
+                    # CONNECT_TIMEOUT_S. Its own clause (before OSError,
+                    # which it subclasses from Python 3.11) because it
+                    # means something different from a refusal: the
+                    # server accepted the TCP connection and then did
+                    # not complete the handshake, which during E2 is a
+                    # server at capacity rather than a server that is
+                    # down.
+                    self.log.warning(
+                        "connection attempt to %s timed out after %.0fs",
+                        self.config.ws_url, CONNECT_TIMEOUT_S,
+                    )
+
+                except OSError as exc:
+                    # DNS failure, network unreachable, connection reset.
+                    # Distinct from "refused" and worth naming: during a
+                    # storm these appear when the OS itself runs out of
+                    # sockets, which is a finding about the harness
+                    # rather than about the server.
+                    self.log.warning(
+                        "network error reaching %s: %s: %s",
+                        self.config.ws_url, type(exc).__name__, exc,
+                    )
+
+                except CallFailed as exc:
+                    # A message the session could not continue without.
+                    # Already logged at ERROR inside client.py with the
+                    # action and error code, so this records only the
+                    # consequence.
+                    self.log.error("session aborted: %s", exc)
+
+                    if not exc.timeout:
+                        # The server ANSWERED, with an error. Retrying
+                        # would reconnect, send the same message, get
+                        # the same CALLError and come straight back --
+                        # a loop with no sleep in it, hammering a server
+                        # that is working fine and simply refusing us.
+                        # A timeout is the opposite case and does retry:
+                        # no answer means overloaded or gone, which is
+                        # exactly what backoff is for.
+                        self.log.error(
+                            "not retrying: the CSMS answered with an error "
+                            "rather than failing to answer. Reconnecting "
+                            "would produce the same error immediately."
+                        )
+                        self._session_complete = True
+                        self._session_ok = False
+
+                if self._session_complete:
+                    return self._session_ok
+
+                # -- the connection ended with work still to do --------
+                if self._disconnected_at is None:
+                    self._disconnected_at = time.monotonic()
+
+                if not self.backoff.should_retry(attempt + 1):
+                    self.log.error(
+                        "giving up after %d attempt(s); %d event(s) undelivered",
+                        attempt, len(self.offline_queue),
+                    )
+                    return False
+
+                delay = self.backoff.delay_for(attempt)
+
+                # THE LINE THAT MAKES A STORM AUDITABLE AFTERWARDS.
+                # It logs the delay ACTUALLY SLEPT, not the ceiling. If
+                # a run's recovery curve looks like a staircase, these
+                # lines across five hundred agent logs are the evidence
+                # that says whether the jitter was working -- and there
+                # is no way to reconstruct them later.
+                self.log.warning(
+                    "reconnecting in %.2fs (attempt %d, ceiling %.2fs, %s)",
+                    delay, attempt + 1, self.backoff.ceiling_for(attempt),
+                    self.backoff.strategy,
+                )
+
+                await self._wait_offline(delay)
 
         except asyncio.CancelledError:
             # Ctrl-C, or the harness shutting this station down. Not an
             # error. Re-raised so the event loop unwinds properly, but
-            # only after the finally blocks above have opened the
-            # contactor.
+            # only after the finally below has opened the contactor.
             self.log.info("station cancelled")
             raise
 
         finally:
-            # Last line of defence for safety rule 1. If an exception
-            # escaped from somewhere without an inner finally, the
-            # contactor still opens.
+            # Safety rule 1, absolute form. _open_contactor_if_session_over
+            # deliberately leaves current flowing across a reconnection,
+            # because the car is still charging. THIS is the point at
+            # which the station itself stops, and here the contactor
+            # always opens -- on success, on giving up, on Ctrl-C, and
+            # on any exception that escaped an inner handler.
             if self.power.is_closed():
                 self.power.open_contactor()
                 self.log.warning("contactor opened during station shutdown")
+
+            if self.offline_queue.queued_total:
+                self.log.info(self.offline_queue.describe())
+
+    # -- what happens while nobody is listening ------------------------------
+
+    async def _wait_offline(self, delay_s: float) -> None:
+        """
+        Sleep before the next connection attempt -- and keep metering.
+
+        *** THE STATION DOES NOT STOP WHEN THE SERVER DOES. ***
+
+        If a transaction is open, current is still flowing and energy is
+        still accumulating for the whole of this delay. Those readings
+        are real. Sleeping through them and reporting nothing would put
+        a hole in the energy curve exactly as wide as the outage, and at
+        Stage 9 that hole is indistinguishable from a station that
+        genuinely stopped charging.
+
+        So the wait is sliced at the normal meter interval and each
+        slice produces a QueuedEvent with the reading taken at that
+        moment, stamped with the time it was taken. They go out on the
+        next connection, marked offline=True.
+
+        seq_no keeps advancing through all of this. It must: Track A
+        detects forward jumps as evidence of message loss during a
+        storm, and a counter that paused during the outage and resumed
+        afterwards would produce a perfectly contiguous sequence across
+        a gap where events really were delayed -- hiding the very thing
+        the experiment is looking at.
+        """
+        if delay_s <= 0:
+            return
+
+        if self.transaction_id is None:
+            # Nothing charging, nothing to record. A plain sleep.
+            await asyncio.sleep(delay_s)
+            return
+
+        cfg = self.config
+        deadline = time.monotonic() + delay_s
+
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+
+            await asyncio.sleep(min(cfg.meter_every_s, remaining))
+
+            # The session's own end time still applies. A transaction
+            # whose deadline passes during an outage stops ACCUMULATING
+            # here and is closed on reconnect by _resume_transaction --
+            # it does not keep charging until the server happens to come
+            # back.
+            #
+            # Note that this stops the metering, NOT the wait. Returning
+            # early here would skip the rest of the backoff delay, and
+            # run() would immediately retry, fail, and come straight
+            # back -- a hot spin against a server that is still down,
+            # burning a core per agent for the length of the outage.
+            # That is the opposite of backing off.
+            if (
+                self._charge_deadline is not None
+                and time.monotonic() >= self._charge_deadline
+            ):
+                continue
+
+            charging_state = self.state.charging_state or msg.CHARGING_STATE_IDLE
+            self.offline_queue.append(
+                QueuedEvent(
+                    event_type=msg.TX_UPDATED,
+                    transaction_id=self.transaction_id,
+                    seq_no=self._next_seq(),
+                    power_w=self.power.read_power(),
+                    energy_wh=self.power.read_energy(),
+                    trigger_reason=msg.TRIGGER_METER_PERIODIC,
+                    charging_state=charging_state,
+                    # Taken NOW, sent later. This is the whole point --
+                    # see agent/offline_queue.py.
+                    timestamp=msg.now_iso(),
+                )
+            )
 
 
 # -- entry point --------------------------------------------------------------
@@ -1036,6 +1534,28 @@ async def main_async(config: AgentConfig) -> int:
     """Run one station and return a process exit code."""
     station = ChargingStation(config)
     ok = await station.run()
+
+    # PHASE C4 SUMMARY. These four numbers are the station's own account
+    # of the run, and they are the client-side half of E2: the server
+    # can only see attempts that arrived.
+    station.log.info(
+        "run summary: %d connection attempt(s), %d reconnection(s), "
+        "%.2fs total downtime, %d state transition(s)",
+        station.connection_attempts,
+        station.reconnections,
+        station.total_downtime_s,
+        station.state.transition_count,
+    )
+    if station.offline_queue.queued_total:
+        station.log.info(station.offline_queue.describe())
+
+    if station.offline_queue.dropped_total:
+        station.log.error(
+            "%d offline event(s) were DROPPED -- this station's contribution "
+            "to the event log has gaps. Raise the queue cap or record this as "
+            "a limitation of the run.",
+            station.offline_queue.dropped_total,
+        )
 
     if station.callerror_count:
         # Surfaced at the end because a CALLError does not stop a
@@ -1082,6 +1602,21 @@ def main() -> None:
     # which flags were typed. Track A does the same server-side by
     # writing its configuration into the SERVER_STARTED event.
     log.info("station starting: %s", config.describe_compact())
+
+    # THE JITTER MUST BE IN THE LOG OF EVERY RUN. It is the difference
+    # between a valid E2 measurement and an invalid one, and six weeks
+    # later this line is the only record of which was used. Printed
+    # before anything connects, so it survives a run that fails early.
+    policy = BackoffPolicy.from_config(config)
+    log.info("%s | ceilings: %s", policy.describe(), policy.preview())
+    if policy.spread < 0.5:
+        log.warning(
+            "reconnect jitter is %.2f. For an E2 run this is LOW -- agents "
+            "will retry in near-lockstep and the recovery curve will be "
+            "shaped by our own thundering herd rather than by handshake "
+            "cost. Use 1.0 unless you are deliberately demonstrating that.",
+            policy.spread,
+        )
 
     exit_code = 1
     try:

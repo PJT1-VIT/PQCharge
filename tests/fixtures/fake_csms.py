@@ -379,6 +379,31 @@ class FakeCSMSHandlers(CpBase):
 
         self.energy_readings: list[float] = []
 
+        # -- Phase C4 additions, for reconnection assertions -----------
+
+        self.seq_numbers: list[int] = []
+        """Every seq_no received, in arrival order. Proving a replay
+        arrived in order and without duplicates is a list comparison."""
+
+        self.event_types: list[str] = []
+        """Started / Updated / Ended, in order."""
+
+        self.event_timestamps: list[str] = []
+        """
+        The OUTER TransactionEvent timestamp of each event.
+
+        ISO-8601 UTC strings sort chronologically as plain strings, so a
+        test can assert that replayed events predate the live ones that
+        follow without parsing anything. That assertion is how a replay
+        stamped at send time instead of at reading time gets caught --
+        which would otherwise silently disable csms/registry.py's
+        last_meter_at staleness guard.
+        """
+
+        self.offline_flags: list[bool] = []
+        """Whether each event carried offline=True. A replay that
+        forgot the flag is invisible in Track A's log."""
+
         self.last_transaction_id: str | None = None
         """So a RequestStopTransaction can name the right transaction
         without the test having to guess it."""
@@ -551,6 +576,11 @@ class FakeCSMSHandlers(CpBase):
         if info.get("charging_state"):
             self.charging_states.append(info["charging_state"])
         self.trigger_reasons.append(trigger_reason)
+
+        self.seq_numbers.append(seq_no)
+        self.event_types.append(event_type)
+        self.event_timestamps.append(timestamp)
+        self.offline_flags.append(bool(kwargs.get("offline", False)))
 
         power, energy = _extract_power_and_energy(meter_values)
         if power is not None:
@@ -864,6 +894,96 @@ class FakeCSMS:
             "fake CSMS listening on ws://%s:%d  interval=%ds  faults=%s",
             self.host, self.port, self.interval_s, _describe_faults(self.faults),
         )
+
+    # =================================================================
+    # OUTAGE SIMULATION (Phase C4)
+    # =================================================================
+    #
+    # *** AN OUTAGE IS NOT THE SAME AS A DROPPED CONNECTION. ***
+    #
+    # --drop-after closes one connection while the server stays up. The
+    # agent reconnects on its first attempt, succeeds instantly, and
+    # never enters backoff at all. That path is worth testing and it is
+    # NOT what E2 does.
+    #
+    # E2 kills the CSMS. The port stops accepting, every attempt is
+    # refused for the length of the outage, and the agent has to back
+    # off repeatedly before anything works. That is the path with the
+    # jitter in it, the offline queue, and the recovery measurement --
+    # so it needs a server that can actually go away and come back.
+    #
+    # go_down() / come_back() do that on the same port. Sessions are
+    # NOT carried across: coming back is a fresh server with an empty
+    # registry, exactly as a restarted csms/server.py would be, and the
+    # agent must rebuild the server's picture of it from scratch.
+
+    async def go_down(self) -> None:
+        """
+        Stop accepting connections and cut every live one.
+
+        Connection attempts during the outage are refused at the TCP
+        level -- ConnectionRefusedError on the agent's side, which is
+        what a killed CSMS produces and what run()'s retry loop is
+        written against.
+        """
+        if self._server is None:
+            return
+
+        live = len(self.connections)
+        self.log.warning(
+            "*** OUTAGE: the fake CSMS is going down (%d live connection(s)) ***",
+            live,
+        )
+
+        for task in self._command_tasks:
+            if not task.done():
+                task.cancel()
+
+        self._server.close()
+        await self._server.wait_closed()
+        self._server = None
+
+        # close() stops the listener; existing sockets may linger. Cut
+        # them explicitly so the agent notices immediately rather than
+        # at its response timeout -- the same 30-second blind spot the
+        # reader-race in station.py exists to avoid, seen from here.
+        for handler in list(self.connections):
+            connection = getattr(handler, "_connection", None)
+            if connection is not None:
+                with contextlib.suppress(Exception):
+                    await connection.close(code=1012, reason="server going down")
+
+    async def come_back(self, clear_history: bool = True) -> None:
+        """
+        Start listening again on the same port.
+
+        clear_history empties `connections`, so a test can assert on
+        what arrived AFTER the outage without filtering out what came
+        before. That is usually what a replay assertion wants -- the
+        question is "did the queued events arrive on the new
+        connection", and the old handler's records are noise.
+        """
+        if clear_history:
+            self.connections.clear()
+        self._command_tasks.clear()
+
+        await self.start()
+        self.log.warning("*** RECOVERED: the fake CSMS is accepting again ***")
+
+    async def outage(self, seconds: float) -> None:
+        """
+        Go down, stay down, come back. The E2 shape in one call.
+
+        Used as `await server.outage(1.5)` from a test, usually from a
+        task running alongside the agent.
+        """
+        await self.go_down()
+        await asyncio.sleep(seconds)
+        await self.come_back()
+
+    @property
+    def is_listening(self) -> bool:
+        return self._server is not None
 
     async def stop(self) -> None:
         """Stop listening and wait for the socket to close."""

@@ -196,14 +196,31 @@ class AgentConfig:
     reconnect_max_delay_s: float = 30.0
     """Ceiling on the doubling, so a long outage does not back off forever."""
 
-    reconnect_jitter: float = 0.3
+    reconnect_jitter: float = 1.0
     """
-    Random fraction added to or subtracted from each delay, 0.0-1.0.
+    How much of each delay is randomised, 0.0-1.0.
+
+    *** THE DEFAULT CHANGED FROM 0.3 TO 1.0 IN PHASE C4. ***
 
     Not decoration. Experiment E2 kills the CSMS with hundreds of
     agents attached; without jitter they all retry on the same tick,
     and the measurement becomes the cost of our own thundering herd
     rather than the cost of post-quantum handshakes.
+
+    0.3 was too small to do the job. It spreads retries over the top
+    30% of the window: at the first retry that is a 300 ms band, and
+    five hundred agents arriving inside 300 ms is still a herd. 1.0
+    spreads them uniformly across the whole window -- classic "full
+    jitter", the strategy that measured best for client contention in
+    AWS's study, which is exactly the E2 situation.
+
+    Lower values remain available on purpose. Running one deliberately
+    under-jittered comparison is a legitimate way to SHOW the
+    thundering herd in the report. What matters is that the value used
+    is chosen rather than inherited, and it is logged at start-up so
+    every run's is recoverable afterwards.
+
+    See agent/backoff.py, which consumes this as BackoffPolicy.spread.
     """
 
     reconnect_max_attempts: int = 0
