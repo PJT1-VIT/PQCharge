@@ -137,6 +137,13 @@ MAX_BOOT_RETRY_WAIT_S = 30.0
 # Five seconds is comfortably longer than any healthy handshake,
 # including a post-quantum one at Stage 8, and short enough that a hung
 # attempt costs one backoff cycle rather than an outage.
+#
+# PHASE C5 MOVED THE VALUE INTO AgentConfig.connect_timeout_s, at Track
+# A's request (their §9.5): under load the risk runs the other way, and
+# a cap that is too LOW makes agents abandon attempts that would have
+# succeeded -- recorded afterwards as failed recoveries. This constant
+# is now only the default that field carries, kept here so the number
+# and the reasoning stay in the same place.
 CONNECT_TIMEOUT_S = 5.0
 
 
@@ -270,6 +277,40 @@ class ChargingStation(StationCommands):
 
         self.commands_received = 0
         """Accumulated across connections, for the end-of-run summary."""
+
+        self.connect_timeouts = 0
+        """
+        Attempts abandoned at --connect-timeout.
+
+        NON-ZERO IS A FINDING, AND WHICH FINDING DEPENDS ON THE RUN. At
+        N=1 it means the server stalled. At N=500 it much more likely
+        means the cap is too low for a loaded machine, and every
+        abandoned attempt would otherwise be counted as a station that
+        failed to recover. harness/load_generator.py sums these across
+        the fleet and says so in its summary, which is the number Track
+        A asked for (their §9.5).
+        """
+
+        # -- TLS material, resolved once, at construction ---------------
+        #
+        # Deliberately eager. A station with a missing or unreadable
+        # certificate fails HERE, before the fleet starts, with a
+        # message naming the file -- rather than on its first dial,
+        # where five hundred simultaneous identical failures look like a
+        # server problem. Track A raises at start-up on their side for
+        # the same reason.
+        self._ssl_context = None
+        if config.uses_tls:
+            from agent.tls import build_station_context
+
+            self._ssl_context = build_station_context(
+                config.station_id,
+                config.cert_dir,
+                cert=config.cert,
+                key=config.key,
+                ca=config.ca,
+                check_hostname=config.tls_check_hostname,
+            )
 
         # ==============================================================
         # PHASE C4 — surviving an outage
@@ -1121,11 +1162,23 @@ class ChargingStation(StationCommands):
             "connecting to %s (attempt %d)", cfg.ws_url, self.connection_attempts
         )
 
-        async with connect(
-            cfg.ws_url,
-            subprotocols=[cfg.subprotocol],
-            open_timeout=CONNECT_TIMEOUT_S,
-        ) as ws:
+        # Built once per station in __init__, not per attempt: loading
+        # and parsing certificate files five hundred times a second
+        # during an E2 reconnection storm would add cost to precisely
+        # the measurement the storm exists to take.
+        connect_kwargs: dict[str, Any] = {
+            "subprotocols": [cfg.subprotocol],
+            "open_timeout": cfg.connect_timeout_s,
+        }
+        if self._ssl_context is not None:
+            connect_kwargs["ssl"] = self._ssl_context
+            if cfg.tls_server_name:
+                # Overrides the name taken from the URL. Needed when the
+                # station dials an IP but the server certificate carries
+                # a .local SAN -- the Raspberry Pi case Track B verified.
+                connect_kwargs["server_hostname"] = cfg.tls_server_name
+
+        async with connect(cfg.ws_url, **connect_kwargs) as ws:
             elapsed_ms = (time.monotonic() - started) * 1000.0
             self.log.info("connected in %.1fms", elapsed_ms)
 
@@ -1356,9 +1409,12 @@ class ChargingStation(StationCommands):
                     # not complete the handshake, which during E2 is a
                     # server at capacity rather than a server that is
                     # down.
+                    self.connect_timeouts += 1
                     self.log.warning(
-                        "connection attempt to %s timed out after %.0fs",
-                        self.config.ws_url, CONNECT_TIMEOUT_S,
+                        "connection attempt to %s timed out after %.1fs "
+                        "(--connect-timeout). If this repeats under load the "
+                        "cap is too low, not the server too slow.",
+                        self.config.ws_url, self.config.connect_timeout_s,
                     )
 
                 except OSError as exc:
@@ -1540,9 +1596,10 @@ async def main_async(config: AgentConfig) -> int:
     # can only see attempts that arrived.
     station.log.info(
         "run summary: %d connection attempt(s), %d reconnection(s), "
-        "%.2fs total downtime, %d state transition(s)",
+        "%d connect timeout(s), %.2fs total downtime, %d state transition(s)",
         station.connection_attempts,
         station.reconnections,
+        station.connect_timeouts,
         station.total_downtime_s,
         station.state.transition_count,
     )
