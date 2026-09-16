@@ -576,7 +576,7 @@ class CSMS:
             identity_check=self.identity_check,
             handshake_scope=HANDSHAKE_SCOPE,
             byte_counting_available=HAS_ROUTE_MESSAGE and HAS_SEND,
-            dispatch_timeout_s=dispatch_timeout_s,
+            dispatch_timeout_s=self.dispatcher.timeout_s,
         )
         # Every parameter that can affect a measurement is recorded on the
         # SERVER_STARTED event, so a run's configuration is recoverable from
