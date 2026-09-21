@@ -88,6 +88,8 @@ from agent.client import CallFailed, StationClient, StationCommands
 from agent.config import AgentConfig
 from agent.logging_setup import configure_logging, get_logger
 from agent.power import PowerInterface
+from agent.pq_identity import PQIdentity
+from agent import pqc_messages as pqc
 from agent.simulated_power import SimulatedPower
 from agent.state_machine import StationState, StationStateMachine
 
@@ -322,6 +324,12 @@ class ChargingStation(StationCommands):
         highest-risk line of code in Track C."""
 
         self.offline_queue = OfflineQueue(station_id=config.station_id)
+
+        # Phase C8. This station's post-quantum identity: empty until the
+        # migration orchestrator sends an InstallPQAuth. STATION-scoped,
+        # so a station migrated before an E2 outage is still migrated
+        # after it. quantcrypt is not touched until the first challenge.
+        self.pq = PQIdentity(station_id=config.station_id)
         """
         Readings taken while the CSMS was unreachable.
 
@@ -620,6 +628,56 @@ class ChargingStation(StationCommands):
         self._pending_triggers.append(requested_message)
         self._wake.set()
         return True, f"{requested_message} will be sent shortly"
+
+    # -- post-quantum migration (Phase C8, Option B) ------------------------
+    #
+    # These are the station's half of Track B's migration. Both are
+    # synchronous like every other StationCommands method, and both are
+    # deliberately transaction-safe: installing a key stores bytes and
+    # signing a nonce is pure CPU, so neither touches the contactor, the
+    # meter or the state machine. A migration that lands mid-charge --
+    # which, across a fleet, is most of them -- does not perturb the
+    # session. That is the "rotate without losing a transaction"
+    # guarantee, met by construction rather than by careful sequencing.
+
+    def handle_install_pq_auth(self, data: Any) -> tuple[bool, str]:
+        """
+        Store the ML-DSA private key the orchestrator sent.
+
+        This is what turns a classical station into a migrated one. A
+        malformed payload is answered Rejected with the reason, never a
+        crash -- the CSMS learns the key did not take, rather than seeing
+        a fault.
+        """
+        try:
+            algorithm, private_key = pqc.parse_install_data(data)
+        except ValueError as exc:
+            self.log.warning("InstallPQAuth rejected: %s", exc)
+            return False, str(exc)
+
+        self.pq.install(private_key, algorithm)
+        return True, f"{algorithm} key installed; station migrated"
+
+    def handle_pq_challenge(
+        self, data: Any
+    ) -> tuple[bool, str, bytes | None]:
+        """
+        Sign the server's nonce and hand back the signature.
+
+        Rejected -- honestly -- when this station holds no key yet, which
+        lets the CSMS tell "ignored the challenge" from "not migrated."
+        """
+        if not self.pq.is_migrated:
+            return False, "station holds no PQC key (not migrated)", None
+
+        try:
+            nonce, _meta = pqc.parse_challenge_data(data)
+            signature = self.pq.answer_challenge(nonce)
+        except Exception as exc:  # noqa: BLE001 - reported, never a CALLError
+            self.log.warning("PQAuthChallenge could not be answered: %s", exc)
+            return False, f"could not sign challenge: {exc}", None
+
+        return True, "challenge signed", signature
 
     # -- serving what the commands asked for -------------------------------
 

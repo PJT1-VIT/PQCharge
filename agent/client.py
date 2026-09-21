@@ -74,6 +74,7 @@ from ocpp.v201 import ChargePoint as CpBase
 from ocpp.v201 import call, call_result
 
 from agent import messages as msg
+from agent import pqc_messages as pqc
 from agent.logging_setup import get_logger
 
 # How long to wait for the CSMS to answer before giving up on one
@@ -219,6 +220,25 @@ class StationCommands:
     ) -> tuple[bool, str]:
         """The CSMS wants a particular message re-sent right now."""
         return False, "no station is attached to this connection"
+
+    # -- Phase C8: the post-quantum migration path (Option B) --------------
+
+    def handle_install_pq_auth(self, data: Any) -> tuple[bool, str]:
+        """The orchestrator is installing this station's ML-DSA key."""
+        return False, "no station is attached to this connection"
+
+    def handle_pq_challenge(
+        self, data: Any
+    ) -> tuple[bool, str, bytes | None]:
+        """
+        The server is challenging this station to prove it holds its key.
+
+        Returns THREE values, not two: the signature has to travel back
+        in the DataTransfer response, so the answer carries it. Signing
+        is synchronous CPU work with no outbound call, so -- unlike the
+        actuation commands -- the reply really is produced here.
+        """
+        return False, "no station is attached to this connection", None
 
 
 class StationClient(CpBase):
@@ -782,4 +802,80 @@ class StationClient(CpBase):
             return call_result.TriggerMessage(status="Accepted")
         return call_result.TriggerMessage(
             status="NotImplemented", status_info=self._status_info(reason)
+        )
+
+    # -- DataTransfer: the post-quantum migration channel (Phase C8) --------
+
+    @on("DataTransfer")
+    async def on_data_transfer(
+        self,
+        vendor_id: str = "",
+        message_id: str = "",
+        data: Any = None,
+        **kwargs: Any,
+    ):
+        """
+        The one OCPP message that carries PQCharge's post-quantum
+        exchanges. Two ride on it, both under one vendor id:
+
+            InstallPQAuth    the orchestrator installs this station's key
+            PQAuthChallenge  the server asks the station to sign a nonce
+
+        Anything else -- a different vendor, an unknown message id -- is
+        answered with the OCPP-correct status and nothing happens. That
+        is what lets a stock third-party OCPP client (E6) share this
+        server: it sends its own DataTransfer, gets UnknownVendorId, and
+        is untroubled by a migration protocol it has never heard of.
+
+        See agent/pqc_messages.py for the wire shape, which is the SAME
+        definition the orchestrator's install_message_factory builds
+        from -- one source of truth, both sides.
+        """
+        if vendor_id != pqc.PQC_VENDOR_ID:
+            self.log.debug("DataTransfer for %r ignored (not ours)", vendor_id)
+            return call_result.DataTransfer(status=pqc.STATUS_UNKNOWN_VENDOR)
+
+        if message_id == pqc.MSG_INSTALL:
+            accepted, reason = self._decide(
+                "InstallPQAuth", self.commands.handle_install_pq_auth, data
+            )
+            return call_result.DataTransfer(
+                status=pqc.STATUS_ACCEPTED if accepted else pqc.STATUS_REJECTED,
+                status_info=None if accepted else self._status_info(reason),
+            )
+
+        if message_id == pqc.MSG_CHALLENGE:
+            return self._answer_pq_challenge(data)
+
+        self.log.warning("DataTransfer with unknown message id %r", message_id)
+        return call_result.DataTransfer(status=pqc.STATUS_UNKNOWN_MESSAGE)
+
+    def _answer_pq_challenge(self, data: Any):
+        """
+        Run the challenge handler, which returns THREE values (the
+        signature has to go back in the response), and pack the
+        signature into DataTransferResponse.data on success.
+
+        The blanket except is the same backstop as _decide: a bug in the
+        station's signer must become a Rejected response, never a
+        CALLError that brands the station faulty.
+        """
+        try:
+            accepted, reason, signature = self.commands.handle_pq_challenge(data)
+        except Exception as exc:  # noqa: BLE001 - deliberate backstop
+            self.log.exception("PQAuthChallenge handler raised; answering Rejected")
+            accepted, reason, signature = (
+                False,
+                f"internal error: {type(exc).__name__}: {exc}",
+                None,
+            )
+
+        self._command_log("PQAuthChallenge", accepted, reason)
+
+        if accepted and signature is not None:
+            return call_result.DataTransfer(
+                status=pqc.STATUS_ACCEPTED, data=pqc.pack_signature(signature)
+            )
+        return call_result.DataTransfer(
+            status=pqc.STATUS_REJECTED, status_info=self._status_info(reason)
         )
