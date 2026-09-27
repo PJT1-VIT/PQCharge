@@ -468,3 +468,41 @@ def test_the_default_fleet_is_small():
     """--n defaults to a size that cannot accidentally launch a storm
     against someone else's running server."""
     assert build_parser().parse_args([]).n == 5
+
+
+
+# =====================================================================
+# E1 — THE STATION-SIDE HANDSHAKE TIME (ports 9278-9279)
+# =====================================================================
+
+
+@pytest.mark.asyncio
+async def test_the_station_records_how_long_its_connection_took():
+    from agent.station import ChargingStation
+
+    async with FakeCSMS(port=9278):
+        station = ChargingStation(make_config(9278))
+        ok = await station.run()
+
+    assert ok is True
+    assert len(station.connect_times_ms) == 1, "one connection, one timing"
+    assert station.connect_times_ms[0] > 0
+
+
+@pytest.mark.asyncio
+async def test_every_stations_connect_time_reaches_the_harness_log(tmp_path):
+    async with FakeCSMS(port=9279):
+        log = make_log(tmp_path, n=3)
+        runner = FleetRunner(make_config(9279), FleetSpec(
+            n=3, stagger_s=0.01), log)
+        await runner.run()
+        log.close()
+
+    rows = TimingLog.read(tmp_path / "t.jsonl")
+    finished = [r for r in rows if r["event_type"] == tl.STATION_FINISHED]
+
+    assert len(finished) == 3
+    for row in finished:
+        assert "connect_ms" in row, "E1's number never reached the log"
+        assert len(row["connect_ms"]) == 1
+        assert row["connect_ms"][0] > 0

@@ -168,6 +168,9 @@ class StationOutcome:
     connection_attempts: int = 0
     reconnections: int = 0
     connect_timeouts: int = 0
+    connect_ms: list[float] = field(default_factory=list)
+    """Each successful connection's open time, station-side (TCP + TLS +
+    WebSocket upgrade). E1's headline figure."""
     total_downtime_s: float = 0.0
     callerrors: int = 0
     commands_received: int = 0
@@ -593,6 +596,7 @@ class FleetRunner:
                 outcome.connection_attempts = station.connection_attempts
                 outcome.reconnections = station.reconnections
                 outcome.connect_timeouts = station.connect_timeouts
+                outcome.connect_ms = list(station.connect_times_ms)
                 outcome.total_downtime_s = station.total_downtime_s
                 outcome.callerrors = station.callerror_count
                 outcome.commands_received = station.commands_received
