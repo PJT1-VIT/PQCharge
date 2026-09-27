@@ -911,6 +911,11 @@ def build_parser() -> argparse.ArgumentParser:
                      help="names the timing log: logs/<experiment>_n<N>_<mode>.jsonl")
     run.add_argument("--timing-log", default=None, help="override that path")
     run.add_argument("--progress-every", type=float, default=5.0)
+    run.add_argument(
+    "--no-analyse", action="store_true",
+    help="do not update analysis/output/ when the run ends (Phase C6); "
+            "by default the results page is rebuilt automatically",
+    )
 
     storm = parser.add_argument_group("storm (E2)")
     storm.add_argument("--server-cmd", default=None,
@@ -973,7 +978,15 @@ def main() -> None:
         # with current behind it.
         log.warning("interrupted -- cancelling the fleet")
         exit_code = 130
+    # PHASE C6: rebuild the results page from the diaries. Skipped on Ctrl-C
+    # and with --no-analyse. Never raises: the run's data is already on disk.
+    if exit_code != 130 and not args.no_analyse:
+        from analysis.run import analyse_after_run
 
+        analyse_after_run(
+            args.timing_log
+            or default_path(args.experiment, args.n, config.crypto_mode, config.log_dir)
+        )
     raise SystemExit(exit_code)
 
 
