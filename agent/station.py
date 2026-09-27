@@ -368,6 +368,7 @@ class ChargingStation(StationCommands):
         downtime across the gap."""
 
         self.connection_attempts = 0
+        self.connect_times_ms: list[float] = []
         self.reconnections = 0
         self.total_downtime_s = 0.0
         """
@@ -1180,6 +1181,7 @@ class ChargingStation(StationCommands):
 
         async with connect(cfg.ws_url, **connect_kwargs) as ws:
             elapsed_ms = (time.monotonic() - started) * 1000.0
+            self.connect_times_ms.append(elapsed_ms)
             self.log.info("connected in %.1fms", elapsed_ms)
 
             client = StationClient(
