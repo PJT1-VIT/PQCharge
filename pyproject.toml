@@ -22,3 +22,6 @@ packages = [
     "harness",
     "idmanager",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
