@@ -154,6 +154,13 @@ CREATE TABLE IF NOT EXISTS meter_values (
     applied        INTEGER NOT NULL DEFAULT 1
 );
 
+CREATE TABLE IF NOT EXISTS pq_enrolment (
+    station_id  TEXT PRIMARY KEY,
+    algorithm   TEXT NOT NULL,
+    public_key  BLOB NOT NULL,
+    enrolled_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_station  ON sessions(station_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_run      ON sessions(run_id);
 CREATE INDEX IF NOT EXISTS idx_tx_station        ON transactions(station_id);
@@ -225,6 +232,15 @@ class NullStore:
     def add_meter_value(self, **kwargs: Any) -> None:
         pass
 
+    def load_enrolments(self) -> dict[str, tuple[str, bytes]]:
+        return {}
+
+    def save_enrolment(self, station_id: str, algorithm: str, public_key: bytes) -> None:
+        pass
+
+    def delete_enrolment(self, station_id: str) -> None:
+        pass
+
     def flush(self) -> int:
         return 0
 
@@ -278,6 +294,10 @@ class SqliteStore:
         self._tx_starts: list[tuple] = []
         self._tx_ends: list[tuple] = []
         self._meter_rows: list[tuple] = []
+        self._enrolment_writes: dict[str, tuple[str, bytes] | None] = {}
+        """station_id -> (algorithm, public key) to upsert, or None to delete.
+        Keyed by station so enrol-then-unenrol inside one flush interval
+        collapses to the final answer."""
 
         LOGGER.info(
             "persistence open: %s (synchronous=%s, journal=%s)",
@@ -315,6 +335,21 @@ class SqliteStore:
         ).fetchall()
         return {
             row["station_id"]: {c: row[c] for c in STATE_COLUMNS} for row in rows
+        }
+
+    def load_enrolments(self) -> dict[str, tuple[str, bytes]]:
+        """
+        Every enrolled post-quantum PUBLIC key: station_id -> (algorithm, key).
+
+        Public keys only. The private half never reaches the CSMS's disk --
+        it lives on the station (Track C's agent/pq_identity.py).
+        """
+        rows = self._db.execute(
+            "SELECT station_id, algorithm, public_key FROM pq_enrolment"
+        ).fetchall()
+        return {
+            row["station_id"]: (row["algorithm"], bytes(row["public_key"]))
+            for row in rows
         }
 
     # -- buffered writes -------------------------------------------------
@@ -439,6 +474,20 @@ class SqliteStore:
             )
         )
 
+    def save_enrolment(self, station_id: str, algorithm: str, public_key: bytes) -> None:
+        """
+        Queue an enrolment. Write-behind like everything else here: an
+        enrolment happens on the orchestrator's task during a migration
+        wave, and an fsync per station would stall the event loop that E3
+        is measuring for disturbance. The cost is the same flush-interval
+        loss window A4 documents.
+        """
+        self._enrolment_writes[station_id] = (algorithm, bytes(public_key))
+
+    def delete_enrolment(self, station_id: str) -> None:
+        """Queue the removal of an enrolment (rollback, un-enrol)."""
+        self._enrolment_writes[station_id] = None
+
     # -- flush ------------------------------------------------------------
 
     def flush(self) -> int:
@@ -462,6 +511,7 @@ class SqliteStore:
             + len(self._tx_starts)
             + len(self._tx_ends)
             + len(self._meter_rows)
+            + len(self._enrolment_writes)
         )
         if pending == 0:
             return 0
@@ -534,6 +584,30 @@ class SqliteStore:
                     self._meter_rows,
                 )
 
+            upserts = [
+                (sid, alg_key[0], alg_key[1], now)
+                for sid, alg_key in self._enrolment_writes.items()
+                if alg_key is not None
+            ]
+            deletes = [
+                (sid,) for sid, alg_key in self._enrolment_writes.items()
+                if alg_key is None
+            ]
+            if upserts:
+                cur.executemany(
+                    "INSERT INTO pq_enrolment "
+                    "(station_id, algorithm, public_key, enrolled_at) "
+                    "VALUES (?, ?, ?, ?) "
+                    "ON CONFLICT(station_id) DO UPDATE SET "
+                    "algorithm=excluded.algorithm, public_key=excluded.public_key, "
+                    "enrolled_at=excluded.enrolled_at",
+                    upserts,
+                )
+            if deletes:
+                cur.executemany(
+                    "DELETE FROM pq_enrolment WHERE station_id=?", deletes
+                )
+
             self._db.commit()
         except sqlite3.Error:
             self._db.rollback()
@@ -550,6 +624,7 @@ class SqliteStore:
             self._tx_starts.clear()
             self._tx_ends.clear()
             self._meter_rows.clear()
+            self._enrolment_writes.clear()
 
         return pending
 

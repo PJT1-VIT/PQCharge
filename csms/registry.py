@@ -271,6 +271,18 @@ class SessionRegistry(FleetView):
         self._run_id = run_id
         self._migration_controller = migration_controller
 
+    def attach_migration_controller(self, controller: Any) -> None:
+        """
+        Hand the registry its Contract 4 controller after construction.
+
+        Needed from Day 9: the real orchestrator is built FROM the registry
+        (FleetAdapter wraps it) and the dispatcher (which also holds the
+        registry), so it cannot exist yet when the registry is created.
+        The registry only ever reads get_migration_status() from it, for
+        the snapshot's migration block.
+        """
+        self._migration_controller = controller
+
     def load(self) -> int:
         """
         Restore the fleet from disk. Called once, at startup.

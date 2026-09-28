@@ -75,6 +75,15 @@ from csms.handlers import (
     HAS_SEND,
     CSMSHandlers,
 )
+from csms.migration import (
+    DEFAULT_MIGRATION_MODE,
+    MIGRATION_MODES,
+    SUPPORTED_TARGET_MODES,
+    DisabledController,
+    apply_fleet_profile,
+    build_migration,
+    load_fleet_profile,
+)
 from csms.persistence import (
     DEFAULT_DB_PATH,
     DEFAULT_FLUSH_INTERVAL_S,
@@ -96,7 +105,7 @@ from csms.transport import (
     default_paths,
     describe_connection_security,
 )
-from idmanager.stub import StubController
+from idmanager.orchestrator import DEFAULT_FAILURE_THRESHOLD
 
 LOGGER = logging.getLogger("csms")
 
@@ -287,6 +296,10 @@ class CSMS:
         ssl_context: Any | None = None,
         identity_check: str = DEFAULT_IDENTITY_CHECK,
         dispatch_timeout_s: float = DEFAULT_DISPATCH_TIMEOUT_S,
+        migration_mode: str = DEFAULT_MIGRATION_MODE,
+        fleet_profile: dict[str, list[str]] | None = None,
+        fleet_profile_path: str | None = None,
+        failure_threshold: float = DEFAULT_FAILURE_THRESHOLD,
     ) -> None:
         self.host = host
         self.port = port
@@ -302,13 +315,11 @@ class CSMS:
         identical across every event of one server run -- that is what
         separates a 50-node run from a 500-node run at analysis time."""
 
-        self.controller = StubController()
-        """Contract 4, Track B's stub until Days 8-12.
-
-        get_migration_status() returns a real IDLE status, so the
-        dashboard's migration panel works from today. start_migration()
-        and rollback() raise NotImplementedError, which the HTTP layer
-        turns into a 501 rather than a stack trace."""
+        self.controller = DisabledController("not built yet")
+        """Contract 4. Replaced below, once the registry and dispatcher it
+        depends on exist, by Track B's real orchestrator -- or by a
+        DisabledController carrying the reason migration is unavailable.
+        Track A no longer imports idmanager/stub.py."""
 
         self.store = open_store(
             db_path,
@@ -337,7 +348,7 @@ class CSMS:
             event_log=self.log,
             crypto_mode=crypto_mode,
             run_id=self.log.run_id,
-            migration_controller=self.controller,
+            migration_controller=None,
             store=self.store,
         )
         self.dispatcher = CommandDispatcher(
@@ -359,6 +370,29 @@ class CSMS:
                 "restored %d station(s) from %s -- fleet known before anyone "
                 "reconnects", restored, db_path,
             )
+
+        # Day 9: the fleet profile, then the orchestrator. Order matters --
+        # the profile must be applied after load() so it can correct
+        # restored stations, and before the orchestrator reads capabilities.
+        self.fleet_profile_path = fleet_profile_path
+        self.fleet_profile_size = len(fleet_profile or {})
+        if fleet_profile:
+            added, updated = apply_fleet_profile(self.registry, fleet_profile)
+            LOGGER.info(
+                "fleet profile %s: %d station(s) declared (%d added, %d updated)",
+                fleet_profile_path, len(fleet_profile), added, updated,
+            )
+
+        self.migration = build_migration(
+            mode=migration_mode,
+            registry=self.registry,
+            dispatcher=self.dispatcher,
+            event_log=self.log,
+            store=self.store,
+            failure_threshold=failure_threshold,
+        )
+        self.controller = self.migration.controller
+        self.registry.attach_migration_controller(self.controller)
 
     # -- OCPP WebSocket side --------------------------------------------
 
@@ -506,6 +540,7 @@ class CSMS:
                     "ok": True,
                     "run_id": self.log.run_id,
                     "crypto_mode": self.crypto_mode,
+                    "migration": self.migration.reason,
                 },
             )
 
@@ -672,22 +707,36 @@ class CSMS:
                 },
             )
 
+        if target_mode not in SUPPORTED_TARGET_MODES:
+            return _json_response(
+                HTTPStatus.BAD_REQUEST,
+                {"error": f"target_mode must be one of {list(SUPPORTED_TARGET_MODES)}",
+                 "got": target_mode},
+            )
+        if wave_size < 1 or canary_count < 0:
+            return _json_response(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "wave_size must be >= 1 and canary_count >= 0"},
+            )
+
         try:
             migration_id = self.controller.start_migration(
                 wave_size=wave_size,
                 canary_count=canary_count,
                 target_mode=target_mode,
             )
-        except NotImplementedError:
+        except NotImplementedError as exc:
             return _json_response(
-                HTTPStatus.NOT_IMPLEMENTED,
-                {"error": "migration orchestrator not implemented yet (Track B)"},
+                HTTPStatus.NOT_IMPLEMENTED, {"error": str(exc) or "migration unavailable"}
             )
         except RuntimeError as exc:
             # Contract 4: raised when a migration is already in progress.
             return _json_response(HTTPStatus.CONFLICT, {"error": str(exc)})
 
-        self.log.emit(EventType.MIGRATION_STARTED, None, migration_id=migration_id)
+        # No MIGRATION_STARTED here any more. From Day 9 the orchestrator
+        # emits it itself (Track B plan §9.6 makes its emitter the one
+        # record of a migration); logging it here too would double every
+        # E3 marker.
         return _json_response(HTTPStatus.OK, {"migration_id": migration_id})
 
     def _rollback(self, query: dict[str, list[str]]) -> Response:
@@ -702,16 +751,19 @@ class CSMS:
 
         try:
             reverted = self.controller.rollback(wave_id)
-        except NotImplementedError:
+        except NotImplementedError as exc:
             return _json_response(
-                HTTPStatus.NOT_IMPLEMENTED,
-                {"error": "migration orchestrator not implemented yet (Track B)"},
+                HTTPStatus.NOT_IMPLEMENTED, {"error": str(exc) or "migration unavailable"}
             )
 
+        # Kept, unlike MIGRATION_STARTED: the orchestrator emits
+        # wave_rolled_back only for its OWN automatic rollbacks. A manual
+        # one is recorded here, and only here -- trigger="manual" says so.
         self.log.emit(
             EventType.WAVE_ROLLED_BACK,
             None,
             wave_id=wave_id,
+            trigger="manual",
             outcome=Outcome.SUCCESS if reverted else Outcome.FAILURE,
         )
         return _json_response(HTTPStatus.OK, {"reverted": reverted})
@@ -739,6 +791,13 @@ class CSMS:
             byte_counting_available=HAS_ROUTE_MESSAGE and HAS_SEND,
             dispatch_timeout_s=self.dispatcher.timeout_s,
             response_timeout_s=self.response_timeout_s,
+            migration=self.migration.reason,
+            migration_enabled=self.migration.enabled,
+            migration_algorithm=self.migration.algorithm,
+            migration_failure_threshold=self.migration.failure_threshold,
+            pq_enrolments_restored=self.migration.restored_enrolments,
+            fleet_profile=self.fleet_profile_path,
+            fleet_profile_stations=self.fleet_profile_size,
         )
         # Every parameter that can affect a measurement is recorded on the
         # SERVER_STARTED event, so a run's configuration is recoverable from
@@ -940,8 +999,41 @@ def main() -> None:
              "than the ocpp library's own 30 s, which is what a dead "
              "connection blocks for; it lands in E3's migration duration",
     )
+    parser.add_argument(
+        "--migration",
+        default=DEFAULT_MIGRATION_MODE,
+        choices=MIGRATION_MODES,
+        help="'auto' runs Track B's orchestrator when the post-quantum "
+             "library is installed, otherwise starts with migration disabled "
+             "and says why. 'off' never loads post-quantum code (classical "
+             "baselines)",
+    )
+    parser.add_argument(
+        "--fleet-profile",
+        default=None,
+        help="JSON file declaring which stations support which algorithms. "
+             "Without it every station is 'incompatible' and a migration "
+             "migrates nobody. See csms/migration.py for the format",
+    )
+    parser.add_argument(
+        "--migration-failure-threshold",
+        type=float,
+        default=DEFAULT_FAILURE_THRESHOLD,
+        help="fraction of a wave that may fail before the orchestrator rolls "
+             "it back (Track B's default). Lands in E3, so it is logged",
+    )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
+
+    if not 0.0 <= args.migration_failure_threshold <= 1.0:
+        parser.error("--migration-failure-threshold must be between 0 and 1")
+
+    fleet_profile = None
+    if args.fleet_profile:
+        try:
+            fleet_profile = load_fleet_profile(args.fleet_profile)
+        except ValueError as exc:
+            parser.error(str(exc))
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -983,6 +1075,10 @@ def main() -> None:
         ssl_context=ssl_context,
         identity_check=args.tls_identity_check,
         dispatch_timeout_s=args.dispatch_timeout,
+        migration_mode=args.migration,
+        fleet_profile=fleet_profile,
+        fleet_profile_path=args.fleet_profile,
+        failure_threshold=args.migration_failure_threshold,
     )
     try:
         asyncio.run(csms.run())

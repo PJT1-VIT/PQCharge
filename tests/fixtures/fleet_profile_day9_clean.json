@@ -1,0 +1,7 @@
+{
+  "description": "Day 9 live test, clean run. CP0001-CP0003 are Track C agents (can do ML-DSA-44); CP0004 is Track A's fake_station, declared legacy so the orchestrator SKIPS it as incompatible. TEST FIXTURE ONLY - the real E3 fleet profiles are Track B's to write.",
+  "groups": [
+    {"stations": "CP0001-CP0003", "supported_algorithms": ["ECDSA-P256", "ML-DSA-44"]},
+    {"stations": "CP0004", "supported_algorithms": ["ECDSA-P256"]}
+  ]
+}
