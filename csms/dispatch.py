@@ -139,6 +139,20 @@ class DispatchResult:
     def ok(self) -> bool:
         return self.outcome == Outcome.SUCCESS.value
 
+    def to_dict(self) -> dict[str, Any]:
+        """JSON-safe form for the /api command endpoints. The library's
+        response object is left out: it is not JSON-serialisable, and
+        status already carries the part of it anyone reads."""
+        return {
+            "station_id": self.station_id,
+            "action": self.action,
+            "ok": self.ok,
+            "outcome": self.outcome,
+            "status": self.status,
+            "duration_ms": round(self.duration_ms, 3),
+            "error": self.error,
+        }
+
 
 def _action_name(request: Any) -> str:
     """The OCPP action a call object represents, for logging."""
@@ -155,6 +169,30 @@ def _status_of(response: Any) -> str | None:
     """
     status = getattr(response, "status", None)
     return None if status is None else str(status)
+
+
+def _called_from_receive_loop(charge_point: Any) -> bool:
+    """
+    Rule 1, stated precisely: is THIS call running inside the task that
+    reads this station's socket?
+
+    The first version checked handling_message alone. That flag is true
+    whenever the station's receive loop is busy -- including while it is
+    merely writing a response -- so a command from a DIFFERENT task (the
+    migration orchestrator, an HTTP request) was refused too. Such a
+    command cannot deadlock: it simply queues behind the library's
+    per-connection call lock. But DispatchError is raised, not returned,
+    so at fleet scale one unlucky timing would have crashed a whole
+    migration wave.
+    """
+    if not getattr(charge_point, "handling_message", False):
+        return False
+    receive_task = getattr(charge_point, "receive_task", None)
+    if receive_task is None:
+        # No task recorded (a test double or an older handler class):
+        # keep the old, conservative answer.
+        return True
+    return asyncio.current_task() is receive_task
 
 
 class CommandDispatcher:
@@ -220,7 +258,7 @@ class CommandDispatcher:
             )
 
         charge_point = session.connection
-        if getattr(charge_point, "handling_message", False):
+        if _called_from_receive_loop(charge_point):
             # Rule 1. Refusing turns a hang into a stack trace naming the
             # caller, which is the difference between a five-minute fix
             # and an afternoon.
@@ -539,6 +577,22 @@ class CommandDispatcher:
             len(out), succeeded, len(out) - succeeded,
         )
         return out
+
+    async def clear_fleet_power_limit(
+        self,
+        *,
+        station_ids: list[str] | None = None,
+        timeout_s: float | None = None,
+    ) -> list[DispatchResult]:
+        """
+        Undo set_fleet_power_limit. A station that was never curtailed
+        answers Unknown, which rule 4 scores as success.
+        """
+        return await self.broadcast(
+            lambda sid: call.ClearChargingProfile(),
+            station_ids=station_ids,
+            timeout_s=timeout_s,
+        )
 
     async def set_fleet_power_limit(
         self,

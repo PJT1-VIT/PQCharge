@@ -80,19 +80,39 @@ everything else is treated as an OCPP WebSocket upgrade.
   GET  /api/migration           Contract 4 MigrationStatus.to_dict(),
                                 forwarded from the in-process controller.
 
-  POST /api/migration/start     ?wave_size=&canary_count=&target_mode=
+  GET  /api/migration/start     ?wave_size=&canary_count=&target_mode=
                                 -> {"migration_id": str}
                                 409 if a migration is already running.
-                                501 while Track B ships only the stub.
+                                501 while no orchestrator is available.
 
-  POST /api/migration/rollback  ?wave_id=
+  GET  /api/migration/rollback  ?wave_id=
                                 -> {"reverted": bool}
-                                501 while Track B ships only the stub.
 
-Control parameters are query parameters, not JSON request bodies. This
-is not a style choice: the websockets library's process_request hook is
-handed the request line and headers only, and never reads a request
-body. Accepting JSON bodies would mean running a second HTTP server on
+Station commands (Day 8) -- each returns the station's own answer:
+
+  GET  /api/stations/{id}/limit?watts=N   SetChargingProfile, cap in W
+  GET  /api/stations/{id}/clear-limit     ClearChargingProfile
+  GET  /api/stations/{id}/stop            RequestStopTransaction for the
+                                          station's open transaction
+                                          (or ?transaction_id=)
+  GET  /api/fleet/limit?watts=N           SetChargingProfile to every
+                                          connected station (E5)
+  GET  /api/fleet/clear-limit             ClearChargingProfile to all
+
+EVERY ENDPOINT IS GET -- INCLUDING THE ONES THAT CHANGE THINGS. Until
+Day 8 this docstring said POST for the two migration endpoints, and that
+could never have worked: the websockets library's HTTP parser accepts
+GET only and rejects any other method with an error before
+process_request is ever called (websockets/http11.py, "unsupported HTTP
+method; expected GET"). Nothing called them yet, so nothing broke. GET
+for state-changing actions is not idiomatic HTTP -- a browser or link
+preview fetching one of these URLs would trigger it -- which is one more
+reason this surface must sit behind mutual TLS for any run that matters.
+Recorded in docs/limitations.md.
+
+Control parameters are query parameters, not JSON request bodies, for
+the same underlying reason: process_request is handed the request line
+and headers only, and never reads a request body. Accepting JSON bodies would mean running a second HTTP server on
 a second port purely to receive two integers. Query parameters keep the
 whole control surface on one port with no additional dependency, at the
 cost of being mildly unRESTful on two endpoints.

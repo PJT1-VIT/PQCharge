@@ -43,6 +43,7 @@ Phase A3 (Day 5) adds Authorize and TransactionEvent to this file.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 
@@ -57,6 +58,15 @@ from csms.metering import parse_meter_values
 from csms.registry import SessionRegistry
 
 LOGGER = logging.getLogger("csms.handlers")
+
+DEFAULT_RESPONSE_TIMEOUT_S = 30.0
+"""The ocpp library's own wait for a reply to a call(), per connection.
+
+Set explicitly rather than left as the library default, because it lands
+in the results. csms/server.py always passes dispatch_timeout + a margin,
+so the DISPATCHER's timeout fires first and a silent station is recorded
+with outcome "timeout" -- not as a library TimeoutError scored "failure".
+This default only applies when CSMSHandlers is built outside server.py."""
 
 DEFAULT_HEARTBEAT_INTERVAL_S = 20
 """Seconds between heartbeats, handed to the station in the
@@ -178,8 +188,9 @@ class CSMSHandlers(CpBase):
         heartbeat_interval_s: int = DEFAULT_HEARTBEAT_INTERVAL_S,
         log_messages: bool = False,
         auth_policy: AuthorizationPolicy | None = None,
+        response_timeout_s: float = DEFAULT_RESPONSE_TIMEOUT_S,
     ) -> None:
-        super().__init__(station_id, connection)
+        super().__init__(station_id, connection, response_timeout=response_timeout_s)
         self.registry = registry
         self.event_log = event_log
         self.heartbeat_interval_s = heartbeat_interval_s
@@ -194,6 +205,12 @@ class CSMSHandlers(CpBase):
         through the receive loop -- which, inside a handler, is the loop
         currently blocked waiting for that handler to return. Refusing
         turns a hang into a stack trace naming the caller."""
+
+        self.receive_task: asyncio.Task | None = None
+        """The task running this connection's receive loop, recorded while
+        it is inside route_message. csms/dispatch.py compares the CALLER's
+        task against this one: only a command sent from this very task can
+        deadlock, because only this task is what reads the reply."""
 
     # -- helpers --------------------------------------------------------
 
@@ -251,10 +268,12 @@ class CSMSHandlers(CpBase):
         # span -- and it is the receive loop, not the handler, that a
         # dispatched command would be waiting on.
         self.handling_message = True
+        self.receive_task = asyncio.current_task()
         try:
             return await super().route_message(raw_msg)
         finally:
             self.handling_message = False
+            self.receive_task = None
 
     async def _send(self, message):
         """

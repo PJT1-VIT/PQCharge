@@ -54,6 +54,7 @@ import argparse
 import asyncio
 import json
 import logging
+import math
 import signal
 import time
 from http import HTTPStatus
@@ -146,6 +147,18 @@ Set to None (via 0 on the command line) to disable entirely.
 """
 
 
+RESPONSE_TIMEOUT_MARGIN_S = 5.0
+"""How much longer the ocpp library waits for a reply than the dispatcher.
+
+Day 8 decision on response_timeout (left at the library's 30 s until now).
+Two timers race on every command: the dispatcher's --dispatch-timeout and
+the library's own response_timeout. Whichever fires first decides how a
+silent station is RECORDED -- the dispatcher's as outcome "timeout", the
+library's as a TimeoutError scored "failure". Keeping the library's timer
+strictly longer means one flag controls the behaviour and a silent
+station is always classified the same way in E3."""
+
+
 HANDSHAKE_SCOPE = "server_upgrade"
 """What this server's handshake_ms actually measures, stamped on every
 connection event so no analysis can mistake it for the full figure.
@@ -196,6 +209,28 @@ def _json_response(status: HTTPStatus, payload: Any) -> Response:
         }
     )
     return Response(status.value, status.phrase, headers, body)
+
+
+def _fleet_summary(results: list[Any], **extra: Any) -> dict[str, Any]:
+    """One JSON body for a fleet-wide command: counts first, then detail."""
+    return {
+        **extra,
+        "targets": len(results),
+        "ok": sum(1 for r in results if r.ok),
+        "not_ok": sum(1 for r in results if not r.ok),
+        "results": [r.to_dict() for r in results],
+    }
+
+
+def _parse_watts(query: dict[str, list[str]]) -> float | None:
+    """The ?watts= parameter as a non-negative finite float, else None."""
+    try:
+        watts = float(query["watts"][0])
+    except (KeyError, IndexError, ValueError):
+        return None
+    if not math.isfinite(watts) or watts < 0:
+        return None
+    return watts
 
 
 def _station_id_from_path(path: str) -> str:
@@ -308,6 +343,9 @@ class CSMS:
         self.dispatcher = CommandDispatcher(
             self.registry, self.log, timeout_s=dispatch_timeout_s
         )
+        self.response_timeout_s = dispatch_timeout_s + RESPONSE_TIMEOUT_MARGIN_S
+        """Handed to every connection's ocpp ChargePoint. See
+        RESPONSE_TIMEOUT_MARGIN_S for why it is derived, not a flag."""
         """Sends OCPP commands down to stations.
 
         Handed to Track B's migration orchestrator when it lands: its
@@ -389,6 +427,7 @@ class CSMS:
             heartbeat_interval_s=self.heartbeat_interval_s,
             log_messages=self.log_messages,
             auth_policy=self.auth_policy,
+            response_timeout_s=self.response_timeout_s,
         )
         self.registry.register(
             station_id,
@@ -444,6 +483,13 @@ class CSMS:
 
         query = parse_qs(parsed.query)
 
+        command = self._command_route(path, query)
+        if command is not None:
+            # A coroutine: websockets awaits it before answering. Only the
+            # command endpoints take this path, so a WebSocket upgrade --
+            # the thing E1 measures -- never pays for an extra coroutine.
+            return command
+
         try:
             return self._route(path, query)
         except Exception:
@@ -488,6 +534,121 @@ class CSMS:
             return self._rollback(query)
 
         return _json_response(HTTPStatus.NOT_FOUND, {"error": "no such endpoint"})
+
+    # -- Contract 6 station commands (Day 8) -----------------------------
+
+    def _command_route(self, path: str, query: dict[str, list[str]]):
+        """
+        The endpoints that SEND something to a station, or None.
+
+        Checked before _route because /api/fleet/limit would otherwise be
+        read as "the station called limit" by the /api/fleet/{id} route.
+
+        These answer with the station's own reply, so they must await a
+        round trip -- which is why they return a coroutine. process_request
+        may return one: websockets awaits it (asyncio/server.py). Everything
+        else under /api/ stays synchronous.
+        """
+        if path == "/api/fleet/limit":
+            return self._guarded(self._fleet_limit(query), path)
+        if path == "/api/fleet/clear-limit":
+            return self._guarded(self._fleet_clear(), path)
+        if path.startswith("/api/stations/"):
+            parts = path[len("/api/stations/"):].split("/")
+            if len(parts) == 2 and parts[0]:
+                station_id, action = unquote(parts[0]), parts[1]
+                handler = {
+                    "limit": self._station_limit,
+                    "clear-limit": self._station_clear,
+                    "stop": self._station_stop,
+                }.get(action)
+                if handler is not None:
+                    return self._guarded(handler(station_id, query), path)
+        return None
+
+    async def _guarded(self, coro: Any, path: str) -> Response:
+        """The async twin of process_request's catch-all: a bug in a command
+        endpoint becomes a 500, never a dropped connection."""
+        try:
+            return await coro
+        except Exception:
+            LOGGER.exception("api: unhandled error on %s", path)
+            return _json_response(
+                HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal error"}
+            )
+
+    def _unknown_station(self, station_id: str) -> Response:
+        return _json_response(
+            HTTPStatus.NOT_FOUND,
+            {"error": "unknown station", "station_id": station_id},
+        )
+
+    async def _station_limit(
+        self, station_id: str, query: dict[str, list[str]]
+    ) -> Response:
+        if self.registry.get_station(station_id) is None:
+            return self._unknown_station(station_id)
+        watts = _parse_watts(query)
+        if watts is None:
+            return _json_response(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "watts must be a non-negative number",
+                 "example": f"/api/stations/{station_id}/limit?watts=3000"},
+            )
+        LOGGER.info("api command: cap %s at %.0f W", station_id, watts)
+        result = await self.dispatcher.set_charging_profile(station_id, watts)
+        return _json_response(HTTPStatus.OK, result.to_dict())
+
+    async def _station_clear(
+        self, station_id: str, query: dict[str, list[str]]
+    ) -> Response:
+        if self.registry.get_station(station_id) is None:
+            return self._unknown_station(station_id)
+        LOGGER.info("api command: clear cap on %s", station_id)
+        result = await self.dispatcher.clear_charging_profile(station_id)
+        return _json_response(HTTPStatus.OK, result.to_dict())
+
+    async def _station_stop(
+        self, station_id: str, query: dict[str, list[str]]
+    ) -> Response:
+        view = self.registry.get_station(station_id)
+        if view is None:
+            return self._unknown_station(station_id)
+        transaction_id = (
+            (query.get("transaction_id") or [None])[0]
+            or view.active_transaction_id
+        )
+        if not transaction_id:
+            return _json_response(
+                HTTPStatus.CONFLICT,
+                {"error": "station has no open transaction",
+                 "station_id": station_id},
+            )
+        LOGGER.info("api command: stop %s transaction %s",
+                    station_id, transaction_id)
+        result = await self.dispatcher.request_stop_transaction(
+            station_id, transaction_id
+        )
+        return _json_response(HTTPStatus.OK, result.to_dict())
+
+    async def _fleet_limit(self, query: dict[str, list[str]]) -> Response:
+        watts = _parse_watts(query)
+        if watts is None:
+            return _json_response(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "watts must be a non-negative number",
+                 "example": "/api/fleet/limit?watts=0"},
+            )
+        LOGGER.info("api command: cap the whole fleet at %.0f W", watts)
+        results = await self.dispatcher.set_fleet_power_limit(watts)
+        return _json_response(HTTPStatus.OK, _fleet_summary(results, watts=watts))
+
+    async def _fleet_clear(self) -> Response:
+        LOGGER.info("api command: clear caps across the fleet")
+        results = await self.dispatcher.clear_fleet_power_limit()
+        return _json_response(HTTPStatus.OK, _fleet_summary(results))
+
+    # -- Contract 4 migration control -------------------------------------
 
     def _start_migration(self, query: dict[str, list[str]]) -> Response:
         """
@@ -577,6 +738,7 @@ class CSMS:
             handshake_scope=HANDSHAKE_SCOPE,
             byte_counting_available=HAS_ROUTE_MESSAGE and HAS_SEND,
             dispatch_timeout_s=self.dispatcher.timeout_s,
+            response_timeout_s=self.response_timeout_s,
         )
         # Every parameter that can affect a measurement is recorded on the
         # SERVER_STARTED event, so a run's configuration is recoverable from
