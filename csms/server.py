@@ -54,6 +54,7 @@ import argparse
 import asyncio
 import json
 import logging
+import math
 import signal
 import time
 from http import HTTPStatus
@@ -73,6 +74,15 @@ from csms.handlers import (
     HAS_ROUTE_MESSAGE,
     HAS_SEND,
     CSMSHandlers,
+)
+from csms.migration import (
+    DEFAULT_MIGRATION_MODE,
+    MIGRATION_MODES,
+    SUPPORTED_TARGET_MODES,
+    DisabledController,
+    apply_fleet_profile,
+    build_migration,
+    load_fleet_profile,
 )
 from csms.persistence import (
     DEFAULT_DB_PATH,
@@ -95,7 +105,7 @@ from csms.transport import (
     default_paths,
     describe_connection_security,
 )
-from idmanager.stub import StubController
+from idmanager.orchestrator import DEFAULT_FAILURE_THRESHOLD
 
 LOGGER = logging.getLogger("csms")
 
@@ -144,6 +154,18 @@ noise to the one measurement the project is built on. Run E2 with
 
 Set to None (via 0 on the command line) to disable entirely.
 """
+
+
+RESPONSE_TIMEOUT_MARGIN_S = 5.0
+"""How much longer the ocpp library waits for a reply than the dispatcher.
+
+Day 8 decision on response_timeout (left at the library's 30 s until now).
+Two timers race on every command: the dispatcher's --dispatch-timeout and
+the library's own response_timeout. Whichever fires first decides how a
+silent station is RECORDED -- the dispatcher's as outcome "timeout", the
+library's as a TimeoutError scored "failure". Keeping the library's timer
+strictly longer means one flag controls the behaviour and a silent
+station is always classified the same way in E3."""
 
 
 HANDSHAKE_SCOPE = "server_upgrade"
@@ -196,6 +218,28 @@ def _json_response(status: HTTPStatus, payload: Any) -> Response:
         }
     )
     return Response(status.value, status.phrase, headers, body)
+
+
+def _fleet_summary(results: list[Any], **extra: Any) -> dict[str, Any]:
+    """One JSON body for a fleet-wide command: counts first, then detail."""
+    return {
+        **extra,
+        "targets": len(results),
+        "ok": sum(1 for r in results if r.ok),
+        "not_ok": sum(1 for r in results if not r.ok),
+        "results": [r.to_dict() for r in results],
+    }
+
+
+def _parse_watts(query: dict[str, list[str]]) -> float | None:
+    """The ?watts= parameter as a non-negative finite float, else None."""
+    try:
+        watts = float(query["watts"][0])
+    except (KeyError, IndexError, ValueError):
+        return None
+    if not math.isfinite(watts) or watts < 0:
+        return None
+    return watts
 
 
 def _station_id_from_path(path: str) -> str:
@@ -252,6 +296,10 @@ class CSMS:
         ssl_context: Any | None = None,
         identity_check: str = DEFAULT_IDENTITY_CHECK,
         dispatch_timeout_s: float = DEFAULT_DISPATCH_TIMEOUT_S,
+        migration_mode: str = DEFAULT_MIGRATION_MODE,
+        fleet_profile: dict[str, list[str]] | None = None,
+        fleet_profile_path: str | None = None,
+        failure_threshold: float = DEFAULT_FAILURE_THRESHOLD,
     ) -> None:
         self.host = host
         self.port = port
@@ -267,13 +315,11 @@ class CSMS:
         identical across every event of one server run -- that is what
         separates a 50-node run from a 500-node run at analysis time."""
 
-        self.controller = StubController()
-        """Contract 4, Track B's stub until Days 8-12.
-
-        get_migration_status() returns a real IDLE status, so the
-        dashboard's migration panel works from today. start_migration()
-        and rollback() raise NotImplementedError, which the HTTP layer
-        turns into a 501 rather than a stack trace."""
+        self.controller = DisabledController("not built yet")
+        """Contract 4. Replaced below, once the registry and dispatcher it
+        depends on exist, by Track B's real orchestrator -- or by a
+        DisabledController carrying the reason migration is unavailable.
+        Track A no longer imports idmanager/stub.py."""
 
         self.store = open_store(
             db_path,
@@ -302,12 +348,15 @@ class CSMS:
             event_log=self.log,
             crypto_mode=crypto_mode,
             run_id=self.log.run_id,
-            migration_controller=self.controller,
+            migration_controller=None,
             store=self.store,
         )
         self.dispatcher = CommandDispatcher(
             self.registry, self.log, timeout_s=dispatch_timeout_s
         )
+        self.response_timeout_s = dispatch_timeout_s + RESPONSE_TIMEOUT_MARGIN_S
+        """Handed to every connection's ocpp ChargePoint. See
+        RESPONSE_TIMEOUT_MARGIN_S for why it is derived, not a flag."""
         """Sends OCPP commands down to stations.
 
         Handed to Track B's migration orchestrator when it lands: its
@@ -321,6 +370,29 @@ class CSMS:
                 "restored %d station(s) from %s -- fleet known before anyone "
                 "reconnects", restored, db_path,
             )
+
+        # Day 9: the fleet profile, then the orchestrator. Order matters --
+        # the profile must be applied after load() so it can correct
+        # restored stations, and before the orchestrator reads capabilities.
+        self.fleet_profile_path = fleet_profile_path
+        self.fleet_profile_size = len(fleet_profile or {})
+        if fleet_profile:
+            added, updated = apply_fleet_profile(self.registry, fleet_profile)
+            LOGGER.info(
+                "fleet profile %s: %d station(s) declared (%d added, %d updated)",
+                fleet_profile_path, len(fleet_profile), added, updated,
+            )
+
+        self.migration = build_migration(
+            mode=migration_mode,
+            registry=self.registry,
+            dispatcher=self.dispatcher,
+            event_log=self.log,
+            store=self.store,
+            failure_threshold=failure_threshold,
+        )
+        self.controller = self.migration.controller
+        self.registry.attach_migration_controller(self.controller)
 
     # -- OCPP WebSocket side --------------------------------------------
 
@@ -389,6 +461,7 @@ class CSMS:
             heartbeat_interval_s=self.heartbeat_interval_s,
             log_messages=self.log_messages,
             auth_policy=self.auth_policy,
+            response_timeout_s=self.response_timeout_s,
         )
         self.registry.register(
             station_id,
@@ -444,6 +517,13 @@ class CSMS:
 
         query = parse_qs(parsed.query)
 
+        command = self._command_route(path, query)
+        if command is not None:
+            # A coroutine: websockets awaits it before answering. Only the
+            # command endpoints take this path, so a WebSocket upgrade --
+            # the thing E1 measures -- never pays for an extra coroutine.
+            return command
+
         try:
             return self._route(path, query)
         except Exception:
@@ -460,6 +540,7 @@ class CSMS:
                     "ok": True,
                     "run_id": self.log.run_id,
                     "crypto_mode": self.crypto_mode,
+                    "migration": self.migration.reason,
                 },
             )
 
@@ -489,6 +570,121 @@ class CSMS:
 
         return _json_response(HTTPStatus.NOT_FOUND, {"error": "no such endpoint"})
 
+    # -- Contract 6 station commands (Day 8) -----------------------------
+
+    def _command_route(self, path: str, query: dict[str, list[str]]):
+        """
+        The endpoints that SEND something to a station, or None.
+
+        Checked before _route because /api/fleet/limit would otherwise be
+        read as "the station called limit" by the /api/fleet/{id} route.
+
+        These answer with the station's own reply, so they must await a
+        round trip -- which is why they return a coroutine. process_request
+        may return one: websockets awaits it (asyncio/server.py). Everything
+        else under /api/ stays synchronous.
+        """
+        if path == "/api/fleet/limit":
+            return self._guarded(self._fleet_limit(query), path)
+        if path == "/api/fleet/clear-limit":
+            return self._guarded(self._fleet_clear(), path)
+        if path.startswith("/api/stations/"):
+            parts = path[len("/api/stations/"):].split("/")
+            if len(parts) == 2 and parts[0]:
+                station_id, action = unquote(parts[0]), parts[1]
+                handler = {
+                    "limit": self._station_limit,
+                    "clear-limit": self._station_clear,
+                    "stop": self._station_stop,
+                }.get(action)
+                if handler is not None:
+                    return self._guarded(handler(station_id, query), path)
+        return None
+
+    async def _guarded(self, coro: Any, path: str) -> Response:
+        """The async twin of process_request's catch-all: a bug in a command
+        endpoint becomes a 500, never a dropped connection."""
+        try:
+            return await coro
+        except Exception:
+            LOGGER.exception("api: unhandled error on %s", path)
+            return _json_response(
+                HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal error"}
+            )
+
+    def _unknown_station(self, station_id: str) -> Response:
+        return _json_response(
+            HTTPStatus.NOT_FOUND,
+            {"error": "unknown station", "station_id": station_id},
+        )
+
+    async def _station_limit(
+        self, station_id: str, query: dict[str, list[str]]
+    ) -> Response:
+        if self.registry.get_station(station_id) is None:
+            return self._unknown_station(station_id)
+        watts = _parse_watts(query)
+        if watts is None:
+            return _json_response(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "watts must be a non-negative number",
+                 "example": f"/api/stations/{station_id}/limit?watts=3000"},
+            )
+        LOGGER.info("api command: cap %s at %.0f W", station_id, watts)
+        result = await self.dispatcher.set_charging_profile(station_id, watts)
+        return _json_response(HTTPStatus.OK, result.to_dict())
+
+    async def _station_clear(
+        self, station_id: str, query: dict[str, list[str]]
+    ) -> Response:
+        if self.registry.get_station(station_id) is None:
+            return self._unknown_station(station_id)
+        LOGGER.info("api command: clear cap on %s", station_id)
+        result = await self.dispatcher.clear_charging_profile(station_id)
+        return _json_response(HTTPStatus.OK, result.to_dict())
+
+    async def _station_stop(
+        self, station_id: str, query: dict[str, list[str]]
+    ) -> Response:
+        view = self.registry.get_station(station_id)
+        if view is None:
+            return self._unknown_station(station_id)
+        transaction_id = (
+            (query.get("transaction_id") or [None])[0]
+            or view.active_transaction_id
+        )
+        if not transaction_id:
+            return _json_response(
+                HTTPStatus.CONFLICT,
+                {"error": "station has no open transaction",
+                 "station_id": station_id},
+            )
+        LOGGER.info("api command: stop %s transaction %s",
+                    station_id, transaction_id)
+        result = await self.dispatcher.request_stop_transaction(
+            station_id, transaction_id
+        )
+        return _json_response(HTTPStatus.OK, result.to_dict())
+
+    async def _fleet_limit(self, query: dict[str, list[str]]) -> Response:
+        watts = _parse_watts(query)
+        if watts is None:
+            return _json_response(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "watts must be a non-negative number",
+                 "example": "/api/fleet/limit?watts=0"},
+            )
+        LOGGER.info("api command: cap the whole fleet at %.0f W", watts)
+        results = await self.dispatcher.set_fleet_power_limit(watts)
+        return _json_response(HTTPStatus.OK, _fleet_summary(results, watts=watts))
+
+    async def _fleet_clear(self) -> Response:
+        LOGGER.info("api command: clear caps across the fleet")
+        results = await self.dispatcher.clear_fleet_power_limit()
+        return _json_response(HTTPStatus.OK, _fleet_summary(results))
+
+    # -- Contract 4 migration control -------------------------------------
+
     def _start_migration(self, query: dict[str, list[str]]) -> Response:
         """
         Forward to Contract 4's start_migration.
@@ -511,22 +707,36 @@ class CSMS:
                 },
             )
 
+        if target_mode not in SUPPORTED_TARGET_MODES:
+            return _json_response(
+                HTTPStatus.BAD_REQUEST,
+                {"error": f"target_mode must be one of {list(SUPPORTED_TARGET_MODES)}",
+                 "got": target_mode},
+            )
+        if wave_size < 1 or canary_count < 0:
+            return _json_response(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "wave_size must be >= 1 and canary_count >= 0"},
+            )
+
         try:
             migration_id = self.controller.start_migration(
                 wave_size=wave_size,
                 canary_count=canary_count,
                 target_mode=target_mode,
             )
-        except NotImplementedError:
+        except NotImplementedError as exc:
             return _json_response(
-                HTTPStatus.NOT_IMPLEMENTED,
-                {"error": "migration orchestrator not implemented yet (Track B)"},
+                HTTPStatus.NOT_IMPLEMENTED, {"error": str(exc) or "migration unavailable"}
             )
         except RuntimeError as exc:
             # Contract 4: raised when a migration is already in progress.
             return _json_response(HTTPStatus.CONFLICT, {"error": str(exc)})
 
-        self.log.emit(EventType.MIGRATION_STARTED, None, migration_id=migration_id)
+        # No MIGRATION_STARTED here any more. From Day 9 the orchestrator
+        # emits it itself (Track B plan §9.6 makes its emitter the one
+        # record of a migration); logging it here too would double every
+        # E3 marker.
         return _json_response(HTTPStatus.OK, {"migration_id": migration_id})
 
     def _rollback(self, query: dict[str, list[str]]) -> Response:
@@ -541,16 +751,19 @@ class CSMS:
 
         try:
             reverted = self.controller.rollback(wave_id)
-        except NotImplementedError:
+        except NotImplementedError as exc:
             return _json_response(
-                HTTPStatus.NOT_IMPLEMENTED,
-                {"error": "migration orchestrator not implemented yet (Track B)"},
+                HTTPStatus.NOT_IMPLEMENTED, {"error": str(exc) or "migration unavailable"}
             )
 
+        # Kept, unlike MIGRATION_STARTED: the orchestrator emits
+        # wave_rolled_back only for its OWN automatic rollbacks. A manual
+        # one is recorded here, and only here -- trigger="manual" says so.
         self.log.emit(
             EventType.WAVE_ROLLED_BACK,
             None,
             wave_id=wave_id,
+            trigger="manual",
             outcome=Outcome.SUCCESS if reverted else Outcome.FAILURE,
         )
         return _json_response(HTTPStatus.OK, {"reverted": reverted})
@@ -577,6 +790,14 @@ class CSMS:
             handshake_scope=HANDSHAKE_SCOPE,
             byte_counting_available=HAS_ROUTE_MESSAGE and HAS_SEND,
             dispatch_timeout_s=self.dispatcher.timeout_s,
+            response_timeout_s=self.response_timeout_s,
+            migration=self.migration.reason,
+            migration_enabled=self.migration.enabled,
+            migration_algorithm=self.migration.algorithm,
+            migration_failure_threshold=self.migration.failure_threshold,
+            pq_enrolments_restored=self.migration.restored_enrolments,
+            fleet_profile=self.fleet_profile_path,
+            fleet_profile_stations=self.fleet_profile_size,
         )
         # Every parameter that can affect a measurement is recorded on the
         # SERVER_STARTED event, so a run's configuration is recoverable from
@@ -778,8 +999,41 @@ def main() -> None:
              "than the ocpp library's own 30 s, which is what a dead "
              "connection blocks for; it lands in E3's migration duration",
     )
+    parser.add_argument(
+        "--migration",
+        default=DEFAULT_MIGRATION_MODE,
+        choices=MIGRATION_MODES,
+        help="'auto' runs Track B's orchestrator when the post-quantum "
+             "library is installed, otherwise starts with migration disabled "
+             "and says why. 'off' never loads post-quantum code (classical "
+             "baselines)",
+    )
+    parser.add_argument(
+        "--fleet-profile",
+        default=None,
+        help="JSON file declaring which stations support which algorithms. "
+             "Without it every station is 'incompatible' and a migration "
+             "migrates nobody. See csms/migration.py for the format",
+    )
+    parser.add_argument(
+        "--migration-failure-threshold",
+        type=float,
+        default=DEFAULT_FAILURE_THRESHOLD,
+        help="fraction of a wave that may fail before the orchestrator rolls "
+             "it back (Track B's default). Lands in E3, so it is logged",
+    )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
+
+    if not 0.0 <= args.migration_failure_threshold <= 1.0:
+        parser.error("--migration-failure-threshold must be between 0 and 1")
+
+    fleet_profile = None
+    if args.fleet_profile:
+        try:
+            fleet_profile = load_fleet_profile(args.fleet_profile)
+        except ValueError as exc:
+            parser.error(str(exc))
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -821,6 +1075,10 @@ def main() -> None:
         ssl_context=ssl_context,
         identity_check=args.tls_identity_check,
         dispatch_timeout_s=args.dispatch_timeout,
+        migration_mode=args.migration,
+        fleet_profile=fleet_profile,
+        fleet_profile_path=args.fleet_profile,
+        failure_threshold=args.migration_failure_threshold,
     )
     try:
         asyncio.run(csms.run())

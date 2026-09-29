@@ -1,0 +1,6 @@
+{
+  "description": "Day 9 live test, injected failure. Same fleet, but the fake_station CP0004 CLAIMS ML-DSA support it does not have: it answers InstallPQAuth with UnknownVendorId, the orchestrator counts a failure, and the wave rolls back - E3's deliberate failure (design doc 13.1). TEST FIXTURE ONLY.",
+  "groups": [
+    {"stations": "CP0001-CP0004", "supported_algorithms": ["ECDSA-P256", "ML-DSA-44"]}
+  ]
+}
