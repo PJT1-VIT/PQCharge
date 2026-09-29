@@ -1,0 +1,63 @@
+{
+  "$schemaVersion": 1,
+  "supervisionUrls": ["ws://localhost:9000"],
+  "supervisionUrlOcppConfiguration": true,
+  "supervisionUrlOcppKey": "CentralSystemAddress",
+  "idTagsFile": "pqcharge-idtags.json",
+  "baseName": "E6-SAP-01",
+  "fixedName": true,
+  "chargePointModel": "KC-P30-ESS400C2-E0R",
+  "chargePointVendor": "Keba AG",
+  "firmwareVersion": "1.10.1",
+  "power": 7400,
+  "powerUnit": "W",
+  "numberOfConnectors": 1,
+  "randomConnectors": false,
+  "amperageLimitationOcppKey": "MaxAvailableCurrent",
+  "amperageLimitationUnit": "mA",
+  "ocppVersion": "2.0.1",
+  "Configuration": {
+    "configurationKey": [
+      { "key": "AuthCtrlr.AuthorizeRemoteStart", "readonly": false, "value": "false" },
+      { "key": "AuthCtrlr.LocalAuthorizationOffline", "readonly": false, "value": "true" },
+      { "key": "AuthCtrlr.LocalPreAuthorization", "readonly": false, "value": "false" },
+      { "key": "AuthCtrlr.OfflineTxForUnknownIdEnabled", "readonly": false, "value": "false" },
+      { "key": "OCPPCommCtrlr.WebSocketPingInterval", "readonly": false, "value": "60" },
+      { "key": "LocalAuthListCtrlr.Enabled", "readonly": false, "value": "false" },
+      { "key": "OCPPCommCtrlr.MessageAttemptInterval.TransactionEvent", "readonly": false, "value": "20" },
+      { "key": "OCPPCommCtrlr.MessageAttempts.TransactionEvent", "readonly": false, "value": "3" },
+      { "key": "ReservationCtrlr.Enabled", "readonly": false, "value": "false" },
+      { "key": "ReservationCtrlr.NonEvseSpecific", "readonly": false, "value": "false" },
+      { "key": "SampledDataCtrlr.TxUpdatedInterval", "readonly": false, "value": "10" },
+      { "key": "SampledDataCtrlr.TxUpdatedMeasurands", "readonly": false, "value": "Energy.Active.Import.Register,Power.Active.Import,Current.Import,Voltage" },
+      { "key": "SampledDataCtrlr.TxStartedMeasurands", "readonly": false, "value": "Energy.Active.Import.Register" },
+      { "key": "SampledDataCtrlr.TxEndedMeasurands", "readonly": false, "value": "Energy.Active.Import.Register" },
+      { "key": "TxCtrlr.EVConnectionTimeOut", "readonly": false, "value": "180" }
+    ]
+  },
+  "AutomaticTransactionGenerator": {
+    "enable": true,
+    "minDuration": 30,
+    "maxDuration": 60,
+    "minDelayBetweenTwoTransactions": 10,
+    "maxDelayBetweenTwoTransactions": 20,
+    "probabilityOfStart": 1,
+    "stopAfterHours": 0.05,
+    "requireAuthorize": true
+  },
+  "Evses": {
+    "0": { "Connectors": { "0": {} } },
+    "1": {
+      "Connectors": {
+        "1": {
+          "MeterValues": [
+            { "unit": "V", "measurand": "Voltage" },
+            { "unit": "W", "measurand": "Power.Active.Import" },
+            { "unit": "A", "measurand": "Current.Import" },
+            { "unit": "Wh" }
+          ]
+        }
+      }
+    }
+  }
+}

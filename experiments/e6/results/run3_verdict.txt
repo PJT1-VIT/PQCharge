@@ -1,0 +1,16 @@
+﻿
+=== E6-SAP-01  (Keba AG / KC-P30-ESS400C2-E0R)
+  [PASS] connected            1
+  [PASS] boot accepted        1
+  [PASS] authorized           {'Accepted': 1}
+  [PASS] transaction started  4
+  [PASS] meter updates        4
+  [PASS] transaction ended    4
+  energy delivered     87.8 Wh
+  measurands not stored (reported, not dropped): ['current.import', 'energy.active.import.interval', 'voltage']
+  actions it sent      {'BootNotification': 1, 'StatusNotification': 10, 'Authorize': 1, 'TransactionEvent': 12, 'Heartbeat': 13}
+
+=== requests the CSMS could not handle
+  none
+
+E6 PASS
