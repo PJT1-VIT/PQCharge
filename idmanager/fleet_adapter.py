@@ -34,8 +34,9 @@ class FleetAdapter:
         we take their ids. Includes disconnected stations by design -- a
         fleet-wide migration must account for stations currently offline,
         and the orchestrator's per-station dispatch will simply fail for
-        one that is not connected, which the wave logic already treats as
-        a station failure rather than a crash.
+        one that is not connected, which the wave logic treats as a
+        station failure rather than a crash -- or, if the orchestrator was
+        built with skip_offline=True, defers it (see is_connected).
         """
         return [v.station_id for v in self._fleet.list_stations()]
 
@@ -54,6 +55,21 @@ class FleetAdapter:
         if identity is None:
             return []
         return list(identity.supported_algorithms)
+
+    def is_connected(self, station_id: str) -> bool:
+        """
+        Whether the station has an open connection to the CSMS right now.
+
+        Read from Contract 6's StationView.connection_state -- a Track A
+        field, read-only here. Used by the orchestrator only when it was
+        built with skip_offline=True: an offline station cannot receive
+        its key, and counting that as a crypto failure would let one
+        unplugged charger roll back a whole wave.
+        """
+        view = self._fleet.get_station(station_id)
+        if view is None:
+            return False
+        return view.connection_state == "connected"
 
     def set_state(
         self,

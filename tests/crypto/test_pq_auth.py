@@ -102,3 +102,21 @@ def test_fresh_challenges_differ():
 def test_algorithm_name_reported():
     auth, _, _ = _enrolled_authenticator()
     assert auth.algorithm == "ML-DSA-44"
+
+def test_unenrol_removes_key_and_outstanding_challenge():
+    # The orchestrator relies on this to undo a failed install. After
+    # unenrol, the station is unknown again: a late response must raise,
+    # not verify against a nonce that should no longer exist.
+    auth, provider, priv = _enrolled_authenticator()
+    challenge = auth.issue_challenge("CP001")
+    response = sign_challenge(provider, priv, challenge)
+    auth.unenrol("CP001")
+    assert auth.is_enrolled("CP001") is False
+    with pytest.raises(AuthError):
+        auth.verify_response("CP001", response)
+
+
+def test_unenrol_unknown_station_is_a_no_op():
+    auth, _, _ = _enrolled_authenticator()
+    auth.unenrol("NOPE")  # must not raise
+    assert auth.is_enrolled("CP001") is True
