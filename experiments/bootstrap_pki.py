@@ -11,7 +11,16 @@ Track B.
 
 Run from anywhere (path resolution is relative to this file, not the
 current working directory):
-    python experiments/bootstrap_pki.py
+    python -m experiments.bootstrap_pki                      # CP0001-CP0003
+    python -m experiments.bootstrap_pki --count 50           # CP0001-CP0050
+    python -m experiments.bootstrap_pki --also E6-SAP-01     # + a third-party charger
+
+Station ids are 4-digit (CP0001), agreed by all three tracks on Day 8. The CN
+of each certificate IS the station id, because Track A's identity check
+compares the CN with the id in the connection URL (finding F1).
+
+Every run makes a NEW root CA, so all certificates are regenerated together:
+a certificate from an earlier run will not verify against the new root.
 
 Output: certs/ (at the project root) populated with root.pem,
 localhost.crt.pem / localhost.key.pem (server identity), and one
@@ -21,6 +30,7 @@ these are regenerated, not committed.
 
 from __future__ import annotations
 
+import argparse
 import socket
 import ssl
 import sys
@@ -46,12 +56,23 @@ from crypto.store import (
 
 CERT_DIR = PROJECT_ROOT / "certs"
 SERVER_COMMON_NAME = "localhost"
-DEMO_STATION_IDS = ["CP001", "CP002", "CP003"]
+DEFAULT_STATION_COUNT = 3
+
+
+def station_ids(count: int, also: list[str] | None = None) -> list[str]:
+    """CP0001..CP<count>, 4-digit, then any extra ids in the order given."""
+    if not 1 <= count <= 9999:
+        raise ValueError(f"--count must be 1..9999, got {count}")
+    ids = [f"CP{n:04d}" for n in range(1, count + 1)]
+    for extra in also or []:
+        if extra not in ids:
+            ids.append(extra)
+    return ids
 HANDSHAKE_TEST_PORT = 8943
 
 
-def build_pki() -> CertificateAuthority:
-    """Create the CA and write the root, server, and demo station
+def build_pki(ids: list[str]) -> CertificateAuthority:
+    """Create the CA and write the root, server, and the given station
     certificates to disk under the project root's certs/ directory."""
     print("Building PKI...")
     ca = CertificateAuthority(ClassicalProvider())
@@ -67,7 +88,7 @@ def build_pki() -> CertificateAuthority:
     save_private_key(server_issued.private_key_der, SERVER_COMMON_NAME, directory=CERT_DIR)
     print(f"  server identity written: {CERT_DIR / (SERVER_COMMON_NAME + '.crt.pem')}")
 
-    for station_id in DEMO_STATION_IDS:
+    for station_id in ids:
         issued = ca.issue_station_certificate_with_new_key(station_id)
         save_certificate(issued.certificate_der, station_id, directory=CERT_DIR)
         save_private_key(issued.private_key_der, station_id, directory=CERT_DIR)
@@ -120,7 +141,7 @@ def _run_test_server(result: dict) -> None:
         sock.close()
 
 
-def verify_handshake(station_id: str = "CP001") -> bool:
+def verify_handshake(station_id: str = "CP0001") -> bool:
     """
     Prove the PKI material just written actually supports a real
     mutual-TLS handshake, station-to-server, before Track A wires
@@ -174,14 +195,22 @@ def verify_handshake(station_id: str = "CP001") -> bool:
     return handshake_ok
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Build the PKI and prove a mutual-TLS handshake.")
+    parser.add_argument("--count", type=int, default=DEFAULT_STATION_COUNT,
+                        help="issue CP0001..CP<count> (default 3)")
+    parser.add_argument("--also", nargs="*", default=[], metavar="ID",
+                        help="extra station ids, e.g. E6-SAP-01 for the third-party charger")
+    args = parser.parse_args(argv)
+    ids = station_ids(args.count, args.also)
+
     print("=" * 60)
     print("PQCharge — Day 7 PKI bootstrap")
     print("=" * 60)
     print(f"Project root resolved as: {PROJECT_ROOT}")
 
-    build_pki()
-    success = verify_handshake()
+    build_pki(ids)
+    success = verify_handshake(ids[0])
 
     print("\n" + "=" * 60)
     if success:
@@ -191,7 +220,8 @@ def main() -> None:
         print(f"  keyfile  = certs/{SERVER_COMMON_NAME}.key.pem")
         print(f"  cafile (for verify_locations) = certs/root.pem")
         print(f"  verify_mode = ssl.CERT_REQUIRED")
-        print(f"\nDemo station identities available: {', '.join(DEMO_STATION_IDS)}")
+        shown = ids if len(ids) <= 6 else ids[:3] + ["..."] + ids[-2:]
+        print(f"\nStation identities available ({len(ids)}): {', '.join(shown)}")
         print(f"Each has certs/<id>.crt.pem and certs/<id>.key.pem")
     else:
         print("FAILED — see errors above. Do not proceed to Day 7 integration")

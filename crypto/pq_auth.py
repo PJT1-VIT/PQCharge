@@ -96,6 +96,19 @@ class PQAuthenticator:
         """
         self._enrolled[station_id] = public_key
 
+    def unenrol(self, station_id: str) -> None:
+        """
+        Forget a station's public key and any challenge outstanding for it.
+
+        Used by the migration orchestrator to undo an enrolment (a failed
+        install, a rolled-back wave). Dropping the outstanding challenge as
+        well matters: a response arriving after the un-enrolment must not
+        find a live nonce waiting for it. Unknown station ids are ignored,
+        so a rollback can call this without first checking.
+        """
+        self._enrolled.pop(station_id, None)
+        self._outstanding.pop(station_id, None)
+
     def is_enrolled(self, station_id: str) -> bool:
         return station_id in self._enrolled
 

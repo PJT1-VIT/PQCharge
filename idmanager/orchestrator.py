@@ -36,12 +36,30 @@ a migration id; get_migration_status reads a snapshot; rollback signals
 the task. This matches Contract 4's stated intent exactly ("returns
 immediately; the work proceeds in the background").
 
+PROOF OF POSSESSION (added Day 12, before the A+B+C session):
+Accepting InstallPQAuth only proves a station received a key. When the
+orchestrator is built with challenge_message_factory and signature_parser,
+each station is then sent a PQAuthChallenge straight after the install, and
+is marked MIGRATED only if its ML-DSA signature verifies against the key
+just enrolled. Without those two arguments the behaviour is exactly as
+before (install accepted = migrated), so existing callers keep working.
+
+OFFLINE STATIONS (added Day 12):
+By default a station that is not connected fails its install and counts
+against the wave's failure threshold. Built with skip_offline=True (and a
+fleet that answers is_connected), an offline station is DEFERRED instead:
+left PENDING, excluded from the threshold, and migratable by a later run.
+
 WHAT IT DOES NOT DO:
 It never writes per-command dispatch events -- csms/dispatch.py already
 emits MESSAGE_SENT with dispatched=True for every command it sends
 (Contract 3 belongs to Track A's CSMS). The orchestrator emits only the
 migration-level events (MIGRATION_STARTED, WAVE_STARTED, WAVE_COMPLETED,
-WAVE_ROLLED_BACK, MIGRATION_COMPLETED) through the same EventLog.
+WAVE_ROLLED_BACK, MIGRATION_COMPLETED), plus one CONNECTION_ATTEMPT
+(transition="pq_auth") per verified station when proof of possession is
+wired, and "station_deferred" when skip_offline defers a station, through
+the event_emitter Track A supplies. "station_deferred" and
+"migration_failed" are not Contract 3 EventType members -- see the dev plan.
 """
 
 from __future__ import annotations
@@ -88,9 +106,14 @@ class DispatchLike(Protocol):
 
 
 class AuthenticatorLike(Protocol):
-    """The enrolment surface from crypto.pq_auth.PQAuthenticator."""
+    """The enrolment and challenge surface from crypto.pq_auth.PQAuthenticator.
+    issue_challenge / verify_response are used only when proof of possession
+    is wired (challenge_message_factory + signature_parser)."""
 
     def enrol(self, station_id: str, public_key: bytes) -> None: ...
+    def unenrol(self, station_id: str) -> None: ...
+    def issue_challenge(self, station_id: str) -> bytes: ...
+    def verify_response(self, station_id: str, response_signature: bytes) -> bool: ...
 
 
 class FleetLike(Protocol):
@@ -115,6 +138,16 @@ InstallMessageFactory = Callable[[str, bytes], object]
 # pass a deterministic fake.
 KeypairFactory = Callable[[], tuple[bytes, bytes]]
 
+# Builds the OCPP call that carries a challenge nonce to a station. In the
+# live CSMS this is agent.pqc_messages.build_challenge_message -- injected,
+# like the install factory, so idmanager/ never imports agent/.
+ChallengeMessageFactory = Callable[[bytes], object]
+
+# Pulls the station's signature bytes out of the dispatcher's response
+# object (DispatchResult.response). In the live CSMS:
+#     lambda response: agent.pqc_messages.parse_signature(response.data)
+SignatureParser = Callable[[object], bytes]
+
 
 class MigrationOrchestrator(MigrationController):
     """
@@ -138,7 +171,18 @@ class MigrationOrchestrator(MigrationController):
         failure_threshold: float = DEFAULT_FAILURE_THRESHOLD,
         dispatch_timeout_s: float | None = None,
         target_algorithm: str = "ML-DSA-44",
+        challenge_message_factory: ChallengeMessageFactory | None = None,
+        signature_parser: SignatureParser | None = None,
+        skip_offline: bool = False,
     ) -> None:
+        if (challenge_message_factory is None) != (signature_parser is None):
+            raise ValueError(
+                "challenge_message_factory and signature_parser must be given "
+                "together: one without the other cannot verify a station"
+            )
+        self._make_challenge_msg = challenge_message_factory
+        self._parse_signature = signature_parser
+        self._skip_offline = skip_offline
         self._dispatch = dispatcher
         self._auth = authenticator
         self._fleet = fleet
@@ -262,28 +306,39 @@ class MigrationOrchestrator(MigrationController):
         migrated = sum(1 for o in outcomes if o == MigrationState.MIGRATED)
         failed = sum(1 for o in outcomes if o == MigrationState.ROLLED_BACK)
         incompatible = sum(1 for o in outcomes if o == MigrationState.INCOMPATIBLE)
+        deferred = sum(1 for o in outcomes if o == MigrationState.PENDING)
 
         wave.migrated_count = migrated
         wave.failed_count = failed
         wave.completed_at = datetime.now(timezone.utc)
 
+        # Every station that reached a terminal state leaves `pending`, and
+        # lands in exactly one counter. A station that failed on its own was
+        # set ROLLED_BACK by _transition_station, so it is counted here --
+        # before Day 12 it was not, and a wave in which every station failed
+        # individually left rolled_back at 0 and the counts short of
+        # total_stations (reported by Track A, TrackA_Dev_Plan R6 §14).
+        # Deferred (offline) stations stay pending.
         self._status.migrated += migrated
+        self._status.rolled_back += failed
         self._status.incompatible += incompatible
-        self._status.pending -= len(station_ids)
+        self._status.pending -= len(station_ids) - deferred
 
-        eligible = len(station_ids) - incompatible
+        eligible = len(station_ids) - incompatible - deferred
         wave_failed = eligible > 0 and (failed / eligible) > self._threshold
 
         if wave_failed:
             wave.phase = WavePhase.ROLLED_BACK
             self._rollback_wave(wave_id)
             self._emit("wave_rolled_back", wave_id=wave_id,
-                       migrated=migrated, failed=failed, eligible=eligible)
+                       migrated=migrated, failed=failed, eligible=eligible,
+                       deferred=deferred)
             return False
 
         wave.phase = WavePhase.COMPLETED
         self._emit("wave_completed", wave_id=wave_id,
-                   migrated=migrated, failed=failed, incompatible=incompatible)
+                   migrated=migrated, failed=failed, incompatible=incompatible,
+                   deferred=deferred)
         return True
 
     async def _transition_station(self, station_id, wave_id, target_mode) -> MigrationState:
@@ -303,6 +358,16 @@ class MigrationOrchestrator(MigrationController):
             self._fleet.set_state(station_id, MigrationState.INCOMPATIBLE, wave_id)
             return MigrationState.INCOMPATIBLE
 
+        # Offline gate (opt-in): a station that is not connected cannot be
+        # sent a key. Deferred = left PENDING, outside the threshold, and
+        # never enrolled -- so there is nothing to undo.
+        if self._skip_offline:
+            is_connected = getattr(self._fleet, "is_connected", None)
+            if callable(is_connected) and not is_connected(station_id):
+                self._emit("station_deferred", station=station_id,
+                           wave_id=wave_id, reason="not connected")
+                return MigrationState.PENDING
+
         self._fleet.set_state(station_id, MigrationState.IN_PROGRESS, wave_id)
 
         # Step 1: enrol the new identity FIRST -- overlap window opens.
@@ -315,14 +380,67 @@ class MigrationOrchestrator(MigrationController):
         result = await self._dispatch.send(
             station_id, install_msg, timeout_s=self._dispatch_timeout_s
         )
+        if not getattr(result, "ok", False):
+            return self._fail_station(station_id, wave_id)
 
-        # Step 3: confirm, or roll back this station's enrolment.
-        if getattr(result, "ok", False):
-            self._fleet.set_state(station_id, MigrationState.MIGRATED, wave_id)
-            self._fleet.mark_migrated_algorithm(station_id, self._target_algorithm)
-            return MigrationState.MIGRATED
+        # Step 3 (when wired): the station must PROVE it holds the key by
+        # signing a fresh challenge. Without this, "migrated" only means
+        # "the station accepted a message".
+        if self._make_challenge_msg is not None:
+            verified, detail, duration_ms = await self._verify_possession(station_id)
+            # Same event shape Track A uses for its identity check, so Track
+            # C's E5 measure counts both. station_id travels as `station`
+            # because the orchestrator's emitter writes events with no
+            # top-level station (a wave is not one station).
+            self._emit("connection_attempt", transition="pq_auth",
+                       station=station_id, wave_id=wave_id,
+                       result="success" if verified else "rejected",
+                       detail=detail, duration_ms=duration_ms,
+                       algorithm=self._target_algorithm)
+            if not verified:
+                return self._fail_station(station_id, wave_id)
 
-        # Failed: un-enrol so the station is never left half-migrated.
+        # Step 4: confirmed.
+        self._fleet.set_state(station_id, MigrationState.MIGRATED, wave_id)
+        self._fleet.mark_migrated_algorithm(station_id, self._target_algorithm)
+        return MigrationState.MIGRATED
+
+    async def _verify_possession(self, station_id: str) -> tuple[bool, str, float | None]:
+        """
+        Challenge a just-installed station and verify its ML-DSA signature
+        against the key enrolled for it in Step 1.
+
+        Returns (verified, detail, round_trip_ms). Never raises: a station
+        that answers badly -- refuses, times out, sends garbage, or signs
+        with the wrong key -- is a failed station, not a crashed wave.
+        """
+        nonce = self._auth.issue_challenge(station_id)
+        result = await self._dispatch.send(
+            station_id, self._make_challenge_msg(nonce),
+            timeout_s=self._dispatch_timeout_s,
+        )
+        duration_ms = getattr(result, "duration_ms", None)
+
+        if not getattr(result, "ok", False):
+            return (False,
+                    f"challenge not answered (outcome={getattr(result, 'outcome', None)}, "
+                    f"status={getattr(result, 'status', None)})",
+                    duration_ms)
+        try:
+            signature = self._parse_signature(getattr(result, "response", None))
+        except Exception as exc:  # noqa: BLE001 - malformed answer = failed station
+            return False, f"unreadable signature: {type(exc).__name__}: {exc}", duration_ms
+        try:
+            verified = self._auth.verify_response(station_id, signature)
+        except Exception as exc:  # noqa: BLE001 - AuthError (expired / no challenge)
+            return False, f"verification refused: {type(exc).__name__}: {exc}", duration_ms
+
+        return (bool(verified),
+                "signature verified" if verified else "signature did not verify",
+                duration_ms)
+
+    def _fail_station(self, station_id: str, wave_id: int) -> MigrationState:
+        """Un-enrol so the station is never left half-migrated."""
         self._unenrol(station_id)
         if station_id in self._enrolled_this_run.get(wave_id, []):
             self._enrolled_this_run[wave_id].remove(station_id)
@@ -340,8 +458,8 @@ class MigrationOrchestrator(MigrationController):
         self._enrolled_this_run[wave_id] = []
 
     def _unenrol(self, station_id: str) -> None:
-        """Reverse an enrolment. PQAuthenticator may or may not expose unenrol;
-        fall back to removing the key directly if not."""
+        """Reverse an enrolment. PQAuthenticator.unenrol exists from Day 12;
+        the fallback stays only for authenticators built before it."""
         unenrol = getattr(self._auth, "unenrol", None)
         if callable(unenrol):
             unenrol(station_id)
