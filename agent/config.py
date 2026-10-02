@@ -145,11 +145,9 @@ class AgentConfig:
     """
     Which cryptographic configuration this station runs.
 
-    Does almost nothing today: Track B's real backends do not exist and
-    crypto/stub.py raises on every call. It is here from the start
-    anyway because it is the grouping variable for every comparison
-    chart in the results -- retrofitting it later would mean touching
-    every file that logs or reports.
+          The grouping variable for every comparison chart in the results.
+      Today it is a label only: it does not change the station's TLS or
+      the server's checks (integration finding F1).
     """
 
     supported_algorithms: list[str] = field(default_factory=list)
