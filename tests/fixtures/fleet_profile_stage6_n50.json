@@ -1,0 +1,8 @@
+{
+  "description": "Stage 6 (A+B+C session, N=50), approved by Track B 2026-10-01. CP0001-CP0040: Track C agents, ML-DSA capable. CP0041-CP0045: Track C agents declared LEGACY (skipped as incompatible - the heterogeneous fleet). CP0046-CP0050: Track A fake stations that CLAIM ML-DSA but refuse the key (UnknownVendorId) - the injected failure.",
+  "groups": [
+    {"stations": "CP0001-CP0040", "supported_algorithms": ["ECDSA-P256", "ML-DSA-44"]},
+    {"stations": "CP0041-CP0045", "supported_algorithms": ["ECDSA-P256"]},
+    {"stations": "CP0046-CP0050", "supported_algorithms": ["ECDSA-P256", "ML-DSA-44"]}
+  ]
+}

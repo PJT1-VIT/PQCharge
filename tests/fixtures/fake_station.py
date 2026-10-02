@@ -42,9 +42,9 @@ Usage (the -m form is the repo convention):
         ^ charges until the CSMS stops it (or Ctrl-C) -- for dispatch tests
 
 Over mutual TLS -- certificates from `python -m experiments.bootstrap_pki`:
-    python -m tests.fixtures.fake_station CP001 --tls
-    python -m tests.fixtures.fake_station CP001 --tls --cert-as CP002
-        ^ connects as CP001 while presenting CP002's certificate, to prove
+    python -m tests.fixtures.fake_station CP0001 --tls
+    python -m tests.fixtures.fake_station CP0001 --tls --cert-as CP0002
+        ^ connects as CP0001 while presenting CP0002's certificate, to prove
           the server's identity check catches one certificate holder
           claiming another station's identity.
 """
