@@ -506,3 +506,62 @@ async def test_every_stations_connect_time_reaches_the_harness_log(tmp_path):
         assert "connect_ms" in row, "E1's number never reached the log"
         assert len(row["connect_ms"]) == 1
         assert row["connect_ms"][0] > 0
+
+# =====================================================================
+# C6.1 — THE STATION'S OWN POST-QUANTUM VIEW
+# =====================================================================
+#
+# Each station reports, in its station_finished row, whether it holds a
+# post-quantum key, which algorithm, how many keys it received and how many
+# key checks it signed. The analysis compares this with what the server
+# says, so a station the server calls migrated but which holds no key is
+# caught.
+
+
+def test_a_pq_identity_counts_the_keys_it_was_given():
+    from agent.pq_identity import PQIdentity
+
+    identity = PQIdentity("CP0001")
+    assert identity.installs == 0 and identity.is_migrated is False
+    identity.install(b"\x01" * 32, "ML-DSA-44")
+    identity.install(b"\x02" * 32, "ML-DSA-44")          # a rotation
+    assert identity.installs == 2 and identity.is_migrated
+
+
+@pytest.mark.asyncio
+async def test_the_stations_own_pq_view_reaches_the_harness_log(tmp_path, monkeypatch):
+    from agent.station import ChargingStation
+
+    async def migrated_run(self):
+        self.pq.install(b"\x01" * 32, "ML-DSA-44")
+        self.pq.challenges_signed = 1
+        return True
+
+    monkeypatch.setattr(ChargingStation, "run", migrated_run)
+    log = make_log(tmp_path, n=2)
+    runner = FleetRunner(make_config(9280), FleetSpec(n=2, stagger_s=0.01), log)
+    result = await runner.run()
+    log.close()
+
+    rows = TimingLog.read(tmp_path / "t.jsonl")
+    finished = [r for r in rows if r["event_type"] == tl.STATION_FINISHED]
+    assert len(finished) == 2
+    for row in finished:
+        assert row["pq_key_installed"] is True
+        assert row["pq_algorithm"] == "ML-DSA-44"
+        assert row["pq_installs"] == 1 and row["pq_challenges_signed"] == 1
+    assert result.to_dict()["pq_keys_installed"] == 2
+    assert "PQ keys held         2/2" in result.describe()
+
+
+@pytest.mark.asyncio
+async def test_a_classical_station_reports_no_key(tmp_path):
+    async with FakeCSMS(port=9281):
+        log = make_log(tmp_path, n=1)
+        runner = FleetRunner(make_config(9281), FleetSpec(n=1, stagger_s=0.01), log)
+        await runner.run()
+        log.close()
+
+    row = [r for r in TimingLog.read(tmp_path / "t.jsonl")
+           if r["event_type"] == tl.STATION_FINISHED][0]
+    assert row["pq_key_installed"] is False and row["pq_installs"] == 0

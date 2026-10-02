@@ -50,6 +50,7 @@ LOG = logging.getLogger("analysis")
 
 DEFAULT_LOG_DIR = "logs"
 DEFAULT_EVENTS = "logs/events.jsonl"
+"""Kept for reference: since C6.1 the default is every server diary in --logs."""
 DEFAULT_OUT = "analysis/output"
 
 
@@ -64,7 +65,8 @@ def analyse_run(matched: match.MatchedRun) -> dict[str, Any]:
     h = matched.harness
     ov = overview.measure(matched)
     e1 = e1_handshake.measure(matched)
-    trust = check.check_run(matched, ov, e1)
+    e3 = e3_migration.measure(matched)
+    trust = check.check_run(matched, ov, e1, e3)
     return {
         "key": store.slot_key(h.experiment, h.n_stations, h.crypto_mode, h.tls),
         "experiment": h.experiment,
@@ -83,17 +85,37 @@ def analyse_run(matched: match.MatchedRun) -> dict[str, Any]:
         "overview": ov,
         "e1": e1,
         "e2": e2_storm.measure(matched),
-        "e3": e3_migration.measure(matched),
+        "e3": e3,
         "e5": e5_security.measure(matched),
     }
 
 
+def server_diary_paths(events: str | Path | list[str | Path] | None,
+                       log_dir: str | Path) -> list[Path]:
+    """
+    Which server diaries to read (C6.1).
+
+    Given explicitly (one path or a list) -> exactly those.
+    Not given -> every server diary found in the log folder
+    (`*events*.jsonl` whose content is Contract 3), which covers both the
+    default logs/events.jsonl and the runbook's per-run files. If none is
+    found, the default path is returned so the "not found" message names it.
+    """
+    if events:
+        if isinstance(events, (str, Path)):
+            return [Path(events)]
+        return [Path(e) for e in events]
+    found = collect.find_server_diaries(log_dir)
+    return found or [Path(log_dir) / "events.jsonl"]
+
+
 def build(
-    events_path: str | Path = DEFAULT_EVENTS,
+    events_path: str | Path | list[str | Path] | None = None,
     log_dir: str | Path = DEFAULT_LOG_DIR,
     harness_paths: list[str | Path] | None = None,
 ) -> dict[str, Any]:
-    diary = collect.read_server_diary(events_path)
+    server_paths = server_diary_paths(events_path, log_dir)
+    diary = collect.read_server_diaries(server_paths)
     paths = [Path(p) for p in harness_paths] if harness_paths else collect.find_harness_files(log_dir)
     files = [collect.read_harness_file(p) for p in paths]
     runs = collect.all_harness_runs(files)
@@ -107,8 +129,11 @@ def build(
         "format_version": store.FORMAT_VERSION,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "sources": {
-            "server_diary": str(events_path),
+            "server_diary": diary.path,
+            "server_diaries": diary.paths,
             "server_diary_lines": diary.lines_total,
+            "server_duplicates_dropped": diary.duplicates_dropped,
+            "server_lines_normalised": diary.normalised,
             "tester_diaries": [
                 {"path": hf.path, "runs": len(hf.runs), "lines": hf.lines_total,
                  "unreadable": hf.lines_unreadable}
@@ -131,7 +156,11 @@ def main(argv: list[str] | None = None) -> int:
         prog="python -m analysis.run",
         description="Turn the server and tester diaries into results (Track C, C6).",
     )
-    parser.add_argument("--events", default=DEFAULT_EVENTS, help="server diary (Contract 3)")
+    parser.add_argument(
+        "--events", action="append", default=None,
+        help="a server diary (Contract 3); repeatable. Default: every "
+             "*events*.jsonl server diary in --logs",
+    )
     parser.add_argument("--logs", default=DEFAULT_LOG_DIR, help="folder holding tester diaries")
     parser.add_argument("--harness-log", action="append", default=None,
                         help="analyse only this tester diary (repeatable)")
@@ -153,7 +182,10 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def summary(results: dict[str, Any]) -> str:
-    lines = [f"server diary: {results['diary_check']['status']}"]
+    diaries = results["sources"].get("server_diaries") or [results["sources"].get("server_diary")]
+    lines = [f"server diaries ({len(diaries)}): {results['diary_check']['status']}"]
+    for d in diaries:
+        lines.append(f"  - {d}")
     for i in results["diary_check"]["issues"]:
         lines.append(f"  [{i['level']}] {i['message']}")
     lines.append(f"runs: {results['sources']['runs_found']} found, "
@@ -164,29 +196,38 @@ def summary(results: dict[str, Any]) -> str:
         med = f"{e1['median']:.1f} ms" if e1.get("n") else "n/a"
         e2 = s.get("e2")
         storm = f"  T95={e2['t95_s']:.2f}s" if e2 and e2.get("t95_s") is not None else ""
-        lines.append(f"  {key:<32} trust={s['trust']['status']:<5} connect median={med}{storm}")
+        e3 = s.get("e3")
+        mig = ""
+        if e3:
+            fc = e3["final_counts"]
+            mig = (f"  migration: {fc['migrated']} migrated / {fc['rolled_back']} rolled back / "
+                   f"{fc['incompatible']} incompatible / {fc['pending']} pending"
+                   f" -- {e3['verification']}, {e3['pq_checks']['passed']} key check(s) passed")
+        lines.append(f"  {key:<32} trust={s['trust']['status']:<5} connect median={med}{storm}{mig}")
     if results["external_nodes"]:
         lines.append("chargers not started by the tester: "
                      + ", ".join(n["station_id"] for n in results["external_nodes"]))
     return "\n".join(lines)
 
 
-def analyse_after_run(harness_log: str | Path, events: str | Path | None = None,
+def analyse_after_run(harness_log: str | Path,
+                      events: str | Path | list[str | Path] | None = None,
                       out: str | Path = DEFAULT_OUT) -> None:
     """
     Called by the load generator when a run ends. Rebuilds everything (the
     new run replaces its slot) and NEVER raises: the run's data is already
     safe on disk, so a problem here must not turn a good run into a failed one.
 
-    The server diary is looked for next to the tester diary first (a run
-    with --log-dir elsewhere), then at the default logs/events.jsonl.
+    Server diaries: the ones passed with the load generator's --events-log,
+    plus every server diary in the tester diary's folder (C6.1). The
+    explicit ones are what make a run whose CSMS logged somewhere else
+    (e.g. logs/s1_events.jsonl named by the runbook) analyse correctly.
     """
     try:
         log_dir = Path(harness_log).parent
-        if events is None:
-            beside = log_dir / "events.jsonl"
-            events = beside if beside.exists() else DEFAULT_EVENTS
-        results = build(events, log_dir)
+        explicit = [events] if isinstance(events, (str, Path)) else list(events or [])
+        paths = [Path(p) for p in explicit] + collect.find_server_diaries(log_dir)
+        results = build(paths or None, log_dir)
         store.write(results, out)
         print(f"\nanalysis updated: {Path(out) / 'report.html'}")
     except Exception as exc:  # noqa: BLE001

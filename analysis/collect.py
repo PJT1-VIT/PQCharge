@@ -33,6 +33,33 @@ loss. The event-type strings still come from Track A's own EventType enum.
 
 A half-written last line (a run killed mid-write, which E2 does on purpose)
 is counted and skipped, exactly as read_events does.
+
+--------------------------------------------------------------------
+PHASE C6.1 (A+B+C integration) — three additions
+
+1. SEVERAL SERVER DIARIES. The integration runbook gives every run its own
+   server diary (logs/s1_events.jsonl, logs/stage6_events.jsonl, ...). All
+   of them are read and merged. A line that appears in two files (a copied
+   backup, say) is counted ONCE: duplicates are recognised by their full
+   content and dropped, and the number dropped is reported.
+
+2. FILES ARE RECOGNISED BY WHAT IS INSIDE, NOT ONLY BY NAME. A server diary
+   has `event_type` + `timestamp` + `monotonic_ns`; a tester diary has `ts` +
+   `elapsed_ms`. A server file that happened to be named like a tester file
+   (e1_n50_events.jsonl) is therefore never read as one, and vice versa.
+
+3. THE CHARGER ID INSIDE THE PAYLOAD. Track B's orchestrator writes its
+   per-charger lines (`connection_attempt` with transition "pq_auth", and
+   `station_deferred`) through Track A's emitter, which leaves the top-level
+   `station_id` empty and puts the charger in `payload.station`; the
+   result goes in `payload.result`, with top-level `outcome` empty.
+   (Confirmed in idmanager/orchestrator.py and csms/migration.py on main
+   8a5922a.) So, in this program's in-memory copy only:
+       station_id empty and payload.station present -> station_id = payload.station
+       outcome empty and payload.result present     -> outcome    = payload.result
+   and the line is marked `_normalised: True`. The diary file is never
+   changed. If Track A later copies these up themselves, nothing here
+   changes: a filled top-level field is always left as it is.
 """
 
 from __future__ import annotations
@@ -72,17 +99,28 @@ def to_epoch(iso: str | None) -> float | None:
 
 @dataclass
 class ServerDiary:
-    """Everything read from logs/events.jsonl, plus how cleanly it read."""
+    """Everything read from the server diaries, plus how cleanly it read."""
 
     path: str
+    """The file read, or a comma-separated list when several were merged."""
+
     events: list[dict[str, Any]] = field(default_factory=list)
-    """Every parsed line, in file order, each with an added `_t` (epoch s)."""
+    """Every parsed line, in time order, each with an added `_t` (epoch s)."""
 
     lines_total: int = 0
     lines_unreadable: int = 0
     last_line_unreadable: bool = False
     unknown_fields: dict[str, int] = field(default_factory=dict)
     found: bool = True
+
+    paths: list[str] = field(default_factory=list)
+    """Every server diary that was read (C6.1)."""
+
+    duplicates_dropped: int = 0
+    """Lines seen in more than one file and counted once (C6.1)."""
+
+    normalised: int = 0
+    """Lines whose charger id / result were taken from the payload (C6.1)."""
 
     def by_run(self) -> dict[str, list[dict[str, Any]]]:
         runs: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -91,16 +129,73 @@ class ServerDiary:
         return dict(runs)
 
 
+def _normalise(obj: dict[str, Any]) -> bool:
+    """
+    Fill an empty top-level station_id / outcome from the payload (see the
+    module docstring, point 3). Returns True when anything was filled.
+    """
+    payload = obj.get("payload") or {}
+    changed = False
+    station = payload.get("station")
+    if not obj.get("station_id") and isinstance(station, str) and station:
+        obj["station_id"] = station
+        changed = True
+    result = payload.get("result")
+    if not obj.get("outcome") and isinstance(result, str) and result:
+        obj["outcome"] = result
+        changed = True
+    if changed:
+        obj["_normalised"] = True
+    return changed
+
+
+def _dedupe_key(raw_line: str) -> str:
+    """The line itself: two lines are the same event only if identical."""
+    return raw_line
+
+
 def read_server_diary(path: str | Path) -> ServerDiary:
-    path = Path(path)
-    diary = ServerDiary(path=str(path))
-    if not path.exists():
+    """One server diary. Kept for callers that have exactly one file."""
+    return read_server_diaries([path])
+
+
+def read_server_diaries(paths: Iterable[str | Path]) -> ServerDiary:
+    """
+    Read and merge every given server diary.
+
+    `found` is False only when NONE of the files exists. Lines appearing in
+    more than one file are kept once. The result is in time order.
+    """
+    paths = [Path(p) for p in paths]
+    seen_paths: list[str] = []
+    for p in paths:
+        if str(p) not in seen_paths:
+            seen_paths.append(str(p))
+    paths = [Path(p) for p in seen_paths]
+
+    diary = ServerDiary(path=", ".join(seen_paths), paths=seen_paths)
+    existing = [p for p in paths if p.exists()]
+    if not existing:
         diary.found = False
         return diary
 
     unknown: dict[str, int] = defaultdict(int)
+    seen_lines: set[str] = set()
+    last_bad = False
+    for path in existing:
+        last_bad = _read_one_server_file(path, diary, unknown, seen_lines)
+    diary.last_line_unreadable = last_bad
+    diary.unknown_fields = dict(unknown)
+    diary.events.sort(key=lambda e: (e["_t"] is None, e["_t"] or 0.0))
+    return diary
+
+
+def _read_one_server_file(path: Path, diary: ServerDiary,
+                          unknown: dict[str, int], seen_lines: set[str]) -> bool:
+    """Append one file's lines to `diary`. Returns whether its last line was bad."""
+
+    last_bad = False
     with path.open("r", encoding="utf-8", errors="replace") as fh:
-        last_bad = False
         for raw in fh:
             line = raw.strip()
             if not line:
@@ -115,16 +210,20 @@ def read_server_diary(path: str | Path) -> ServerDiary:
                 last_bad = True
                 continue
             last_bad = False
-            for key in obj.keys() - SERVER_FIELDS:
-                unknown[key] += 1
+            key = _dedupe_key(line)
+            if key in seen_lines:
+                diary.duplicates_dropped += 1
+                continue
+            seen_lines.add(key)
+            for field_name in obj.keys() - SERVER_FIELDS:
+                unknown[field_name] += 1
             obj["_t"] = to_epoch(obj.get("timestamp"))
             if not isinstance(obj.get("payload"), dict):
                 obj["payload"] = {}
+            if _normalise(obj):
+                diary.normalised += 1
             diary.events.append(obj)
-        diary.last_line_unreadable = last_bad
-
-    diary.unknown_fields = dict(unknown)
-    return diary
+    return last_bad
 
 
 # =====================================================================
@@ -236,12 +335,65 @@ def read_harness_file(path: str | Path) -> HarnessFile:
     return hf
 
 
+SERVER_GLOB = "*events*.jsonl"
+
+
+def sniff_kind(path: str | Path) -> str:
+    """
+    "server", "harness" or "unknown", from the first readable line.
+
+    Server lines (Contract 3) carry event_type + timestamp + monotonic_ns;
+    tester lines (harness/timing_log.py) carry ts + elapsed_ms. Reading the
+    content means a file's NAME can never make it be read as the wrong kind.
+    """
+    try:
+        with Path(path).open("r", encoding="utf-8", errors="replace") as fh:
+            for _ in range(50):
+                raw = fh.readline()
+                if not raw:
+                    break
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                if "ts" in obj and "elapsed_ms" in obj:
+                    return "harness"
+                if "event_type" in obj and "timestamp" in obj and "monotonic_ns" in obj:
+                    return "server"
+    except OSError:
+        return "unknown"
+    return "unknown"
+
+
 def find_harness_files(log_dir: str | Path) -> list[Path]:
-    """Every tester diary in the log folder, by the agreed name pattern."""
+    """Every tester diary in the log folder: agreed name pattern AND content."""
     log_dir = Path(log_dir)
     if not log_dir.is_dir():
         return []
-    return sorted(p for p in log_dir.glob(HARNESS_GLOB) if p.is_file())
+    return sorted(
+        p for p in log_dir.glob(HARNESS_GLOB)
+        if p.is_file() and sniff_kind(p) == "harness"
+    )
+
+
+def find_server_diaries(log_dir: str | Path) -> list[Path]:
+    """
+    Every server diary in the log folder: `*events*.jsonl` whose content is
+    Contract 3. Covers the default logs/events.jsonl and the runbook's
+    per-run names (s1_events.jsonl, stage6_events.jsonl, ...).
+    """
+    log_dir = Path(log_dir)
+    if not log_dir.is_dir():
+        return []
+    return sorted(
+        p for p in log_dir.glob(SERVER_GLOB)
+        if p.is_file() and sniff_kind(p) == "server"
+    )
 
 
 def all_harness_runs(files: Iterable[HarnessFile]) -> list[HarnessRun]:

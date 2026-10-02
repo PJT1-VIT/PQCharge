@@ -66,11 +66,28 @@ def test_two_runs_appended_to_one_tester_file_are_separated(tmp_path):
     assert all(len(r.station_ids) == 2 for r in runs)
 
 
+HARNESS_LINE = '{"ts": "2026-10-01T00:00:00+00:00", "elapsed_ms": 0.0, "run_id": "r", "event_type": "run_started"}\n'
+SERVER_LINE = ('{"timestamp": "2026-10-01T00:00:00+00:00", "monotonic_ns": 1, '
+               '"event_type": "server_started", "run_id": "s", "payload": {}}\n')
+
+
 def test_only_files_named_by_the_agreed_pattern_are_picked_up(tmp_path):
-    (tmp_path / "e1_n5_pqc.jsonl").write_text("")
-    (tmp_path / "events.jsonl").write_text("")
+    (tmp_path / "e1_n5_pqc.jsonl").write_text(HARNESS_LINE)
+    (tmp_path / "events.jsonl").write_text(SERVER_LINE)
     (tmp_path / "agent_CP0001.log").write_text("")
     assert [p.name for p in collect.find_harness_files(tmp_path)] == ["e1_n5_pqc.jsonl"]
+    assert [p.name for p in collect.find_server_diaries(tmp_path)] == ["events.jsonl"]
+
+
+def test_a_file_is_read_as_what_it_contains_not_what_it_is_called(tmp_path):
+    """C6.1: a server diary named like a tester diary is still a server diary."""
+    (tmp_path / "e2_n50_events.jsonl").write_text(SERVER_LINE)   # matches BOTH name patterns
+    (tmp_path / "stage6_events.jsonl").write_text(SERVER_LINE)
+    (tmp_path / "stage6_n45_classical.jsonl").write_text(HARNESS_LINE)
+    assert [p.name for p in collect.find_harness_files(tmp_path)] == ["stage6_n45_classical.jsonl"]
+    assert [p.name for p in collect.find_server_diaries(tmp_path)] == [
+        "e2_n50_events.jsonl", "stage6_events.jsonl",
+    ]
 
 
 def test_a_missing_server_diary_is_a_failure_that_says_where_it_looked(tmp_path):

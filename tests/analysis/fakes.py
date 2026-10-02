@@ -65,7 +65,8 @@ class Diaries:
                   connect_ms: list[float] | None = None, charge_s: int = 5,
                   storm: dict[str, Any] | None = None, migrate: bool = False,
                   crash: str | None = None, omit_connect_ms: bool = False,
-                  first_id: int = 1) -> dict[str, Any]:
+                  first_id: int = 1, pq_checks: bool = True, bad_counts: bool = False,
+                  agent_keys: dict[str, bool] | None = None) -> dict[str, Any]:
         """
         A run of n chargers: connect, boot, charge for charge_s seconds with a
         7.4 kW reading each second, disconnect. Optional storm / migration.
@@ -156,27 +157,59 @@ class Diaries:
             )
             if not omit_connect_ms:
                 row["connect_ms"] = times
+            if agent_keys is not None:
+                # C6.1: the charger's own post-quantum view (harness StationOutcome).
+                row["pq_key_installed"] = bool(agent_keys.get(sid, False))
+                row["pq_installs"] = 1 if agent_keys.get(sid) else 0
+                row["pq_challenges_signed"] = 1 if agent_keys.get(sid) else 0
             kind = "station_crashed" if sid == crash else "station_finished"
             self.harness(name, t + 0.01, kind, station_id=sid, **row, **H)
 
         if migrate:
-            self._migration(name, ids, start, H, S, srv)
+            self._migration(name, ids, start, H, S, srv, pq_checks=pq_checks, bad_counts=bad_counts)
 
         self.harness(name, end + 1.0, "run_finished", succeeded=n, failed=0, crashed=0, **H)
         return {"ids": ids, "name": name, "storm_restart": storm_restart}
 
-    def _migration(self, name: str, ids: list[str], start: float, H: dict, S: dict, srv: str) -> None:
-        """Canary (2) -> wave 1 (next 2, succeeds) -> wave 2 (rest, rolled back)."""
+    def _migration(self, name: str, ids: list[str], start: float, H: dict, S: dict, srv: str,
+                   *, pq_checks: bool = True, bad_counts: bool = False) -> None:
+        """
+        Canary (2) -> wave 1 (next 2, succeeds) -> wave 2 (rest, fails at
+        install -> rolled back, migration halts). Shaped exactly as the real
+        orchestrator writes it through Track A's emitter (main 8a5922a):
+        top-level station_id None, `source: "orchestrator"`, per-charger
+        lines carrying `station` and `result` in the payload, and NO
+        migration_completed after a rollback (the orchestrator halts).
+
+        pq_checks=False -> the server was not wired to challenge ("key
+        installed" only). bad_counts=True -> the controller's counts do not
+        add up (to test the trust check).
+        """
         canary, w1, w2 = ids[:2], ids[2:4], ids[4:]
         began = start + 1.0
-        self.server(began, "migration_started", None, run_id=srv, migration_id="m1", **S)
-        self.server(began, "wave_started", None, run_id=srv, wave_id=0, **S)
-        self.server(began + 1.0, "wave_completed", None, run_id=srv, wave_id=0, outcome="success", **S)
-        self.server(began + 1.0, "wave_started", None, run_id=srv, wave_id=1, **S)
-        self.server(began + 2.0, "wave_completed", None, run_id=srv, wave_id=1, outcome="success", **S)
-        self.server(began + 2.0, "wave_started", None, run_id=srv, wave_id=2, **S)
-        self.server(began + 3.0, "wave_rolled_back", None, run_id=srv, wave_id=2, outcome="success", **S)
-        self.server(began + 3.5, "migration_completed", None, run_id=srv, **S)
+        O = dict(source="orchestrator", **S)
+        self.server(began, "migration_started", None, run_id=srv, migration_id="m1",
+                    target_mode="pqc", total=len(ids), wave_size=2, canary_count=2, **O)
+        self.server(began, "wave_started", None, run_id=srv, wave_id=0, is_canary=True, size=2, **O)
+        if pq_checks:
+            for k, sid in enumerate(canary):
+                self.server(began + 0.4 + 0.01 * k, "connection_attempt", None, run_id=srv,
+                            transition="pq_auth", station=sid, wave_id=0, result="success",
+                            detail="signature verified", duration_ms=40.0 + k, algorithm="ML-DSA-44", **O)
+        self.server(began + 1.0, "wave_completed", None, run_id=srv, wave_id=0,
+                    migrated=2, failed=0, incompatible=0, deferred=0, **O)
+        self.server(began + 1.0, "wave_started", None, run_id=srv, wave_id=1, is_canary=False, size=2, **O)
+        if pq_checks:
+            for k, sid in enumerate(w1):
+                self.server(began + 1.4 + 0.01 * k, "connection_attempt", None, run_id=srv,
+                            transition="pq_auth", station=sid, wave_id=1, result="success",
+                            detail="signature verified", duration_ms=50.0 + k, algorithm="ML-DSA-44", **O)
+        self.server(began + 2.0, "wave_completed", None, run_id=srv, wave_id=1,
+                    migrated=2, failed=0, incompatible=0, deferred=0, **O)
+        self.server(began + 2.0, "wave_started", None, run_id=srv, wave_id=2, is_canary=False,
+                    size=len(w2), **O)
+        self.server(began + 3.0, "wave_rolled_back", None, run_id=srv, wave_id=2,
+                    migrated=0, failed=len(w2), eligible=len(w2), deferred=0, **O)
 
         def state_at(sid: str, t: float) -> str:
             rel = t - began
@@ -188,7 +221,7 @@ class Diaries:
 
         for k in range(0, 7):
             t = start + 0.5 + k
-            phase = "idle" if t < began else ("completed" if t >= began + 3.5 else "running")
+            phase = "idle" if t < began else ("rolled_back" if t >= began + 3.0 else "running")
             waves = [
                 {"wave_id": 0, "is_canary": True, "station_ids": canary, "phase": "completed",
                  "migrated_count": 2, "failed_count": 0, "started_at": iso(began), "completed_at": iso(began + 1)},
@@ -197,14 +230,20 @@ class Diaries:
                 {"wave_id": 2, "is_canary": False, "station_ids": w2, "phase": "rolled_back",
                  "migrated_count": 0, "failed_count": len(w2), "started_at": iso(began + 2), "completed_at": iso(began + 3)},
             ]
+            states = {sid: state_at(sid, t) for sid in ids}
+            counts = {st: sum(1 for v in states.values() if v == st)
+                      for st in ("pending", "in_progress", "migrated", "rolled_back", "incompatible")}
+            if bad_counts and phase == "rolled_back":
+                counts["rolled_back"] = 0          # the pre-Day-12 counter bug
             snapshot = {
                 "run_id": srv, "crypto_mode": S["mode"],
                 "stations": [
                     {"station_id": sid, "connection_state": "connected", "boot_accepted": True,
-                     "migration_state": state_at(sid, t)}
+                     "migration_state": states[sid]}
                     for sid in ids
                 ],
-                "migration": {"phase": phase, "target_mode": "pqc", "waves": waves},
+                "migration": {"phase": phase, "target_mode": "pqc", "waves": waves,
+                              "total_stations": len(ids), **counts},
             }
             self.harness(name, t, "fleet_snapshot", snapshot=snapshot, **H)
 
