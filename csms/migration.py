@@ -43,12 +43,19 @@ WHO OWNS WHAT (agreed Day 9)
            under Contract 6); the post-quantum challenge check itself.
   Track C  the station's answer to InstallPQAuth / PQAuthChallenge.
 
-WHAT "MIGRATED" MEANS UNTIL TRACK B'S CHALLENGE CHECK LANDS
+WHAT "MIGRATED" MEANS (since Track B's Day 12, PR #19)
 
-The orchestrator marks a station MIGRATED when the station ACCEPTS its
-InstallPQAuth. Nothing yet asks the station to prove it holds the key
-(a PQAuthChallenge answered and verified). Until Track B adds that check,
-results must say "key installed", not "authenticated".
+After a station ACCEPTS its InstallPQAuth, the orchestrator sends it a
+PQAuthChallenge (a fresh nonce) and marks it MIGRATED only if the ML-DSA
+signature it returns verifies against the public key just enrolled.
+"Migrated" therefore means AUTHENTICATED, not "accepted a message". Each
+check is logged as connection_attempt / transition="pq_auth", with the
+station id in payload.station and the result in payload.result.
+
+A station that is not connected when its wave runs is skipped
+(skip_offline): it stays PENDING, is never sent a key, gets one
+station_deferred line, and does not count towards the wave's failure
+threshold.
 """
 
 from __future__ import annotations
@@ -152,13 +159,12 @@ class PersistentPQAuthenticator(PQAuthenticator):
 
     def unenrol(self, station_id: str) -> None:
         """
-        Remove a station's enrolment (a rolled-back wave, a failed install).
+        Remove a station's enrolment (a rolled-back wave, a failed install
+        or a failed challenge).
 
-        Track B's plan describes unenrol() but PQAuthenticator does not
-        define it yet; the orchestrator falls back to editing the private
-        dictionary itself. Defining it here makes that fallback unnecessary
-        and adds the database delete. If Track B later adds their own
-        unenrol(), theirs runs first.
+        Track B's own unenrol() runs first (it exists since Day 12: it drops
+        the key and any outstanding challenge); this adds the database
+        delete. The fallback branch only matters for an older crypto/pq_auth.py.
         """
         parent = getattr(super(), "unenrol", None)
         if callable(parent):
@@ -373,7 +379,11 @@ def build_migration(
 
     try:
         from crypto.pq import PQProvider
-        from agent.pqc_messages import build_install_message
+        from agent.pqc_messages import (
+            build_challenge_message,
+            build_install_message,
+            parse_signature,
+        )
         from idmanager.fleet_adapter import FleetAdapter
         from idmanager.orchestrator import MigrationOrchestrator
 
@@ -411,6 +421,15 @@ def build_migration(
         failure_threshold=failure_threshold,
         dispatch_timeout_s=dispatcher.timeout_s,
         target_algorithm=algorithm,
+        # Day 12 (Track B, PR #19): proof of possession. After InstallPQAuth
+        # is accepted, send PQAuthChallenge; MIGRATED only if it verifies.
+        # The orchestrator calls the parser only for an answered challenge
+        # and treats any exception from it as a failed station.
+        challenge_message_factory=build_challenge_message,
+        signature_parser=lambda response: parse_signature(response.data),
+        # Day 12: a station not connected when its wave runs stays PENDING
+        # and is not a failure, instead of rolling back the whole wave.
+        skip_offline=True,
     )
 
     # Consistency check: a station the database calls MIGRATED but for
@@ -430,7 +449,10 @@ def build_migration(
             len(orphans), ", ".join(orphans[:5]),
         )
 
-    reason = f"orchestrator active ({algorithm}, {restored} key(s) restored)"
+    reason = (
+        f"orchestrator active ({algorithm}, {restored} key(s) restored, "
+        f"challenge after install, offline stations deferred)"
+    )
     LOGGER.info("migration: %s", reason)
     return MigrationSetup(
         controller=controller,

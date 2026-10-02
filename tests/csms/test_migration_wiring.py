@@ -12,10 +12,13 @@ from __future__ import annotations
 import asyncio
 import sys
 import types
+from pathlib import Path
 
 import pytest
+from ocpp.v201 import call_result
 
 from crypto.identity import MigrationState
+from csms.dispatch import CommandDispatcher, DispatchResult, _action_name, _status_of
 from csms.migration import (
     DisabledController,
     PersistentPQAuthenticator,
@@ -170,24 +173,72 @@ def test_migration_off_never_loads_post_quantum_code():
 # -- the real orchestrator, real ML-DSA, through our wiring ---------------
 
 
-class _Result:
-    def __init__(self, ok):
-        self.ok = ok
-
-
 class _FakeDispatcher:
-    """Answers like a station: Accepted if it can do PQC, else refuses."""
+    """
+    Answers the way Track C's agent answers, without a network.
+
+      InstallPQAuth    keeps the private key it was sent; Accepted
+                       (Rejected for a station listed in `refuse`)
+      PQAuthChallenge  signs the nonce with that key using Track B's real
+                       sign_challenge, and returns the signature in
+                       DataTransfer.data packed by Track C's real
+                       pack_signature
+
+    Returns Track A's real DispatchResult, built with the real dispatcher's
+    own status and outcome rules, so the orchestrator reads exactly the
+    object it gets in a live run.
+    """
 
     timeout_s = 1.0
 
     def __init__(self, refuse=()):
+        from crypto.pq import PQProvider
+
         self.refuse = set(refuse)
-        self.sent = []
+        self.sent = []      # (station_id, message_id), in send order
+        self.keys = {}      # station_id -> the private key it was given
+        self._provider = PQProvider()
 
     async def send(self, station_id, request, *, timeout_s=None):
+        from agent.pqc_messages import (
+            MSG_CHALLENGE,
+            MSG_INSTALL,
+            STATUS_ACCEPTED,
+            STATUS_REJECTED,
+            STATUS_UNKNOWN_MESSAGE,
+            pack_signature,
+            parse_challenge_data,
+            parse_install_data,
+        )
+        from crypto.pq_auth import sign_challenge
+
         self.sent.append((station_id, request.message_id))
         await asyncio.sleep(0)
-        return _Result(ok=station_id not in self.refuse)
+
+        if station_id in self.refuse:
+            response = call_result.DataTransfer(status=STATUS_REJECTED)
+        elif request.message_id == MSG_INSTALL:
+            _algorithm, self.keys[station_id] = parse_install_data(request.data)
+            response = call_result.DataTransfer(status=STATUS_ACCEPTED)
+        elif request.message_id == MSG_CHALLENGE:
+            nonce, _payload = parse_challenge_data(request.data)
+            signature = sign_challenge(self._provider, self.keys[station_id], nonce)
+            response = call_result.DataTransfer(
+                status=STATUS_ACCEPTED, data=pack_signature(signature)
+            )
+        else:
+            response = call_result.DataTransfer(status=STATUS_UNKNOWN_MESSAGE)
+
+        action = _action_name(request)
+        status = _status_of(response)
+        return DispatchResult(
+            station_id=station_id,
+            action=action,
+            outcome=CommandDispatcher._outcome_for(action, status),
+            status=status,
+            response=response,
+            duration_ms=1.0,
+        )
 
 
 def _real_mldsa_unavailable() -> str | None:
@@ -227,6 +278,38 @@ def test_missing_binaries_disable_migration_instead_of_crashing_later(monkeypatc
     assert "binaries" in setup.reason and "qclib compile" in setup.reason
 
 
+def _connect(registry, *station_ids):
+    """Open a session for each station, as a real connection does. Since
+    Day 12 the orchestrator skips stations that are not connected
+    (skip_offline=True), so a test station must be online."""
+    for station_id in station_ids:
+        registry.register(station_id, object())
+
+
+async def _run_migration(setup, *, wave_size=1, canary_count=1):
+    setup.controller.start_migration(
+        wave_size=wave_size, canary_count=canary_count, target_mode="pqc"
+    )
+    for _ in range(300):
+        if setup.controller.get_migration_status().is_terminal:
+            return
+        await asyncio.sleep(0.01)
+
+
+def _pq_auth_lines(log):
+    return [
+        payload for (event_type, _sid, payload) in log.events
+        if event_type == "connection_attempt" and payload.get("transition") == "pq_auth"
+    ]
+
+
+def _counts_add_up(status):
+    return (
+        status.pending + status.in_progress + status.migrated
+        + status.rolled_back + status.incompatible
+    ) == status.total_stations
+
+
 def test_real_orchestrator_through_the_wiring(tmp_path):
     why = _real_mldsa_unavailable()
     if why:
@@ -240,6 +323,7 @@ def test_real_orchestrator_through_the_wiring(tmp_path):
             "CP0002": ["ECDSA-P256", "ML-DSA-44"],
             "CP0003": ["ECDSA-P256"],                # legacy: skipped, not failed
         })
+        _connect(registry, "CP0001", "CP0002", "CP0003")
         log = _FakeLog()
         dispatcher = _FakeDispatcher()
         setup = build_migration(
@@ -248,30 +332,87 @@ def test_real_orchestrator_through_the_wiring(tmp_path):
         )
         assert setup.enabled, setup.reason
         registry.attach_migration_controller(setup.controller)
-
-        setup.controller.start_migration(wave_size=1, canary_count=1, target_mode="pqc")
-        for _ in range(200):
-            if setup.controller.get_migration_status().is_terminal:
-                break
-            await asyncio.sleep(0.01)
+        await _run_migration(setup)
         return registry, setup, log, dispatcher, store
 
     registry, setup, log, dispatcher, store = asyncio.run(scenario())
 
     status = setup.controller.get_migration_status()
     assert status.phase.value == "completed"
+    assert (status.migrated, status.incompatible, status.rolled_back) == (2, 1, 0)
+    assert _counts_add_up(status)
     states = {sid: registry.get_identity(sid).migration_state for sid in ("CP0001", "CP0002", "CP0003")}
     assert states == {
         "CP0001": MigrationState.MIGRATED,
         "CP0002": MigrationState.MIGRATED,
         "CP0003": MigrationState.INCOMPATIBLE,
     }
-    # the install message is Track C's DataTransfer, and the legacy station got none
-    assert {sid for sid, _ in dispatcher.sent} == {"CP0001", "CP0002"}
-    assert {msg for _, msg in dispatcher.sent} == {"InstallPQAuth"}
-    # exactly ONE migration_started -- the server no longer adds its own
+    # each capable station: key installed, THEN challenged; the legacy one got nothing
+    for sid in ("CP0001", "CP0002"):
+        assert [m for s, m in dispatcher.sent if s == sid] == ["InstallPQAuth", "PQAuthChallenge"]
+    assert "CP0003" not in {s for s, _ in dispatcher.sent}
+    # "migrated" now means AUTHENTICATED: one verified challenge per station,
+    # id in payload.station, result in payload.result, round-trip time kept (S2)
+    checks = _pq_auth_lines(log)
+    assert sorted(p["station"] for p in checks) == ["CP0001", "CP0002"]
+    assert {p["result"] for p in checks} == {"success"}
+    assert all(p.get("duration_ms") is not None for p in checks)
+    assert all(p["source"] == "orchestrator" for p in checks)
+    # exactly ONE migration_started -- the server does not add its own
     assert [e[0] for e in log.events].count("migration_started") == 1
+    # the server's startup line says the challenge is on
+    assert "challenge after install" in setup.reason
     # keys reached the database
     store.flush()
     assert set(store.load_enrolments()) == {"CP0001", "CP0002"}
     store.close()
+
+
+def test_station_offline_at_start_is_deferred_not_failed(tmp_path):
+    """skip_offline=True, through our wiring (session drill D2): a capable
+    charger that is not connected stays PENDING, is never sent a key, gets
+    one station_deferred line, and does not count as a failure."""
+    why = _real_mldsa_unavailable()
+    if why:
+        pytest.skip(f"real ML-DSA unavailable on this machine ({why})")
+
+    async def scenario():
+        store = SqliteStore(tmp_path / "offline.db")
+        registry = SessionRegistry(store=store)
+        apply_fleet_profile(registry, {
+            "CP0001": ["ECDSA-P256", "ML-DSA-44"],
+            "CP0002": ["ECDSA-P256", "ML-DSA-44"],
+        })
+        _connect(registry, "CP0001")                 # CP0002 never connects
+        log = _FakeLog()
+        dispatcher = _FakeDispatcher()
+        setup = build_migration(
+            mode="auto", registry=registry, dispatcher=dispatcher,
+            event_log=log, store=store,
+        )
+        assert setup.enabled, setup.reason
+        registry.attach_migration_controller(setup.controller)
+        await _run_migration(setup)
+        return registry, setup, log, dispatcher, store
+
+    registry, setup, log, dispatcher, store = asyncio.run(scenario())
+
+    status = setup.controller.get_migration_status()
+    assert registry.get_identity("CP0001").migration_state == MigrationState.MIGRATED
+    assert registry.get_identity("CP0002").migration_state == MigrationState.PENDING
+    assert "CP0002" not in {s for s, _ in dispatcher.sent}
+    deferred = [p for (t, _sid, p) in log.events if t == "station_deferred"]
+    assert [p["station"] for p in deferred] == ["CP0002"]
+    assert status.rolled_back == 0
+    assert _counts_add_up(status)
+    store.close()
+
+
+def test_stage6_profile_matches_the_session_plan():
+    """The approved Stage 6 file: 50 stations, 45 declare ML-DSA-44 (40
+    agents + 5 refusing fake stations), CP0041-CP0045 are legacy."""
+    path = Path(__file__).resolve().parents[1] / "fixtures" / "fleet_profile_stage6_n50.json"
+    profile = load_fleet_profile(path)
+    assert sorted(profile) == [f"CP{n:04d}" for n in range(1, 51)]
+    legacy = sorted(s for s, algs in profile.items() if "ML-DSA-44" not in algs)
+    assert legacy == [f"CP{n:04d}" for n in range(41, 46)]
