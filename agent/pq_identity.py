@@ -96,6 +96,11 @@ class PQIdentity:
         self._private_key: bytes | None = None
         self._algorithm: str | None = None
 
+        self.installs = 0
+        """How many keys this station has been given (1 = migrated once;
+        more = rotated). Phase C6.1: reported in the tester diary so the
+        analysis can compare the station's own view with the server's."""
+
         self.challenges_signed = 0
         """For the end-of-run summary and the latency measurement Track B
         asked for (their §8.6-b): how many challenges this station
@@ -139,6 +144,7 @@ class PQIdentity:
         rotating = self._private_key is not None
         self._private_key = bytes(private_key)
         self._algorithm = algorithm
+        self.installs += 1
 
         self.log.info(
             "%s ML-DSA key installed (%s, %d bytes) -- station is now migrated",

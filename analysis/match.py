@@ -47,6 +47,16 @@ class MatchedRun:
     server_events: list[dict[str, Any]] = field(default_factory=list)
     """Server-wide lines (no charger id) inside the window, in time order."""
 
+    migration_events: list[dict[str, Any]] = field(default_factory=list)
+    """
+    PHASE C6.1. Every migration line inside the window, for the WHOLE
+    fleet -- not only this run's chargers. A migration is fleet-wide: in
+    Stage 6 the five chargers that fail are Track A's test chargers, which
+    the tester did not start. Contains the orchestrator's lines (source
+    "orchestrator": migration/wave events, pq_auth checks, deferrals,
+    migration_failed) and the server's own manual-rollback line.
+    """
+
     window: tuple[float, float] | None = None
 
     @property
@@ -71,6 +81,14 @@ class MatchedRun:
             out = [e for e in out if e.get("station_id") == station_id]
         return out
 
+    def migration(self, *event_types: str, transition: str | None = None) -> list[dict[str, Any]]:
+        """Fleet-wide migration lines of the given types (all if none given)."""
+        wanted = set(event_types)
+        out = [e for e in self.migration_events if not wanted or e.get("event_type") in wanted]
+        if transition is not None:
+            out = [e for e in out if (e.get("payload") or {}).get("transition") == transition]
+        return out
+
     def transitions(self, name: str) -> list[dict[str, Any]]:
         """Server lines whose payload.transition equals `name` (e.g. "booted")."""
         return [
@@ -83,8 +101,23 @@ class MatchedRun:
 SERVER_WIDE = frozenset({
     "server_started", "server_stopping",
     "migration_started", "wave_started", "wave_completed",
-    "wave_rolled_back", "migration_completed",
+    "wave_rolled_back", "migration_completed", "migration_failed",
 })
+
+# PHASE C6.1: lines that belong to a migration, whoever the charger is.
+MIGRATION_TYPES = frozenset({
+    "migration_started", "wave_started", "wave_completed", "wave_rolled_back",
+    "migration_completed", "migration_failed", "station_deferred",
+})
+
+
+def is_migration_line(ev: dict[str, Any]) -> bool:
+    p = ev.get("payload") or {}
+    return (
+        ev.get("event_type") in MIGRATION_TYPES
+        or p.get("source") == "orchestrator"
+        or (ev.get("event_type") == "connection_attempt" and p.get("transition") == "pq_auth")
+    )
 
 
 def match_run(run: HarnessRun, diary: ServerDiary) -> MatchedRun:
@@ -102,6 +135,8 @@ def match_run(run: HarnessRun, diary: ServerDiary) -> MatchedRun:
         t = ev.get("_t")
         if t is None or t < lo or t > hi:
             continue
+        if is_migration_line(ev):
+            matched.migration_events.append(ev)
         sid = ev.get("station_id")
         if sid is None:
             matched.server_events.append(ev)
@@ -110,4 +145,5 @@ def match_run(run: HarnessRun, diary: ServerDiary) -> MatchedRun:
 
     matched.station_events.sort(key=lambda e: e["_t"])
     matched.server_events.sort(key=lambda e: e["_t"])
+    matched.migration_events.sort(key=lambda e: e["_t"])
     return matched

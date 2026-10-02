@@ -518,16 +518,67 @@
       return;
     }
     var s = list.filter(function (x) { return x.key === selectedSlot; })[0] || list[0];
-    var e = s.e3, c = e.charging;
-    html += '<p class="sub">Showing: ' + esc(slotLabel(s)) + (list.length > 1 ? " (pick another run under Runs)" : "") + "</p>" +
+    var e = s.e3, c = e.charging, q = e.pq_checks || { total: 0, passed: 0, rejected: 0 };
+    var d = e.deferred || { count: 0, station_ids: [] };
+    var verifiedStatus = { "authenticated": "pass", "key installed (not authenticated)": "warn",
+      "partly authenticated": "warn", "nothing migrated": "info" }[e.verification] || "info";
+    html += '<p class="sub">Showing: ' + esc(slotLabel(s)) + (list.length > 1 ? " (pick another run under Runs)" : "") +
+      " · whole fleet: " + int(e.fleet_size) + " chargers, " + int(e.tester_chargers) + " started by the tester</p>" +
+      '<div class="banner">' + badge(verifiedStatus).replace(/Trusted|Caveats|Note|Not usable/, esc(
+        e.verification === "authenticated" ? "Authenticated" :
+        e.verification === "key installed (not authenticated)" ? "Key installed only" :
+        e.verification === "partly authenticated" ? "Partly authenticated" : "Nothing migrated")) +
+      " " + esc(e.verification === "authenticated"
+        ? "Every upgraded charger proved it holds its new key (signed a fresh challenge that the server verified)."
+        : e.verification === "key installed (not authenticated)"
+          ? "Chargers received keys, but the server never checked them. Report as 'key installed', not 'authenticated'."
+          : e.verification === "partly authenticated"
+            ? "Some upgraded chargers have no passed key check."
+            : "No charger was upgraded in this run.") + "</div>" +
       '<div class="tiles">' +
       tile("Upgraded", int(e.final_counts.migrated), "chargers on the new security") +
-      tile("Rolled back", int(e.final_counts.rolled_back), int(e.rollbacks) + " wave rollback(s)") +
+      tile("Key checks passed", int(q.passed) + " / " + int(q.total), int(q.rejected) + " rejected") +
+      tile("Rolled back", int(e.final_counts.rolled_back), int(e.rollbacks) + " wave rollback(s)" +
+        (e.manual_rollbacks ? ", " + int(e.manual_rollbacks) + " manual" : "")) +
       tile("Incompatible", int(e.final_counts.incompatible), "skipped, left on classical") +
+      tile("Skipped (offline)", int(d.count), "not attempted, not failed") +
       tile("Duration", sec(e.duration_s), "migration start to finish") +
-      tile("Sessions disturbed", int(c.sessions_disturbed) + " / " + int(c.sessions_running_at_start), "running when migration began") +
+      tile("Sessions disturbed", int(c.sessions_disturbed) + " / " + int(c.sessions_running_at_start), "tester's chargers charging when it began") +
       "</div>" +
-      '<div class="card"><h3>Chargers by migration state</h3><p class="sub">Stacked: every charger is in exactly one state; vertical lines mark waves</p><div class="chart tall" id="cE3"></div></div>';
+      '<div class="card"><h3>Chargers by migration state (whole fleet)</h3><p class="sub">Stacked: every charger is in exactly one state; vertical lines mark waves</p><div class="chart tall" id="cE3"></div></div>';
+    var rt = q.round_trip_ms || { n: 0 };
+    if (rt.n) {
+      html += '<div class="grid two" style="margin-top:16px">' +
+        '<div class="card"><h3>Key check round-trip time</h3><p class="sub">Server sends a challenge, charger signs it, server verifies (' +
+        esc(q.algorithm || "ML-DSA") + '). Share of checks finished within a time.</p><div class="chart" id="cE3rt"></div></div>' +
+        '<div class="card"><h3>Key check numbers</h3>' + table(
+          [{ t: "Checks" }, { t: "n", num: true }, { t: "Median", num: true }, { t: "95% CI", num: true },
+           { t: "p95", num: true }, { t: "Max", num: true }],
+          [["All", rt], ["First per charger", q.first_per_charger_ms || { n: 0 }], ["Later (re-checks)", q.later_ms || { n: 0 }]]
+            .filter(function (r) { return r[1].n; })
+            .map(function (r) {
+              var x = r[1], ci = x.median_ci95;
+              return [esc(r[0]), int(x.n), ms(x.median), ci ? ms(ci[0]) + " – " + ms(ci[1]) : "—", ms(x.p95), ms(x.max)];
+            })) +
+        '<p class="note">A charger\'s first check may include one-time start-up of its post-quantum library.</p></div></div>';
+    }
+    if (q.rejections && q.rejections.length) {
+      html += '<div class="card" style="margin-top:16px"><h3>Rejected key checks</h3>' + table(
+        [{ t: "Charger" }, { t: "Wave", num: true }, { t: "At", num: true }, { t: "Reason" }],
+        q.rejections.map(function (r) { return [esc(r.station_id), esc(r.wave_id), sec(r.at_s), esc(r.detail)]; })) + "</div>";
+    }
+    if (d.count) {
+      html += '<p class="note">Skipped because offline: ' + esc(d.station_ids.join(", ")) + "</p>";
+    }
+    var noKey = (e.agent_view || {}).migrated_but_no_key || [];
+    if (noKey.length) {
+      html += '<div class="banner">' + badge("warn") + " Server says upgraded, but the charger itself reports no key: " +
+        esc(noKey.join(", ")) + "</div>";
+    }
+    if (e.failures && e.failures.length) {
+      html += '<div class="banner">' + badge("fail") + " The migration controller crashed: " +
+        esc(e.failures.map(function (f) { return f.error || "no error text"; }).join("; ")) + "</div>";
+    }
     if (e.waves && e.waves.length) {
       html += '<div class="card" style="margin-top:16px"><h3>Waves</h3>' + table(
         [{ t: "Wave" }, { t: "Chargers", num: true }, { t: "Upgraded", num: true }, { t: "Failed", num: true },
@@ -582,17 +633,25 @@
         // Wave markers as their own thin series (not markLine, which ECharts
         // always paints beneath filled areas). Gaps ("-") separate the lines.
         var top = cumulative.length ? Math.max.apply(null, cumulative) : 0;
-        var at = {};
-        e.markers.forEach(function (m) {
+        // Markers closer together than 2% of the time axis share one line and
+        // one label (a fast migration puts canary and every wave within a
+        // fraction of a second, and separate labels would print on top of
+        // each other).
+        var span = xs.length > 1 ? xs[xs.length - 1] - xs[0] : 1;
+        var groups = [];
+        e.markers.slice().sort(function (a, b) { return a.at_s - b.at_s; }).forEach(function (m) {
           if (m.event === "wave_completed") return;
           var label = { migration_started: "start", wave_started: m.wave_id === 0 ? "canary" : "wave " + m.wave_id,
-            wave_rolled_back: "rollback " + m.wave_id, migration_completed: "end" }[m.event] || m.event;
-          at[m.at_s] = at[m.at_s] ? at[m.at_s] + " · " + label : label;
+            wave_rolled_back: (m.trigger === "manual" ? "manual rollback " : "rollback ") + m.wave_id,
+            migration_completed: "end", migration_failed: "FAILED" }[m.event] || m.event;
+          var g = groups[groups.length - 1];
+          if (g && m.at_s - g.x <= span * 0.02) { g.labels.push(label); } else { groups.push({ x: m.at_s, labels: [label] }); }
         });
         var pts = [];
-        Object.keys(at).map(Number).sort(function (a, b) { return a - b; }).forEach(function (x) {
-          pts.push([x, 0]);
-          pts.push({ value: [x, top], label: { show: true, formatter: at[x], position: "top", color: p.ink, fontSize: 10 } });
+        groups.forEach(function (g) {
+          var text = g.labels.length > 3 ? g.labels[0] + " … " + g.labels[g.labels.length - 1] : g.labels.join(" · ");
+          pts.push([g.x, 0]);
+          pts.push({ value: [g.x, top], label: { show: true, formatter: text, position: "top", color: p.ink, fontSize: 10 } });
           pts.push("-");
         });
         o.series.push({
@@ -604,6 +663,19 @@
       }
       return o;
     });
+    var rtq = (e.pq_checks || {}).round_trip_ms || { n: 0 };
+    if (rtq.n) {
+      mount(document.getElementById("cE3rt"), function (p) {
+        var o = base(p, "e3_key_check_round_trip");
+        o.legend.show = false;
+        o.tooltip.trigger = "axis";
+        o.tooltip.valueFormatter = function (v) { return fmt(v, 1) + "%"; };
+        o.xAxis = valueAxis(p, "Round-trip time (ms)", { splitLine: { show: false } });
+        o.yAxis = valueAxis(p, "Checks finished (%)", { max: 100 });
+        o.series = [line("Key checks", modeColor(p, "pqc"), rtq.ecdf, { step: "end" })];
+        return o;
+      });
+    }
   }
 
   // ---------------------------------------------------------------- E4
@@ -677,6 +749,9 @@
       '<div class="tiles">' +
       tile("Identity checks", int(e.identity_checks), e.identity_checks ? "certificate name vs charger id" : "only made when TLS is on") +
       tile("Rejected", int(e.identity_rejected), "wrong certificate for the id") +
+      tile("Mismatches let in", int(e.identity_mismatches),
+        e.identity_mode === "warn" ? "server in 'warn' mode: logged, not refused" : "certificate name did not match") +
+      tile("Key checks", int(e.pq_passed) + " / " + int(e.pq_checks), int(e.pq_rejected) + " rejected (post-quantum)") +
       tile("Connection failures", int(failures.reduce(function (a, k) { return a + e.connection_failures[k]; }, 0)), failures.join(", ") || "none") +
       tile("Protocol errors", int(e.callerrors), "CALLErrors reported by chargers") +
       tile("Commands received", int(e.commands_received), "e.g. power limits, remote stop") +
@@ -686,6 +761,11 @@
       html += '<div class="card" style="margin-top:16px"><h3>Rejected identities</h3>' + table(
         [{ t: "Charger id" }, { t: "Certificate name" }, { t: "At", num: true }],
         e.identity_rejections.map(function (r) { return [esc(r.station_id), esc(r.certificate_name), sec(r.at_s)]; })) + "</div>";
+    }
+    if (e.pq_rejections && e.pq_rejections.length) {
+      html += '<div class="card" style="margin-top:16px"><h3>Rejected post-quantum key checks</h3>' + table(
+        [{ t: "Charger id" }, { t: "At", num: true }, { t: "Reason" }],
+        e.pq_rejections.map(function (r) { return [esc(r.station_id), sec(r.at_s), esc(r.detail)]; })) + "</div>";
     }
     root.insertAdjacentHTML("beforeend", html + "</section>");
 
@@ -724,13 +804,16 @@
     var yes = function (b) { return b ? badge("pass").replace("Trusted", "Yes") : badge("fail").replace("Not usable", "No"); };
     html += '<div class="card">' + table(
       [{ t: "Charger id" }, { t: "Kind" }, { t: "Connected" }, { t: "Accepted" }, { t: "Completed a session" },
-       { t: "Sessions", num: true }, { t: "Energy", num: true }, { t: "Mode" }, { t: "TLS" }, { t: "Last seen (UTC)" }],
+       { t: "Sessions", num: true }, { t: "Energy (charger-reported)", num: true }, { t: "Key check" },
+       { t: "Mode" }, { t: "TLS" }, { t: "Last seen (UTC)" }],
       nodes.map(function (n) {
+        var pq = n.pq_auth ? (n.pq_auth === "success" ? badge("pass").replace("Trusted", "Passed")
+          : badge("fail").replace("Not usable", "Rejected")) : (n.deferred ? "skipped (offline)" : "—");
         return [esc(n.station_id), n.kind === "hardware" ? "<strong>Raspberry Pi</strong>" : "External client",
           yes(n.connected), yes(n.accepted), yes(n.completed_session), int(n.sessions_completed),
-          fmt(n.energy_wh, 2) + " Wh", modeCell(n.crypto_mode), esc(n.tls_version || "off"),
+          fmt(n.energy_wh, 2) + " Wh", pq, modeCell(n.crypto_mode), esc(n.tls_version || "off"),
           esc((n.last_seen || "").replace("T", " ").slice(0, 19))];
-      })) + "</div>";
+      })) + '<p class="note">Energy here is what each charger reported about itself. A simulator\'s figures are not physical, and these are never added to any fleet total.</p></div>';
     root.insertAdjacentHTML("beforeend", html + "</section>");
   }
 

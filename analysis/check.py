@@ -55,7 +55,8 @@ def check_diary(diary: ServerDiary) -> dict[str, Any]:
     if not diary.found:
         issues.append(_issue(
             "fail", "server_diary_missing",
-            f"Server diary not found at {diary.path}. Every run will be unmatched. "
+            f"No server diary found (looked for: {diary.path or 'nothing given'}). "
+            "Every run will be unmatched. "
             "If the CSMS ran on another machine, copy its logs/events.jsonl here.",
         ))
         return {"status": _status(issues), "issues": issues}
@@ -72,6 +73,12 @@ def check_diary(diary: ServerDiary) -> dict[str, Any]:
             "warn", "unreadable_lines",
             f"{bad} of {diary.lines_total} server diary lines could not be read and were skipped.",
         ))
+    if diary.duplicates_dropped:
+        issues.append(_issue(
+            "info", "duplicate_lines",
+            f"{diary.duplicates_dropped} line(s) appeared in more than one server diary "
+            "and were counted once.",
+        ))
     if diary.unknown_fields:
         names = ", ".join(sorted(diary.unknown_fields))
         issues.append(_issue(
@@ -82,8 +89,9 @@ def check_diary(diary: ServerDiary) -> dict[str, Any]:
     return {"status": _status(issues), "issues": issues}
 
 
-def check_run(run: MatchedRun, overview: dict[str, Any], e1: dict[str, Any]) -> dict[str, Any]:
-    """Checks on one matched run."""
+def check_run(run: MatchedRun, overview: dict[str, Any], e1: dict[str, Any],
+              e3: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Checks on one matched run. `e3` adds the migration checks (C6.1)."""
     h: HarnessRun = run.harness
     issues: list[dict[str, str]] = []
     st = overview["stations"]
@@ -146,6 +154,9 @@ def check_run(run: MatchedRun, overview: dict[str, Any], e1: dict[str, Any]) -> 
             "(connect_ms). E1's headline number is unavailable for it; re-run to include it.",
         ))
 
+    if e3 is not None:
+        issues.extend(_migration_issues(e3))
+
     if overview["meter"]["unrecognised_meter_values"]:
         issues.append(_issue(
             "warn", "unrecognised_meter_values",
@@ -154,3 +165,69 @@ def check_run(run: MatchedRun, overview: dict[str, Any], e1: dict[str, Any]) -> 
         ))
 
     return {"status": _status(issues), "issues": issues}
+
+
+def _migration_issues(e3: dict[str, Any]) -> list[dict[str, str]]:
+    """
+    PHASE C6.1 — checks on a run that contains a migration.
+
+    These protect the claims the integration session makes: that chargers
+    were AUTHENTICATED (not just handed a key), that the controller's
+    numbers are consistent, and that every charger agrees with the server.
+    """
+    issues: list[dict[str, str]] = []
+
+    for f in e3.get("failures") or []:
+        issues.append(_issue(
+            "fail", "migration_failed",
+            f"The migration controller crashed at {f.get('at_s')} s "
+            f"({f.get('error') or 'no error text'}). The migration did not finish; "
+            "its numbers are not a result.",
+        ))
+
+    if e3.get("controller_sum_violations"):
+        issues.append(_issue(
+            "fail", "migration_counts_do_not_add_up",
+            f"In {e3['controller_sum_violations']} fleet snapshot(s) the controller's "
+            "pending + upgrading + upgraded + rolled back + incompatible did not equal "
+            "its total. That is a counting bug (Track B); E3's totals cannot be trusted.",
+        ))
+
+    verification = e3.get("verification")
+    if verification == "key installed (not authenticated)":
+        issues.append(_issue(
+            "warn", "key_installed_not_authenticated",
+            "Chargers were migrated but no post-quantum key check (pq_auth) was run: "
+            "the server was not wired to challenge them. Report these as "
+            "'key installed', NOT 'authenticated'.",
+        ))
+    elif verification == "partly authenticated":
+        issues.append(_issue(
+            "warn", "partly_authenticated",
+            "Some chargers counted as migrated have no passed key check. "
+            "Report only the checked ones as authenticated.",
+        ))
+
+    no_key = (e3.get("agent_view") or {}).get("migrated_but_no_key") or []
+    if no_key:
+        issues.append(_issue(
+            "warn", "migrated_but_charger_has_no_key",
+            f"{len(no_key)} charger(s) the server calls migrated report holding no key "
+            f"themselves (e.g. {', '.join(no_key[:3])}). The two sides disagree.",
+        ))
+
+    if not e3.get("snapshots_available"):
+        issues.append(_issue(
+            "warn", "no_fleet_snapshots",
+            "This migration run was recorded without --watch-fleet, so there is no "
+            "second-by-second state timeline and no per-charger final state.",
+        ))
+
+    if (e3.get("deferred") or {}).get("count"):
+        issues.append(_issue(
+            "info", "chargers_deferred",
+            f"{e3['deferred']['count']} charger(s) were offline when their wave ran and "
+            "were skipped (not attempted, not failed).",
+        ))
+    return issues
+

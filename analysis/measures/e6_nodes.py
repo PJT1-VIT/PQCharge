@@ -41,6 +41,7 @@ def measure(diary: ServerDiary, harness_station_ids: Iterable[str]) -> list[dict
         "connections": 0, "boots": 0, "sessions_started": 0, "sessions_completed": 0,
         "energy_wh": 0.0, "first_seen": None, "last_seen": None,
         "tls_versions": Counter(), "crypto_modes": Counter(), "identity_rejected": 0,
+        "pq_auth": None, "deferred": 0,
     })
 
     for ev in diary.events:
@@ -66,8 +67,15 @@ def measure(diary: ServerDiary, harness_station_ids: Iterable[str]) -> list[dict
         elif et == "transaction_ended":
             rec["sessions_completed"] += 1
             rec["energy_wh"] += float(p.get("energy_wh") or 0.0)
-        elif et == "connection_attempt" and ev.get("outcome") == "rejected":
+        elif (et == "connection_attempt" and p.get("transition") == "identity_check"
+              and ev.get("outcome") == "rejected"):
             rec["identity_rejected"] += 1
+        elif et == "connection_attempt" and p.get("transition") == "pq_auth":
+            # C6.1: the latest post-quantum key check for this charger
+            # (result normalised into `outcome` by collect.py).
+            rec["pq_auth"] = ev.get("outcome")
+        elif et == "station_deferred":
+            rec["deferred"] += 1
 
     out = []
     for sid in sorted(per):
@@ -81,7 +89,13 @@ def measure(diary: ServerDiary, harness_station_ids: Iterable[str]) -> list[dict
             "connections": rec["connections"],
             "sessions_completed": rec["sessions_completed"],
             "energy_wh": round(rec["energy_wh"], 3),
+            # Track A F10: energy from a charger we did not start is what IT
+            # reported (a simulator's numbers are not physical). Labelled, and
+            # never added to any fleet energy total.
+            "energy_source": "charger-reported",
             "identity_rejected": rec["identity_rejected"],
+            "pq_auth": rec["pq_auth"],
+            "deferred": rec["deferred"],
             "tls_version": rec["tls_versions"].most_common(1)[0][0] if rec["tls_versions"] else None,
             "crypto_mode": rec["crypto_modes"].most_common(1)[0][0] if rec["crypto_modes"] else None,
             "first_seen": rec["first_seen"],

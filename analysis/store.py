@@ -44,7 +44,7 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 WEB_DIR = Path(__file__).resolve().parent / "web"
 WEB_FILES = ("report.html", "charts.js", "vendor/echarts.min.js", "vendor/ECHARTS_LICENSE.txt")
 

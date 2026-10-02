@@ -116,7 +116,11 @@ def test_e3_follows_the_canary_the_waves_and_the_rollback(tmp_path):
     assert e3["final_counts"]["migrated"] == 4
     assert e3["final_counts"]["rolled_back"] == 4
     assert e3["rollbacks"] == 1
-    assert e3["duration_s"] == pytest.approx(3.5, abs=1e-3)
+    # The real orchestrator HALTS on a rollback (no migration_completed), so
+    # the migration ends at the wave_rolled_back line, 3 s after it began.
+    assert e3["duration_s"] == pytest.approx(3.0, abs=1e-3)
+    assert e3["phase"] == "rolled_back"
+    assert e3["pq_checks"]["passed"] == 4 and e3["verification"] == "authenticated"
     assert [w["is_canary"] for w in e3["waves"]] == [True, False, False]
     assert e3["charging"]["sessions_running_at_start"] == 8
     assert e3["charging"]["sessions_disturbed"] == 0

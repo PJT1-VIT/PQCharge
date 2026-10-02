@@ -180,6 +180,17 @@ class StationOutcome:
     offline_replayed: int = 0
     offline_dropped: int = 0
 
+    pq_key_installed: bool = False
+    """PHASE C6.1. Whether this station ended the run holding a post-quantum
+    key -- the station's OWN view. analysis/measures/e3_migration.py
+    compares it with the server's: a station the server calls migrated
+    but which holds no key is flagged."""
+    pq_algorithm: str | None = None
+    pq_installs: int = 0
+    """Keys received (more than 1 = rotated)."""
+    pq_challenges_signed: int = 0
+    """Post-quantum key checks this station answered with a signature."""
+
     wall_s: float = 0.0
 
 
@@ -229,6 +240,9 @@ class FleetResult:
             "offline_replayed": self.total("offline_replayed"),
             "offline_dropped": self.total("offline_dropped"),
             "total_downtime_s": self.total("total_downtime_s"),
+            # PHASE C6.1: the stations' own post-quantum view, totalled.
+            "pq_keys_installed": sum(1 for o in self.outcomes if o.pq_key_installed),
+            "pq_challenges_signed": self.total("pq_challenges_signed"),
         }
 
     def describe(self) -> str:
@@ -253,6 +267,10 @@ class FleetResult:
             f"  offline queued       {self.total('offline_queued'):.0f}",
             f"  offline replayed     {self.total('offline_replayed'):.0f}",
             f"  offline DROPPED      {self.total('offline_dropped'):.0f}",
+            "",
+            f"  PQ keys held         {sum(1 for o in self.outcomes if o.pq_key_installed)}"
+            f"/{self.n_stations}",
+            f"  PQ checks signed     {self.total('pq_challenges_signed'):.0f}",
         ]
 
         # The three lines that decide whether this run's data is usable.
@@ -604,6 +622,10 @@ class FleetRunner:
                 outcome.offline_queued = station.offline_queue.queued_total
                 outcome.offline_replayed = station.offline_queue.replayed_total
                 outcome.offline_dropped = station.offline_queue.dropped_total
+                outcome.pq_key_installed = station.pq.is_migrated
+                outcome.pq_algorithm = station.pq.algorithm
+                outcome.pq_installs = station.pq.installs
+                outcome.pq_challenges_signed = station.pq.challenges_signed
 
             self.finished += 1
             self.log.emit(
@@ -912,9 +934,16 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--timing-log", default=None, help="override that path")
     run.add_argument("--progress-every", type=float, default=5.0)
     run.add_argument(
-    "--no-analyse", action="store_true",
-    help="do not update analysis/output/ when the run ends (Phase C6); "
-            "by default the results page is rebuilt automatically",
+        "--no-analyse", action="store_true",
+        help="do not update analysis/output/ when the run ends (Phase C6); "
+             "by default the results page is rebuilt automatically",
+    )
+    run.add_argument(
+        "--events-log", action="append", default=None, metavar="PATH",
+        help="the CSMS's event log for this run, e.g. logs/s1_events.jsonl "
+             "(repeatable). Used by the automatic analysis at the end of the "
+             "run, in addition to every *events*.jsonl server diary in the "
+             "log folder (Phase C6.1)",
     )
 
     storm = parser.add_argument_group("storm (E2)")
@@ -985,7 +1014,8 @@ def main() -> None:
 
         analyse_after_run(
             args.timing_log
-            or default_path(args.experiment, args.n, config.crypto_mode, config.log_dir)
+            or default_path(args.experiment, args.n, config.crypto_mode, config.log_dir),
+            events=args.events_log,
         )
     raise SystemExit(exit_code)
 
