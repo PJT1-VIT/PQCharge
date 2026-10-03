@@ -91,6 +91,13 @@ RUN_FINISHED = "run_finished"
 STATION_SPAWNED = "station_spawned"
 """An agent task was created. The harness's denominator."""
 
+STATION_CONNECTED = "station_connected"
+"""PHASE C6.2. One line per successful connection, written the moment it
+opens: connect_ms (TCP + TLS + WebSocket, station-side), connection (1 =
+first, 2+ = reconnections) and attempt. The same times also appear in
+station_finished's connect_ms list; this line exists so they survive a
+run that is stopped before the station reports (Ctrl-C)."""
+
 STATION_FINISHED = "station_finished"
 """An agent returned. Carries its own counters: attempts, reconnections,
 downtime, CALLErrors, offline queue outcome."""

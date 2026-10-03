@@ -16,7 +16,9 @@ Two timers exist, and they measure DIFFERENT things:
 
     station-side   (the headline)  measured by the charger itself, from
                    "dial" to "ready": TCP + TLS + WebSocket upgrade.
-                   Recorded by the agent since the C5 fix (connect_ms).
+                   Recorded by the agent since the C5 fix (connect_ms);
+                   since C6.2 also written the moment each connection
+                   opens (station_connected), so Ctrl-C does not lose it.
 
     server-side    (a cross-check) measured by the CSMS, which can only see
                    the last part -- the WebSocket upgrade. Track A records
@@ -45,12 +47,10 @@ def measure(run: MatchedRun) -> dict[str, Any]:
     reconnect: list[float] = []
     have_station_side = False
 
-    for row in run.harness.of_type("station_finished", "station_crashed"):
-        times = row.get("connect_ms")
-        if times is None:
-            continue
+    # C6.2: from station_connected lines and/or station_finished rows, so a
+    # run stopped with Ctrl-C still has its connection times.
+    for times in run.harness.connect_times().values():
         have_station_side = True
-        times = [float(t) for t in times if t is not None]
         if times:
             initial.append(times[0])
             reconnect.extend(times[1:])

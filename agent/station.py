@@ -71,7 +71,7 @@ import asyncio
 import contextlib
 import time
 import uuid
-from typing import Any
+from typing import Any, Callable
 
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed, InvalidStatus
@@ -377,6 +377,17 @@ class ChargingStation(StationCommands):
 
         self.connection_attempts = 0
         self.connect_times_ms: list[float] = []
+        self.on_connected: Callable[[float, int, int], None] | None = None
+        """
+        PHASE C6.2. Called the moment a connection opens, with
+        (connect_ms, connection number, attempt number).
+
+        The load generator sets it to write a `station_connected` line
+        straight away, so a connection time is on disk even when the
+        run is stopped early (Ctrl-C) and the station never writes its
+        final row. Off (None) for a single station. A failing hook is
+        logged and ignored: it must never cost the station its session.
+        """
         self.reconnections = 0
         self.total_downtime_s = 0.0
         """
@@ -1241,6 +1252,13 @@ class ChargingStation(StationCommands):
             elapsed_ms = (time.monotonic() - started) * 1000.0
             self.connect_times_ms.append(elapsed_ms)
             self.log.info("connected in %.1fms", elapsed_ms)
+            if self.on_connected is not None:
+                try:
+                    self.on_connected(
+                        elapsed_ms, len(self.connect_times_ms), self.connection_attempts
+                    )
+                except Exception:  # noqa: BLE001 - instrumentation only
+                    self.log.warning("on_connected hook failed", exc_info=True)
 
             client = StationClient(
                 cfg.station_id,

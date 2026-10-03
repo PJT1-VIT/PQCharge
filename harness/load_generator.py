@@ -111,7 +111,7 @@ import urllib.error
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from agent.config import AgentConfig
 from agent.logging_setup import configure_logging, get_logger
@@ -592,6 +592,7 @@ class FleetRunner:
 
         try:
             station = ChargingStation(self.config_for(station_id))
+            station.on_connected = self._connected_hook(station_id)
             outcome.ok = await station.run()
 
         except asyncio.CancelledError:
@@ -636,6 +637,20 @@ class FleetRunner:
             )
 
         return outcome
+
+    def _connected_hook(self, station_id: str) -> Callable[[float, int, int], None]:
+        """
+        PHASE C6.2. Write each connection time to the tester diary the
+        moment the connection opens (station_connected), instead of only
+        in station_finished at the end. A run stopped with Ctrl-C keeps
+        every connection time that happened before the stop.
+        """
+        def hook(connect_ms: float, connection: int, attempt: int) -> None:
+            self.log.emit(
+                tl.STATION_CONNECTED, station_id,
+                connect_ms=connect_ms, connection=connection, attempt=attempt,
+            )
+        return hook
 
     # -- progress ------------------------------------------------------------
 
@@ -936,7 +951,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--no-analyse", action="store_true",
         help="do not update analysis/output/ when the run ends (Phase C6); "
-             "by default the results page is rebuilt automatically",
+             "by default the results page is rebuilt automatically, also "
+             "after Ctrl-C (C6.2; the run is then marked incomplete)",
     )
     run.add_argument(
         "--events-log", action="append", default=None, metavar="PATH",
@@ -1007,17 +1023,36 @@ def main() -> None:
         # with current behind it.
         log.warning("interrupted -- cancelling the fleet")
         exit_code = 130
-    # PHASE C6: rebuild the results page from the diaries. Skipped on Ctrl-C
-    # and with --no-analyse. Never raises: the run's data is already on disk.
-    if exit_code != 130 and not args.no_analyse:
-        from analysis.run import analyse_after_run
+    analyse_at_end(args, config, exit_code, log)
+    raise SystemExit(exit_code)
 
+
+def analyse_at_end(args: argparse.Namespace, config: AgentConfig,
+                   exit_code: int, log: Any) -> bool:
+    """
+    PHASE C6 / C6.2: rebuild the results page from the diaries when the run
+    ends. Returns True if the analysis was started.
+
+    C6.2: it also runs after Ctrl-C (exit code 130). The run is then shown
+    as "warn / run_incomplete" on the results page, never as complete.
+    Skipped only with --no-analyse. A second Ctrl-C during the analysis
+    stops just the analysis. analyse_after_run itself never raises.
+    """
+    if args.no_analyse:
+        return False
+    from analysis.run import analyse_after_run
+
+    if exit_code == 130:
+        log.warning("run stopped early -- analysing anyway; it will be marked incomplete")
+    try:
         analyse_after_run(
             args.timing_log
             or default_path(args.experiment, args.n, config.crypto_mode, config.log_dir),
             events=args.events_log,
         )
-    raise SystemExit(exit_code)
+    except KeyboardInterrupt:
+        log.warning("analysis interrupted; run `python -m analysis.run` by hand")
+    return True
 
 
 if __name__ == "__main__":
