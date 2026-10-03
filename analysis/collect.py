@@ -270,6 +270,42 @@ class HarnessRun:
         wanted = set(event_types)
         return [r for r in self.rows if r.get("event_type") in wanted]
 
+    def connect_times(self) -> dict[str, list[float]]:
+        """
+        PHASE C6.2. Each charger's connection times (ms, oldest first; the
+        first is E1's handshake, later ones are reconnections).
+
+        Two sources in the tester diary:
+          * station_connected -- one line per connection, written the moment
+            it opens (C6.2). Survives a run stopped with Ctrl-C.
+          * station_finished / station_crashed -- the full connect_ms list,
+            written when the charger stops (C5.1). Missing if the tester
+            was stopped before chargers reported.
+        Per charger the source with MORE entries wins (a tie goes to the
+        final row), so old diaries read exactly as before and an early stop
+        loses nothing that reached the disk. A charger appears only if one
+        of the two sources mentions it.
+        """
+        live: dict[str, list[tuple[int, int, float]]] = {}
+        for i, r in enumerate(self.of_type("station_connected")):
+            sid, ms = r.get("station_id"), r.get("connect_ms")
+            if not sid or ms is None:
+                continue
+            live.setdefault(sid, []).append((int(r.get("connection") or 0), i, float(ms)))
+        final: dict[str, list[float]] = {}
+        for r in self.of_type("station_finished", "station_crashed"):
+            sid, times = r.get("station_id"), r.get("connect_ms")
+            if not sid or times is None:
+                continue
+            final[sid] = [float(t) for t in times if t is not None]
+        out: dict[str, list[float]] = {}
+        for sid in sorted(set(live) | set(final)):
+            from_live = [ms for _, _, ms in sorted(live.get(sid, []))]
+            from_final = final.get(sid)
+            out[sid] = (from_final if from_final is not None
+                        and len(from_final) >= len(from_live) else from_live)
+        return out
+
     @property
     def station_ids(self) -> list[str]:
         seen: dict[str, None] = {}

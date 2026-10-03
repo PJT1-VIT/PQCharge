@@ -66,11 +66,17 @@ class Diaries:
                   storm: dict[str, Any] | None = None, migrate: bool = False,
                   crash: str | None = None, omit_connect_ms: bool = False,
                   first_id: int = 1, pq_checks: bool = True, bad_counts: bool = False,
-                  agent_keys: dict[str, bool] | None = None) -> dict[str, Any]:
+                  agent_keys: dict[str, bool] | None = None,
+                  connected_lines: bool = False, stop_early: bool = False) -> dict[str, Any]:
         """
         A run of n chargers: connect, boot, charge for charge_s seconds with a
         7.4 kW reading each second, disconnect. Optional storm / migration.
         Returns the known answers.
+
+        C6.2: connected_lines=True also writes a station_connected line per
+        connection (as the load generator does since C6.2); stop_early=True
+        drops every station_finished row and the run_finished row -- the
+        tester stopped (Ctrl-C) before the chargers reported.
         """
         name = f"{experiment}_n{n}_{mode}.jsonl"
         ids = [f"CP{i:04d}" for i in range(first_id, first_id + n)]
@@ -162,13 +168,20 @@ class Diaries:
                 row["pq_key_installed"] = bool(agent_keys.get(sid, False))
                 row["pq_installs"] = 1 if agent_keys.get(sid) else 0
                 row["pq_challenges_signed"] = 1 if agent_keys.get(sid) else 0
+            if connected_lines:
+                for k, ms in enumerate(times, start=1):
+                    self.harness(name, start + 0.1 + i * 0.01 + 0.005 * k, "station_connected",
+                                 station_id=sid, connect_ms=ms, connection=k, attempt=k, **H)
+            if stop_early:
+                continue
             kind = "station_crashed" if sid == crash else "station_finished"
             self.harness(name, t + 0.01, kind, station_id=sid, **row, **H)
 
         if migrate:
             self._migration(name, ids, start, H, S, srv, pq_checks=pq_checks, bad_counts=bad_counts)
 
-        self.harness(name, end + 1.0, "run_finished", succeeded=n, failed=0, crashed=0, **H)
+        if not stop_early:
+            self.harness(name, end + 1.0, "run_finished", succeeded=n, failed=0, crashed=0, **H)
         return {"ids": ids, "name": name, "storm_restart": storm_restart}
 
     def _migration(self, name: str, ids: list[str], start: float, H: dict, S: dict, srv: str,

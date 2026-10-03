@@ -565,3 +565,132 @@ async def test_a_classical_station_reports_no_key(tmp_path):
     row = [r for r in TimingLog.read(tmp_path / "t.jsonl")
            if r["event_type"] == tl.STATION_FINISHED][0]
     assert row["pq_key_installed"] is False and row["pq_installs"] == 0
+
+
+# =====================================================================
+# C6.2 — CONNECTION TIMES WRITTEN AT CONNECT TIME (ports 9282-9284)
+# =====================================================================
+#
+# The s1b integration run lost every connection time: the tester was
+# stopped before the chargers wrote station_finished. Since C6.2 each
+# connection is written the moment it opens (station_connected), and the
+# analysis runs even after Ctrl-C.
+
+
+@pytest.mark.asyncio
+async def test_the_on_connected_hook_fires_once_per_connection():
+    from agent.station import ChargingStation
+
+    calls = []
+    async with FakeCSMS(port=9282):
+        station = ChargingStation(make_config(9282))
+        station.on_connected = lambda ms, n, attempt: calls.append((ms, n, attempt))
+        ok = await station.run()
+
+    assert ok is True
+    assert calls == [(station.connect_times_ms[0], 1, 1)]
+
+
+@pytest.mark.asyncio
+async def test_a_failing_hook_never_costs_the_station_its_session():
+    from agent.station import ChargingStation
+
+    def broken(*_):
+        raise RuntimeError("instrumentation bug")
+
+    async with FakeCSMS(port=9283):
+        station = ChargingStation(make_config(9283))
+        station.on_connected = broken
+        ok = await station.run()
+
+    assert ok is True, "a logging hook must never end a charging session"
+    assert len(station.connect_times_ms) == 1
+
+
+@pytest.mark.asyncio
+async def test_connection_times_are_on_disk_before_the_run_is_stopped(tmp_path):
+    """Ctrl-C mid-charge: every charger's station_connected line exists."""
+    async with FakeCSMS(port=9284):
+        log = make_log(tmp_path, n=3)
+        runner = FleetRunner(
+            make_config(9284, charge_for_s=30.0), FleetSpec(n=3, stagger_s=0.01), log,
+        )
+        task = asyncio.ensure_future(runner.run())
+        await asyncio.sleep(0.8)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        log.close()
+
+    rows = TimingLog.read(tmp_path / "t.jsonl")
+    connected = [r for r in rows if r["event_type"] == tl.STATION_CONNECTED]
+    assert sorted(r["station_id"] for r in connected) == ["CP0001", "CP0002", "CP0003"]
+    for r in connected:
+        assert r["connect_ms"] > 0
+        assert r["connection"] == 1 and r["attempt"] == 1
+
+    # Where station_finished also made it, both sources agree.
+    finished = {r["station_id"]: r for r in rows if r["event_type"] == tl.STATION_FINISHED}
+    for r in connected:
+        if r["station_id"] in finished:
+            assert finished[r["station_id"]]["connect_ms"] == [r["connect_ms"]]
+
+
+# -- the analysis at the end of a run ----------------------------------------------
+
+
+def _end_args(tmp_path, *extra):
+    return build_parser().parse_args(
+        ["--experiment", "unit", "--timing-log", str(tmp_path / "t.jsonl"), *extra]
+    )
+
+
+def _fake_analysis(monkeypatch, effect=None):
+    import analysis.run
+
+    calls = []
+
+    def fake(harness_log, events=None, out=None):
+        calls.append(harness_log)
+        if effect is not None:
+            raise effect
+
+    monkeypatch.setattr(analysis.run, "analyse_after_run", fake)
+    return calls
+
+
+def test_the_analysis_runs_after_ctrl_c(tmp_path, monkeypatch):
+    import logging
+
+    from harness.load_generator import analyse_at_end
+
+    calls = _fake_analysis(monkeypatch)
+    args = _end_args(tmp_path)
+    assert analyse_at_end(args, AgentConfig.from_namespace(args), 130,
+                          logging.getLogger("t")) is True
+    assert calls == [str(tmp_path / "t.jsonl")]
+
+
+def test_no_analyse_still_switches_it_off(tmp_path, monkeypatch):
+    import logging
+
+    from harness.load_generator import analyse_at_end
+
+    calls = _fake_analysis(monkeypatch)
+    args = _end_args(tmp_path, "--no-analyse")
+    for code in (0, 130):
+        assert analyse_at_end(args, AgentConfig.from_namespace(args), code,
+                              logging.getLogger("t")) is False
+    assert calls == []
+
+
+def test_a_second_ctrl_c_stops_only_the_analysis(tmp_path, monkeypatch):
+    import logging
+
+    from harness.load_generator import analyse_at_end
+
+    _fake_analysis(monkeypatch, effect=KeyboardInterrupt())
+    args = _end_args(tmp_path)
+    # Must not raise: the caller still has to exit with the run's own code.
+    assert analyse_at_end(args, AgentConfig.from_namespace(args), 130,
+                          logging.getLogger("t")) is True

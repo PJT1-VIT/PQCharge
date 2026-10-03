@@ -115,10 +115,14 @@ def check_run(run: MatchedRun, overview: dict[str, Any], e1: dict[str, Any],
             "not a result -- fix it and re-run.",
         ))
     if st["never_reported"]:
-        issues.append(_issue(
-            "warn", "unreported_stations",
-            f"{st['never_reported']} charger(s) were started but never reported back.",
-        ))
+        if h.completed:
+            text = f"{st['never_reported']} charger(s) were started but never reported back."
+        else:
+            # C6.2: the usual cause is the early stop itself, not the chargers.
+            text = (f"{st['never_reported']} charger(s) never sent their final totals "
+                    "because the tester stopped early. Their connection times still "
+                    "count where the diary has station_connected lines.")
+        issues.append(_issue("warn", "unreported_stations", text))
 
     # -- the two diaries must agree on who charged ---------------------------
     ended_by_station = Counter(e.get("station_id") for e in run.events("transaction_ended"))
@@ -137,8 +141,8 @@ def check_run(run: MatchedRun, overview: dict[str, Any], e1: dict[str, Any],
     if e1.get("station_side_available"):
         server_conns = Counter(e.get("station_id") for e in run.events("connection_established"))
         mismatched = [
-            sid for sid, r in finished.items()
-            if len(r.get("connect_ms") or []) != server_conns.get(sid, 0)
+            sid for sid, times in h.connect_times().items()
+            if len(times) != server_conns.get(sid, 0)
         ]
         if mismatched and run.station_events:
             issues.append(_issue(
@@ -148,11 +152,16 @@ def check_run(run: MatchedRun, overview: dict[str, Any], e1: dict[str, Any],
                 "before the server registers it, e.g. during a restart).",
             ))
     else:
-        issues.append(_issue(
-            "warn", "no_station_side_timing",
-            "This run was recorded before chargers logged their own connection time "
-            "(connect_ms). E1's headline number is unavailable for it; re-run to include it.",
-        ))
+        if h.completed:
+            text = ("This run was recorded before chargers logged their own connection time "
+                    "(connect_ms). E1's headline number is unavailable for it; re-run to include it.")
+        else:
+            # C6.2: the s1b case -- stopped before any charger reported, and
+            # the diary predates station_connected lines.
+            text = ("No charger connection times were recorded: the tester stopped before "
+                    "the chargers reported, and this diary has no station_connected lines "
+                    "(recorded before C6.2). E1's headline number is unavailable for it.")
+        issues.append(_issue("warn", "no_station_side_timing", text))
 
     if e3 is not None:
         issues.extend(_migration_issues(e3))

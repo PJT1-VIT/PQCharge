@@ -159,8 +159,9 @@ def measure(run: MatchedRun) -> dict[str, Any] | None:
     )
 
     rows = run.harness.of_type("station_finished", "station_crashed")
+    # C6.2: station_connected lines and/or station_finished rows.
     reconnect_ms = [
-        float(t) for r in rows for t in (r.get("connect_ms") or [])[1:] if t is not None
+        t for times in run.harness.connect_times().values() for t in times[1:]
     ]
 
     snap = _snapshot_curve(run, restart_t, population) if population else []
