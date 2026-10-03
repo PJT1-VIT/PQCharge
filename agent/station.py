@@ -1216,7 +1216,11 @@ class ChargingStation(StationCommands):
         server cannot know for attempts that never arrived.
         """
         cfg = self.config
-        started = time.monotonic()
+        # perf_counter, not monotonic: on Windows before Python 3.13,
+        # time.monotonic() only advances in ~15.6 ms steps, so a fast
+        # localhost connect read as 0.0 ms and every E1 time was rounded
+        # to that step. perf_counter is high-resolution on every platform.
+        started = time.perf_counter()
         self.connection_attempts += 1
 
         # PHASE C4: the server has never seen this connection before, so
@@ -1249,7 +1253,7 @@ class ChargingStation(StationCommands):
                 connect_kwargs["server_hostname"] = cfg.tls_server_name
 
         async with connect(cfg.ws_url, **connect_kwargs) as ws:
-            elapsed_ms = (time.monotonic() - started) * 1000.0
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
             self.connect_times_ms.append(elapsed_ms)
             self.log.info("connected in %.1fms", elapsed_ms)
             if self.on_connected is not None:
