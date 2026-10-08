@@ -89,6 +89,7 @@ from agent.config import AgentConfig
 from agent.logging_setup import configure_logging, get_logger
 from agent.power import PowerInterface
 from agent.pq_identity import PQIdentity
+from agent.pq_keystore import PQKeyStore
 from agent import pqc_messages as pqc
 from agent.simulated_power import SimulatedPower
 from agent.state_machine import StationState, StationStateMachine
@@ -329,7 +330,22 @@ class ChargingStation(StationCommands):
         # migration orchestrator sends an InstallPQAuth. STATION-scoped,
         # so a station migrated before an E2 outage is still migrated
         # after it. quantcrypt is not touched until the first challenge.
-        self.pq = PQIdentity(station_id=config.station_id)
+        #
+        # Contract 7 (C-P2): the station makes and keeps its OWN key. With
+        # a key folder configured, a key saved by an earlier run is loaded
+        # here -- before any connection -- and the provider is built now,
+        # so the first challenge does not pay the library load (L10). No
+        # key file: nothing is loaded and quantcrypt stays untouched.
+        key_store = (
+            PQKeyStore(config.pq_key_dir, config.station_id)
+            if config.pq_key_dir else None
+        )
+        self.pq = PQIdentity(
+            station_id=config.station_id,
+            key_store=key_store,
+            supported_algorithms=config.supported_algorithms,
+        )
+        self.pq.load()
         """
         Readings taken while the CSMS was unreachable.
 
@@ -670,6 +686,34 @@ class ChargingStation(StationCommands):
         self.pq.install(private_key, algorithm)
         return True, f"{algorithm} key installed; station migrated"
 
+    def handle_pq_enrolment(
+        self, data: Any
+    ) -> tuple[bool, str, str | None]:
+        """
+        RequestPQEnrolment (Contract 7 section 7.2): make a new key pair on
+        THIS station, save it, and answer with the public key only.
+
+        Like install, it touches no physical state, so it is safe mid-charge.
+        Refused (never a crash) when the payload is malformed, the
+        algorithm is not supported, or the key cannot be saved -- a station
+        must not hand out a public key whose private half is not stored.
+        """
+        try:
+            algorithm = pqc.parse_enrolment_request(data)
+        except ValueError as exc:
+            self.log.warning("RequestPQEnrolment rejected: %s", exc)
+            return False, str(exc), None
+        try:
+            public_key, key_id = self.pq.enrol(algorithm)
+        except ValueError as exc:
+            self.log.warning("RequestPQEnrolment rejected: %s", exc)
+            return False, str(exc), None
+        except OSError as exc:
+            self.log.error("RequestPQEnrolment failed: key could not be saved: %s", exc)
+            return False, f"key could not be saved: {exc}", None
+        return True, f"{algorithm} key made on this station (key_id {key_id})", \
+            pqc.pack_enrolment_reply(algorithm, public_key)
+
     def handle_pq_challenge(
         self, data: Any
     ) -> tuple[bool, str, bytes | None]:
@@ -683,8 +727,9 @@ class ChargingStation(StationCommands):
             return False, "station holds no PQC key (not migrated)", None
 
         try:
-            nonce, _meta = pqc.parse_challenge_data(data)
-            signature = self.pq.answer_challenge(nonce)
+            nonce, meta = pqc.parse_challenge_data(data)
+            # Contract 7: the server may name which key to sign with.
+            signature = self.pq.answer_challenge(nonce, pqc.challenge_key_id(meta))
         except Exception as exc:  # noqa: BLE001 - reported, never a CALLError
             self.log.warning("PQAuthChallenge could not be answered: %s", exc)
             return False, f"could not sign challenge: {exc}", None
@@ -1345,6 +1390,14 @@ class ChargingStation(StationCommands):
                             asyncio.CancelledError, Exception
                         ):
                             await task
+                    elif task is not None and not task.cancelled():
+                        # Already finished, possibly with an exception
+                        # nobody read -- e.g. the reader ended with
+                        # ConnectionClosed in the same instant the session
+                        # returned. Reading it here stops asyncio printing
+                        # "Task exception was never retrieved" (seen on
+                        # Windows after the fake server's injected 1013).
+                        task.exception()
                 self._heartbeat_task = None
 
                 self.callerror_count += client.callerror_count
