@@ -822,8 +822,33 @@ def _check_storm_preconditions(args: argparse.Namespace) -> None:
         )
 
 
+def warm_up_pq_provider() -> float | None:
+    """
+    L10 / Contract 7 section 7.3: build the post-quantum provider ONCE,
+    before any charger is spawned. Returns how long it took (ms), or None
+    if the post-quantum backend is not installed (classical-only machine).
+
+    Why here: every charger in this process shares the library, and the
+    first construction costs ~300 ms (measured). Paid inside the run, it
+    would block the event loop at the worst moment -- while other chargers
+    are connecting (inflating E1) or during a migration's first wave
+    (inflating E3). Paid here, it is outside every measured window; later
+    constructions are near-instant.
+    """
+    started = time.perf_counter()
+    try:
+        from crypto.pq import PQProvider
+
+        PQProvider()
+    except Exception as exc:  # noqa: BLE001 - a missing backend is not an error here
+        get_logger(__name__).info("post-quantum warm-up skipped: %s", exc)
+        return None
+    return (time.perf_counter() - started) * 1000.0
+
+
 async def main_async(args: argparse.Namespace, config: AgentConfig) -> int:
     run_id = args.run_id or uuid.uuid4().hex[:12]
+    pq_warmup_ms = warm_up_pq_provider()
     spec = FleetSpec(
         n=args.n,
         id_prefix=args.id_prefix,
@@ -858,6 +883,7 @@ async def main_async(args: argparse.Namespace, config: AgentConfig) -> int:
             storm_for_s=args.storm_for,
             python=sys.version.split()[0],
             platform=sys.platform,
+            pq_warmup_ms=pq_warmup_ms,
         )
         log.sync()
 

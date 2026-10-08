@@ -87,6 +87,17 @@ DEFAULT_ID_TOKEN = "TAG-0001"
 SUBPROTOCOL_STANDARD = "ocpp2.0.1"
 SUBPROTOCOL_PQC = "ocpp2.0.1+pqc"
 
+DEFAULT_PQ_KEY_DIR = "certs/pq"
+"""Contract 7 section 7.3: the command-line default for pq_key_dir."""
+
+
+def _pq_key_dir_from(value: Any) -> str | None:
+    """'none' / '' on the command line means memory only."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    return None if text.lower() in ("", "none") else text
+
 
 @dataclass
 class AgentConfig:
@@ -159,6 +170,19 @@ class AgentConfig:
     skipped by the orchestrator, rather than counted as a failure. Left
     empty by default because inventing algorithm names before Track B
     publishes them would put fiction in the results table.
+    """
+
+    pq_key_dir: str | None = None
+    """
+    Contract 7 section 7.3: the folder holding this station's own
+    post-quantum key file (<pq_key_dir>/<station_id>.json).
+
+    None = keep keys in memory only. That is the default for an
+    AgentConfig built in code (the tests), so a key file left on a
+    developer's machine can never change a test's starting state. The
+    COMMAND LINE (agent and load generator) defaults to "certs/pq" -- the
+    contract's location, inside the already git-ignored certs/ -- and
+    `--pq-key-dir none` turns persistence off.
     """
 
     # -- physical model --------------------------------------------------
@@ -362,6 +386,9 @@ class AgentConfig:
                 f"accepts {SUBPROTOCOL_STANDARD!r} and {SUBPROTOCOL_PQC!r}"
             )
 
+        if self.pq_key_dir is not None and not str(self.pq_key_dir).strip():
+            raise ValueError("pq_key_dir must be a folder path or None")
+
         if self.max_power_w < 0:
             raise ValueError(f"max_power_w must be >= 0, got {self.max_power_w}")
 
@@ -537,6 +564,11 @@ class AgentConfig:
             help="comma-separated capability profile for Contract 2",
         )
         parser.add_argument(
+            "--pq-key-dir", dest="pq_key_dir", default=DEFAULT_PQ_KEY_DIR,
+            help="folder for this station's own post-quantum key file "
+                 "(Contract 7); 'none' keeps keys in memory only",
+        )
+        parser.add_argument(
             "--max-power", dest="max_power_w", type=float,
             default=cls.max_power_w, help="watts",
         )
@@ -640,6 +672,7 @@ class AgentConfig:
             meter_every_s=ns.meter_every_s,
             crypto_mode=ns.crypto_mode,
             supported_algorithms=algorithms,
+            pq_key_dir=_pq_key_dir_from(getattr(ns, "pq_key_dir", DEFAULT_PQ_KEY_DIR)),
             max_power_w=ns.max_power_w,
             response_timeout_s=ns.response_timeout_s,
             connect_timeout_s=getattr(ns, "connect_timeout_s", 5.0),

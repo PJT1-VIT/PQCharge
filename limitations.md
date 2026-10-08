@@ -40,7 +40,6 @@ Old numbers (F1, F13, F14, R11, …) differed between the dev plans; F14 meant t
 | L06 | **Certificates lack the AKI/SKI extensions.** Strict TLS software rejects them; Python 3.13's default context did in session Step 1b. *(old: integration-plan F14)* | Agreed | Add both extensions in `crypto/ca.py`, then regenerate all certificates. | B |
 | L07 | **The identity check only warns by default.** | Agreed | Default `--tls-identity-check` to `enforce`. The agent already passed under `enforce` in session Step 1b. | A |
 | L09 | **E3 showed the rollback but not the halt.** The failing chargers were in the last wave. | Agreed | One extra E3 run with the refusers mid-fleet (for example CP0021–25): a new fleet profile, plus the load generator run twice with `--start-index`. | C runs; B (profile contents), A (fixture) |
-| L10 | **The first key check is ~10× slower (500–600 ms vs ~46 ms).** The agent loads the post-quantum library on its first signature, ~270–360 ms once per process, and all chargers share one process. *(old: R11, C-2)* | Agreed | Load the provider once at charger start (it happens anyway when the charger loads its stored key, Contract 7 §7.3). Keep reporting "first check" separately. | C |
 | L11 | **Session runs were stopped with Ctrl-C,** so they are marked "incomplete". | Agreed | Every run ends on its own. `--charge-for` follows the rule in Track C's plan (ramp + action + 30 s observation + 30 s margin). | C |
 
 ## 3. Planned (in the owner's plan)
@@ -91,5 +90,6 @@ Old numbers (F1, F13, F14, R11, …) differed between the dev plans; F14 meant t
 | Server logs in evidence | PR #25 |
 | L03 (meaning of the three modes) | Contract 7 §7.1, frozen 2026-10-08 |
 | L18 (Contract 7 approval) | approved by A, B, C, 2026-10-08 |
+| L10 (first key check ~10× slower) | C-P2: the provider is built once at load-generator start, and at charger start when a key file exists (Contract 7 §7.3) |
 
 **Note:** `docs/limitations.md` R4 ("certificates carry no SAN") is out of date: the SAN mechanism was merged (Track B R2). Track B should update it.

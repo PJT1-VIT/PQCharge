@@ -224,8 +224,21 @@ class StationCommands:
     # -- Phase C8: the post-quantum migration path (Option B) --------------
 
     def handle_install_pq_auth(self, data: Any) -> tuple[bool, str]:
-        """The orchestrator is installing this station's ML-DSA key."""
+        """The orchestrator is installing this station's ML-DSA key.
+        DEPRECATED (Contract 7 section 7.8)."""
         return False, "no station is attached to this connection"
+
+    def handle_pq_enrolment(
+        self, data: Any
+    ) -> tuple[bool, str, str | None]:
+        """
+        Contract 7 section 7.2: the server asks this station to make its
+        own key pair. Returns (accepted, reason, reply_data): reply_data is
+        the JSON for DataTransferResponse.data (algorithm, PUBLIC key,
+        key_id) when accepted. Synchronous, like the challenge: key
+        generation is CPU work with no outbound call.
+        """
+        return False, "no station is attached to this connection", None
 
     def handle_pq_challenge(
         self, data: Any
@@ -816,10 +829,14 @@ class StationClient(CpBase):
     ):
         """
         The one OCPP message that carries PQCharge's post-quantum
-        exchanges. Two ride on it, both under one vendor id:
+        exchanges. Three ride on it, all under one vendor id:
 
-            InstallPQAuth    the orchestrator installs this station's key
-            PQAuthChallenge  the server asks the station to sign a nonce
+            RequestPQEnrolment  the server asks the station to make its own
+                                key pair; the station answers with the
+                                PUBLIC key (Contract 7)
+            PQAuthChallenge     the server asks the station to sign a nonce
+            InstallPQAuth       DEPRECATED: the orchestrator installs a
+                                server-made key (until Contract 7 section 7.8)
 
         Anything else -- a different vendor, an unknown message id -- is
         answered with the OCPP-correct status and nothing happens. That
@@ -847,8 +864,35 @@ class StationClient(CpBase):
         if message_id == pqc.MSG_CHALLENGE:
             return self._answer_pq_challenge(data)
 
+        if message_id == pqc.MSG_REQUEST_ENROLMENT:
+            return self._answer_pq_enrolment(data)
+
         self.log.warning("DataTransfer with unknown message id %r", message_id)
         return call_result.DataTransfer(status=pqc.STATUS_UNKNOWN_MESSAGE)
+
+    def _answer_pq_enrolment(self, data: Any):
+        """
+        Run the enrolment handler (Contract 7 section 7.2) and put the
+        public-key reply into DataTransferResponse.data. Same backstop as
+        the challenge: a fault here is a Rejected response, never a
+        CALLError. The reply never contains the private key -- it is built
+        by pqc.pack_enrolment_reply from the public key alone.
+        """
+        try:
+            accepted, reason, reply = self.commands.handle_pq_enrolment(data)
+        except Exception as exc:  # noqa: BLE001 - deliberate backstop
+            self.log.exception("RequestPQEnrolment handler raised; answering Rejected")
+            accepted, reason, reply = (
+                False, f"internal error: {type(exc).__name__}: {exc}", None,
+            )
+
+        self._command_log("RequestPQEnrolment", accepted, reason)
+
+        if accepted and reply is not None:
+            return call_result.DataTransfer(status=pqc.STATUS_ACCEPTED, data=reply)
+        return call_result.DataTransfer(
+            status=pqc.STATUS_REJECTED, status_info=self._status_info(reason)
+        )
 
     def _answer_pq_challenge(self, data: Any):
         """

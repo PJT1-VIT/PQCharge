@@ -208,6 +208,11 @@ def test_from_args_with_no_arguments_matches_defaults():
     b = in_code.describe()
     a.pop("run_id")
     b.pop("run_id")
+    # pq_key_dir differs by design too (Contract 7, C-P2): the command line
+    # saves keys to certs/pq; a config built in code keeps them in memory,
+    # so a key file on a developer's machine can never change a test.
+    assert a.pop("pq_key_dir") == "certs/pq"
+    assert b.pop("pq_key_dir") is None
     assert a == b
 
 
