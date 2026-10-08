@@ -1,6 +1,6 @@
 # PQCharge — Open Items and Limitations
 
-**The single register of everything not yet resolved.** Started 2026-10-03, after the A+B+C integration.
+**The single register of everything not yet resolved.** Started 2026-10-03, after the A+B+C integration. **Updated 2026-10-08:** every team item is agreed by A, B and C; L03 is decided; Contract 7 has been proposed (L18).
 
 ## Rules (all three tracks)
 
@@ -18,30 +18,30 @@
    - **Not decided** — needs a team decision; the action shown is only the recommendation.
    - **Planned** — already scheduled in the owner's dev plan.
    - **Accepted** — a known limit we keep; it is stated in the report and stays here.
-5. **Team items** marked "Agreed (Track C)" were agreed by Koshambi on 2026-10-03. **Tracks A and B confirm them** by editing the status to "Agreed (A, B, C)".
+5. **Team items** are agreed by all three tracks (confirmed 2026-10-08). New team items start as "Proposed" until all three agree.
 
 Old numbers (F1, F13, F14, R11, …) differed between the dev plans; F14 meant two different things. **From now on, cite the `L` number.**
 
 ---
 
-## 1. Blocking E1 / E2 (decide in this order: L01 → L02 → L03)
+## 1. Blocking E1 / E2 (all decided; built through Contract 7)
 
 | No. | Finding | Status | Action | Owner |
 |---|---|---|---|---|
-| **L01** | **The server makes every charger's private key and sends it over the network.** The charger keeps it in memory only, so a restart loses it. *(old: F2+F3, A-F13, B-F13)* | Agreed (Track C) — A, B to confirm | The charger generates its own ML-DSA key, sends **only the public key**, and saves the private key in a file on its own disk (ignored by git). | B (orchestrator install step), C (`agent/pqc_messages.py`, `agent/pq_identity.py`); A reviews |
-| **L02** | **The security mode is only a label.** The key is checked once, at migration, so "classical" and "post-quantum" chargers connect in exactly the same way. E1/E2 would compare identical things. *(old: F1, A-8)* | Agreed (Track C) — A, B to confirm | The server challenges every migrated charger after **each** accepted boot (Track A's boot listener); a failed check rejects the charger. **E2 "recovered" in post-quantum mode = connected + boot accepted + key check passed.** **Presentation:** the migration must be visibly obvious to the panel (dashboard migration timeline, live ticker of waves and key checks, a readable console view). | A (boot hook, recovered rule), B (challenge on boot), C (agent; display) |
-| **L03** | **"Hybrid" has no defined meaning under Option B.** Connections always use classical TLS, so "post-quantum" mode is already "classical TLS + post-quantum ID check". *(old: F5)* | **Not decided** | *Recommended:* two modes, named honestly: *classical* and *classical TLS + post-quantum authentication*. E2 becomes 8 runs instead of 12. **Check with the guide/panel first**, because the design document promises three modes. | B leads, with C |
+| **L01** | **The server makes every charger's private key and sends it over the network.** The charger keeps it in memory only, so a restart loses it. *(old: F2+F3, A-F13, B-F13)* | **Agreed (A, B, C)** | The charger generates its own ML-DSA key, sends **only the public key**, and saves the private key in `certs/pq/<id>.json` (ignored by git). **Specified in Contract 7 §7.2–7.4.** | B (orchestrator install step), C (`agent/pqc_messages.py`, `agent/pq_identity.py`); A reviews |
+| **L02** | **The security mode is only a label.** The key is checked once, at migration, so "classical" and "post-quantum" chargers connect in exactly the same way. E1/E2 would compare identical things. *(old: F1, A-8)* | **Agreed (A, B, C)** | The server challenges every migrated charger after **each** accepted boot (Track A's boot listener); a failed check **closes the connection** (code 1008). **Specified in Contract 7 §7.5–7.7.** **E2 "recovered" in post-quantum mode = connected + boot accepted + key check passed.** **Presentation:** the migration must be visibly obvious to the panel (dashboard migration timeline, live ticker of waves and key checks, a readable console view). | A (boot hook, recovered rule), B (challenge on boot), C (agent; display) |
+| **L03** | **The three security modes need a real meaning.** *(old: F5)* | **Decided (A, B, C), 2026-10-08** | **classical** = classical TLS; **hybrid** = classical TLS + the ML-DSA key check at every boot; **pure PQC** (`pqc`) = post-quantum TLS via liboqs, with **no** extra key check. E2 stays 12 runs (4 sizes × 3 modes). Defined in Contract 7 §7.1. `pqc` details wait for L17. Remove this item once Contract 7 is frozen (L18). | B leads, with C |
 
 ## 2. Agreed fixes, not yet done
 
 | No. | Finding | Status | Action | Owner |
 |---|---|---|---|---|
-| L04 | **Private keys appear in the server log.** The `ocpp` library logs every `InstallPQAuth` message at INFO, key included. GitGuardian flagged the copies once committed in `evidence/`. *(old: A-F14)* | Agreed (Track C) — A to confirm | 1. Track A adds a log filter that blanks `private_key` values. 2. Never commit `*.log`. 3. Koshambi closes the GitGuardian incident as a test credential. 4. No git-history rewrite (throwaway test keys). The root fix is L01. | A (filter), C (incident) |
-| L05 | **Coarse timers on Windows before Python 3.13.** `time.monotonic()` moves in ~15.6 ms steps. The agent is fixed (PR #26); Track A's timers (`monotonic_ns`: server handshake time, key-check round trip) are not. | Agreed | **All tracks move to Python 3.13+.** Remove this item once all three confirm. | A, B, C |
+| L04 | **Private keys appear in the server log.** The `ocpp` library logs every `InstallPQAuth` message at INFO, key included. GitGuardian flagged the copies once committed in `evidence/`. *(old: A-F14)* | **Agreed (A, B, C)** | 1. Track A adds a log filter that blanks `private_key` values. 2. Never commit `*.log`. 3. Koshambi closes the GitGuardian incident as a test credential. 4. No git-history rewrite (throwaway test keys). **Root fix: Contract 7 removes `InstallPQAuth` (§7.8).** | A (filter), C (incident) |
+| L05 | **Coarse timers on Windows before Python 3.13.** `time.monotonic()` moves in ~15.6 ms steps. The agent is fixed (PR #26); Track A's timers (`monotonic_ns`: server handshake time, key-check round trip) are not. | **Agreed (A, B, C)** | **All tracks move to Python 3.13+.** Remove this item once all three confirm they are on 3.13. | A, B, C |
 | L06 | **Certificates lack the AKI/SKI extensions.** Strict TLS software rejects them; Python 3.13's default context did in session Step 1b. *(old: integration-plan F14)* | Agreed | Add both extensions in `crypto/ca.py`, then regenerate all certificates. | B |
 | L07 | **The identity check only warns by default.** | Agreed | Default `--tls-identity-check` to `enforce`. The agent already passed under `enforce` in session Step 1b. | A |
 | L09 | **E3 showed the rollback but not the halt.** The failing chargers were in the last wave. | Agreed | One extra E3 run with the refusers mid-fleet (for example CP0021–25): a new fleet profile, plus the load generator run twice with `--start-index`. | C runs; B (profile contents), A (fixture) |
-| L10 | **The first key check is ~10× slower (500–600 ms vs ~46 ms).** The agent loads the post-quantum library on its first signature, ~270–360 ms once per process, and all chargers share one process. *(old: R11, C-2)* | Agreed | Load the provider once at tester start, and at boot for a real charger. Keep reporting "first check" separately. | C |
+| L10 | **The first key check is ~10× slower (500–600 ms vs ~46 ms).** The agent loads the post-quantum library on its first signature, ~270–360 ms once per process, and all chargers share one process. *(old: R11, C-2)* | Agreed | Load the provider once at charger start (it happens anyway when the charger loads its stored key, Contract 7 §7.3). Keep reporting "first check" separately. | C |
 | L11 | **Session runs were stopped with Ctrl-C,** so they are marked "incomplete". | Agreed | Every run ends on its own. `--charge-for` follows the rule in Track C's plan (ramp + action + 30 s observation + 30 s margin). | C |
 
 ## 3. Planned (in the owner's plan)
@@ -60,6 +60,14 @@ Old numbers (F1, F13, F14, R11, …) differed between the dev plans; F14 meant t
 | L12 | **E6's second half is not done:** our agent against a third-party CSMS. The first half (a third-party charger on our server) passed on Day 10. | Not decided | *Recommended:* compare CitrineOS and MaEVe (both OCPP 2.0.1, open source) on install effort, then pick one. **Install effort not yet investigated.** | C + A |
 | L13 | **Raspberry Pi hardware status unknown** (Pi, relay, INA219 sensor). | Not decided | Confirm what is bought. On the Pi: Track A's quantcrypt 1312 check; certificate SAN for the laptop's `.local` name (old B-R4). | Team; C (C9) |
 
+## 4b. New items (2026-10-08)
+
+| No. | Finding | Status | Action | Owner |
+|---|---|---|---|---|
+| **L17** | **Pure PQC may not run in Windows Python.** Our design record (`docs/limitations.md` R3) and Track B's plan say liboqs's OpenSSL provider does not load into Windows CPython. Pure-PQC runs may then need Linux (WSL or the Pi), a different platform from the other two modes, which affects the fairness of E1/E2. **Not yet tested with Python 3.13 / current OpenSSL.** | Not decided | *Recommended:* Track B runs a timeboxed test (2 days, as the design document's original transport decision did). On Windows: does Python 3.13's `ssl` load the oqs provider (or a native ML-KEM/ML-DSA OpenSSL)? If not, what works on WSL/Linux? Then decide where **all three** modes run, so the comparison stays like for like. Contract 7 v2 then fixes `pqc`. | B leads; A, C |
+| **L18** | **Contract 7 v1 (security modes, charger-made keys, key check at every boot) is proposed, not yet frozen.** | Proposed (Track C) | Tracks A and B review `PQCharge_Interface_Contracts.md` → Contract 7 and tick their approval box. Track C builds only the parts that need no other track (see Track C plan) until then. | A, B |
+| **L19** | **Charger key files cannot be locked down on Windows** (no `chmod 0600`). | Proposed (accepted limitation) | State it in the report. Simulated chargers only; the Pi (Linux) uses mode 0600. | C |
+
 ## 5. Accepted limitations (stay in the report)
 
 | No. | Limitation | Why it is accepted |
@@ -72,6 +80,8 @@ Old numbers (F1, F13, F14, R11, …) differed between the dev plans; F14 meant t
 | L25 | **The agent's offline queue holds at most 2,000 events;** older ones are dropped when full. | Bounded memory at 500 chargers; drops are counted and reported by C6. |
 
 ---
+
+*Contract 7 (security modes) is in the project doc `PQCharge_Interface_Contracts.md`.*
 
 *Resolved and removed:*
 
