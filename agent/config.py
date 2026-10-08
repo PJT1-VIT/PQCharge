@@ -233,6 +233,15 @@ class AgentConfig:
     Track A demonstrated (their §6.2) gets shown from the client side.
     """
 
+    rotation_dir: str = "certs/rotated"
+    """
+    Where this station keeps a certificate it received by LIVE ROTATION
+    (plan Phase 5): <rotation_dir>/<station_id>.crt.pem and .key.pem. The key
+    is generated on the station and written here, never sent anywhere. Kept
+    across restarts (finding F3); the bootstrap ECDSA pair in cert_dir is left
+    untouched as the fallback.
+    """
+
     tls_server_name: str | None = None
     """
     The hostname to verify the server's certificate against.
@@ -570,7 +579,13 @@ class AgentConfig:
         tls.add_argument("--key", dest="key", default=None,
                          help="override this station's private key")
         tls.add_argument("--ca", dest="ca", default=None,
-                         help="override the CA root")
+                         help="override the CA root (a rotating station uses "
+                              "certs/roots_all.pem: classical + ML-DSA roots)")
+        tls.add_argument(
+            "--rotation-dir", dest="rotation_dir", default=cls.rotation_dir,
+            help="where a certificate received by live rotation is stored "
+                 "(<dir>/<id>.crt.pem and .key.pem); reused after a restart",
+        )
         tls.add_argument(
             "--tls-server-name", dest="tls_server_name", default=None,
             help="hostname to verify the server certificate against; needs to "
@@ -647,6 +662,7 @@ class AgentConfig:
             cert=getattr(ns, "cert", None),
             key=getattr(ns, "key", None),
             ca=getattr(ns, "ca", None),
+            rotation_dir=getattr(ns, "rotation_dir", "certs/rotated"),
             tls_server_name=getattr(ns, "tls_server_name", None),
             tls_check_hostname=not getattr(ns, "tls_no_hostname_check", False),
             reconnect_base_delay_s=ns.reconnect_base_delay_s,

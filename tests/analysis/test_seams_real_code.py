@@ -21,7 +21,7 @@ wrong:
         (deferred), and two refusers the tester did not start (rolled back).
         C6 must report exactly what the orchestrator itself reports.
 
-The end-to-end test needs the post-quantum library (quantcrypt) and skips
+The end-to-end test needs the post-quantum library (cryptography>=50) and skips
 cleanly without it, like the other post-quantum tests.
 """
 
@@ -237,7 +237,7 @@ class _Fleet:
 
 @pytest.mark.asyncio
 async def test_end_to_end_stage6_shape_with_every_track_real(tmp_path):
-    pytest.importorskip("quantcrypt", reason="PQ backend; see requirements.txt")
+    pytest.importorskip("cryptography.hazmat.primitives.asymmetric.mldsa", reason="PQ backend needs cryptography>=50; see requirements.txt")
     from agent.client import StationClient
     from agent.config import AgentConfig
     from agent.pqc_messages import build_challenge_message, build_install_message, parse_signature

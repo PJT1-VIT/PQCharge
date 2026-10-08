@@ -106,7 +106,31 @@ TRIGGERABLE = (
     "StatusNotification",
     "Heartbeat",
     "MeterValues",
+    "SignChargingStationCertificate",
 )
+
+ROTATION_ALGORITHM = "ML-DSA-44"
+"""What live certificate rotation (plan Phase 5) moves a station to. Only a
+label here (the key itself is made by Track B's crypto/csr.py): a station
+whose declared --supported-algorithms omit it refuses the rotation trigger."""
+
+
+class _Rotation:
+    """
+    Live certificate rotation state for one station (plan Phase 5).
+
+        installed  CertificateSigned accepted; the new certificate and key are
+                   on disk. Waiting for the CSMS to close the socket.
+        switching  reconnecting with the new certificate.
+        active     the new certificate completed a connection (boot accepted).
+        fell_back  the new certificate was refused or its handshake failed;
+                   the station is back on its previous (ECDSA) certificate.
+    """
+
+    def __init__(self, old_context: Any, new_context: Any, phase: str) -> None:
+        self.old_context = old_context
+        self.new_context = new_context
+        self.phase = phase
 
 # How many times to re-send BootNotification when the CSMS answers
 # Pending. Today it never does -- csms/handlers.py always accepts --
@@ -312,7 +336,17 @@ class ChargingStation(StationCommands):
                 key=config.key,
                 ca=config.ca,
                 check_hostname=config.tls_check_hostname,
+                crypto_mode=config.crypto_mode,
             )
+
+        # -- live certificate rotation (plan Phase 5) --------------------
+        self._rotation: _Rotation | None = None
+        self._pending_rotation_key: bytes | None = None
+        """The private key generated for an outstanding CSR. Held in memory
+        only until its certificate arrives, then written next to it."""
+        self._last_connection_error: BaseException | None = None
+        if self._ssl_context is not None:
+            self._resume_rotated_identity()
 
         # ==============================================================
         # PHASE C4 — surviving an outage
@@ -637,6 +671,13 @@ class ChargingStation(StationCommands):
         ):
             return False, "no transaction is in progress, so there are no meter values"
 
+        if requested_message == "SignChargingStationCertificate":
+            if not self.config.uses_tls:
+                return False, "certificate rotation needs a TLS (wss://) connection"
+            declared = self.config.supported_algorithms
+            if declared and ROTATION_ALGORITHM not in declared:
+                return False, f"{ROTATION_ALGORITHM} is not among this station's supported algorithms"
+
         self._pending_triggers.append(requested_message)
         self._wake.set()
         return True, f"{requested_message} will be sent shortly"
@@ -651,6 +692,89 @@ class ChargingStation(StationCommands):
     # which, across a fleet, is most of them -- does not perturb the
     # session. That is the "rotate without losing a transaction"
     # guarantee, met by construction rather than by careful sequencing.
+
+    def handle_certificate_signed(
+        self, certificate_chain: str, certificate_type: Any
+    ) -> tuple[bool, str]:
+        """
+        Plan Phase 5 step 3: store the certificate the CSMS signed for the key
+        this station generated, keep the old ECDSA pair as the fallback, and
+        prepare the post-quantum context the next connection will use. The
+        CSMS then closes the socket (step 4); the reconnect is in run().
+
+        Synchronous like every StationCommands method, and transaction-safe:
+        files and a context are prepared; nothing touches the contactor, the
+        meter or the state machine.
+        """
+        from crypto.csr import certificate_common_name, certificate_matches_key, leaf_certificate_pem
+        from agent.tls import build_rotated_context, rotated_cert_paths
+
+        key_pem = self._pending_rotation_key
+        if key_pem is None:
+            return False, "no certificate request is outstanding"
+        try:
+            leaf = leaf_certificate_pem(certificate_chain or "")
+        except Exception as exc:  # noqa: BLE001 - malformed chain = refusal
+            return False, f"certificate chain unreadable: {exc}"
+        if certificate_common_name(leaf) != self.config.station_id:
+            return False, "certificate is not issued to this station"
+        if not certificate_matches_key(leaf, key_pem):
+            return False, "certificate does not match the key this station generated"
+
+        cert_path, key_path = rotated_cert_paths(self.config.station_id, self.config.rotation_dir)
+        cert_path.parent.mkdir(parents=True, exist_ok=True)
+        key_path.write_bytes(key_pem)
+        cert_path.write_bytes(leaf)
+        try:
+            new_context = build_rotated_context(
+                self.config.station_id, self.config.rotation_dir, self._rotation_ca(),
+                check_hostname=self.config.tls_check_hostname,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return False, f"new certificate cannot be used: {exc}"
+
+        self._pending_rotation_key = None
+        old = self._rotation.old_context if self._rotation else self._ssl_context
+        self._rotation = _Rotation(old, new_context, "installed")
+        self.log.info("ROTATION: new %s certificate stored in %s; switching on the next "
+                      "connection (previous certificate kept as fallback)",
+                      ROTATION_ALGORITHM, cert_path.parent)
+        return True, f"{ROTATION_ALGORITHM} certificate installed"
+
+    def _resume_rotated_identity(self) -> None:
+        """
+        A certificate received by an earlier rotation survives a restart
+        (finding F3): if one is on disk and loads, start on it, with the
+        bootstrap certificate kept as the fallback.
+        """
+        from agent.tls import build_rotated_context, rotated_cert_paths
+
+        cert_path, key_path = rotated_cert_paths(self.config.station_id, self.config.rotation_dir)
+        if not (cert_path.is_file() and key_path.is_file()):
+            return
+        try:
+            context = build_rotated_context(
+                self.config.station_id, self.config.rotation_dir, self._rotation_ca(),
+                check_hostname=self.config.tls_check_hostname,
+            )
+        except Exception as exc:  # noqa: BLE001 - unusable -> stay on the bootstrap pair
+            self.log.warning("ROTATION: stored certificate %s not usable (%s); using the "
+                             "bootstrap certificate", cert_path, exc)
+            return
+        self._rotation = _Rotation(self._ssl_context, context, "switching")
+        self._ssl_context = context
+        self.log.info("ROTATION: starting on the %s certificate from an earlier rotation (%s)",
+                      ROTATION_ALGORITHM, cert_path)
+
+    def _rotation_ca(self) -> str:
+        """The trust anchors for the post-quantum server identity: --ca if
+        given (certs/roots_all.pem for a rotating station), else the bundle
+        bootstrap_pki writes next to the classical set."""
+        from pathlib import Path
+
+        if self.config.ca:
+            return self.config.ca
+        return str(Path(self.config.cert_dir) / "roots_all.pem")
 
     def handle_install_pq_auth(self, data: Any) -> tuple[bool, str]:
         """
@@ -734,6 +858,17 @@ class ChargingStation(StationCommands):
                 await self._send_meter_event(
                     client, trigger_reason=msg.TRIGGER_METER_PERIODIC
                 )
+
+            elif requested == "SignChargingStationCertificate":
+                # Plan Phase 5 step 1: the key pair is generated HERE, on the
+                # station; only the CSR leaves it.
+                from crypto.csr import new_station_key_and_csr
+
+                key_pem, csr = new_station_key_and_csr(self.config.station_id)
+                self._pending_rotation_key = key_pem
+                status = await client.send_sign_certificate(csr)
+                if not status.endswith("Accepted"):
+                    self._pending_rotation_key = None
 
     def _next_trigger_reason(self) -> str:
         """
@@ -1246,6 +1381,16 @@ class ChargingStation(StationCommands):
         }
         if self._ssl_context is not None:
             connect_kwargs["ssl"] = self._ssl_context
+            on_pq_identity = (
+                self._rotation is not None
+                and self._rotation.phase in ("switching", "active")
+            ) or cfg.crypto_mode == "pqc"
+            if on_pq_identity and not cfg.tls_server_name:
+                # Ask for the CSMS's post-quantum identity (TLS SNI); without
+                # this the CSMS presents its classical certificate.
+                from crypto.tls_mode import PQ_SERVER_NAME
+
+                connect_kwargs["server_hostname"] = PQ_SERVER_NAME
             if cfg.tls_server_name:
                 # Overrides the name taken from the URL. Needed when the
                 # station dials an IP but the server certificate carries
@@ -1382,6 +1527,13 @@ class ChargingStation(StationCommands):
             self._session_ok = False
             return False
 
+        if self._rotation is not None and self._rotation.phase == "switching":
+            # Plan Phase 5 step 5, station side: the new certificate carried a
+            # whole connection through boot. The old one stays on disk.
+            self._rotation.phase = "active"
+            self.log.info("ROTATION CONFIRMED: connected and booted on the %s certificate",
+                          ROTATION_ALGORITHM)
+
         self._heartbeat_task = asyncio.ensure_future(
             client.heartbeat_loop(interval)
         )
@@ -1457,6 +1609,7 @@ class ChargingStation(StationCommands):
                     )
                     return False
 
+                self._last_connection_error = None
                 try:
                     await self.run_once()
 
@@ -1478,6 +1631,7 @@ class ChargingStation(StationCommands):
                     )
 
                 except ConnectionClosed as exc:
+                    self._last_connection_error = exc
                     self.log.warning(
                         "connection closed: %s", describe_close(exc)
                     )
@@ -1500,6 +1654,7 @@ class ChargingStation(StationCommands):
                     )
 
                 except OSError as exc:
+                    self._last_connection_error = exc
                     # DNS failure, network unreachable, connection reset.
                     # Distinct from "refused" and worth naming: during a
                     # storm these appear when the OS itself runs out of
@@ -1536,6 +1691,10 @@ class ChargingStation(StationCommands):
 
                 if self._session_complete:
                     return self._session_ok
+
+                # -- live certificate rotation: switch, or fall back -----
+                if self._rotation_reconnect_now():
+                    continue
 
                 # -- the connection ended with work still to do --------
                 if self._disconnected_at is None:
@@ -1586,6 +1745,45 @@ class ChargingStation(StationCommands):
                 self.log.info(self.offline_queue.describe())
 
     # -- what happens while nobody is listening ------------------------------
+
+    def _rotation_reconnect_now(self) -> bool:
+        """
+        Decide, after a connection ended, whether live rotation changes the
+        next attempt. True = reconnect immediately (no backoff delay):
+
+          installed -> the CSMS closed the socket after CertificateSigned
+                       (plan step 4): reconnect on the NEW certificate.
+          switching / active -> the new certificate was refused by the CSMS
+                       (close 1008 'certificate refused') or its TLS handshake
+                       failed: fall back to the previous certificate (step 7).
+        A refused TCP connection or an ordinary drop is NOT a reason to fall
+        back -- during an E2 outage a rotated station keeps its new certificate.
+        """
+        import ssl as _ssl
+
+        rotation = self._rotation
+        if rotation is None:
+            return False
+        if rotation.phase == "installed":
+            self._ssl_context = rotation.new_context
+            rotation.phase = "switching"
+            self.log.info("ROTATION: reconnecting now with the new %s certificate", ROTATION_ALGORITHM)
+            return True
+        if rotation.phase in ("switching", "active"):
+            err = self._last_connection_error
+            refused = (
+                isinstance(err, ConnectionClosed)
+                and getattr(getattr(err, "rcvd", None), "code", None) == 1008
+                and "certificate" in (getattr(err.rcvd, "reason", "") or "")
+            )
+            if refused or isinstance(err, _ssl.SSLError):
+                self._ssl_context = rotation.old_context
+                rotation.phase = "fell_back"
+                self.log.warning("ROTATION FALLBACK: the new certificate was %s; reconnecting "
+                                 "now with the previous certificate",
+                                 "refused by the CSMS" if refused else f"rejected in the handshake ({err})")
+                return True
+        return False
 
     async def _wait_offline(self, delay_s: float) -> None:
         """

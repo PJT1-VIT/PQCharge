@@ -77,6 +77,14 @@ from csms.handlers import _safe_payload
 
 LOGGER = logging.getLogger("csms.migration")
 
+MIGRATION_METHODS = ("enrolment", "rotation")
+DEFAULT_MIGRATION_METHOD = "enrolment"
+"""enrolment: Option B (ML-DSA key installed by DataTransfer, then challenged).
+rotation: live certificate rotation (plan Phase 5): the charger makes its own
+ML-DSA key, sends SignCertificate, receives CertificateSigned, the CSMS
+disconnects it and it must return on the new certificate. Needs --tls and the
+post-quantum CA (root.pem + root.key.pem written by bootstrap_pki --algorithm pqc)."""
+
 MIGRATION_MODES = ("auto", "off")
 DEFAULT_MIGRATION_MODE = "auto"
 """auto: build the real orchestrator if the post-quantum library imports,
@@ -364,6 +372,10 @@ def build_migration(
     event_log: Any,
     store: Any,
     failure_threshold: float = DEFAULT_FAILURE_THRESHOLD,
+    method: str = DEFAULT_MIGRATION_METHOD,
+    rotation_ca_dir: str | Path | None = None,
+    certificate_broker: Any = None,
+    close_connection: Callable[..., Any] | None = None,
 ) -> MigrationSetup:
     """
     Build the live migration controller, or a disabled one with a reason.
@@ -406,6 +418,18 @@ def build_migration(
         return MigrationSetup(DisabledController(reason), False, reason)
 
     algorithm = provider.signature_algorithm
+
+    rotation_driver = None
+    if method == "rotation":
+        try:
+            rotation_driver = _build_rotation_driver(
+                provider, dispatcher, rotation_ca_dir, certificate_broker, close_connection
+            )
+        except Exception as exc:  # noqa: BLE001 - say why, never crash the CSMS
+            reason = f"live certificate rotation unavailable ({type(exc).__name__}: {exc})"
+            LOGGER.warning("migration disabled: %s", reason)
+            return MigrationSetup(DisabledController(reason), False, reason)
+
     authenticator = PersistentPQAuthenticator(provider, store, algorithm=algorithm)
     restored = authenticator.restore()
 
@@ -430,6 +454,7 @@ def build_migration(
         # Day 12: a station not connected when its wave runs stays PENDING
         # and is not a failure, instead of rolling back the whole wave.
         skip_offline=True,
+        rotation_driver=rotation_driver,
     )
 
     # Consistency check: a station the database calls MIGRATED but for
@@ -450,6 +475,9 @@ def build_migration(
         )
 
     reason = (
+        f"orchestrator active ({algorithm}, live certificate rotation: "
+        f"SignCertificate -> CertificateSigned -> reconnect, offline stations deferred)"
+        if rotation_driver is not None else
         f"orchestrator active ({algorithm}, {restored} key(s) restored, "
         f"challenge after install, offline stations deferred)"
     )
@@ -462,4 +490,36 @@ def build_migration(
         algorithm=algorithm,
         restored_enrolments=restored,
         failure_threshold=failure_threshold,
+    )
+
+
+def _build_rotation_driver(provider: Any, dispatcher: Any, ca_dir: str | Path | None,
+                           broker: Any, close_connection: Callable[..., Any] | None) -> Any:
+    """Live rotation (plan Phase 5): the post-quantum CA reloaded from the
+    files bootstrap_pki wrote, plus the two OCPP 2.0.1 messages."""
+    from ocpp.v201 import call
+
+    from crypto.ca import CertificateAuthority
+    from idmanager.rotation import CertificateRotationDriver
+
+    if broker is None or close_connection is None:
+        raise ValueError("rotation needs the CSMS's certificate broker and connection closer (--tls)")
+    if ca_dir is None:
+        raise ValueError("rotation needs the post-quantum CA directory (--pq-cert-dir certs/pqc)")
+    ca_dir = Path(ca_dir)
+    root, key = ca_dir / "root.pem", ca_dir / "root.key.pem"
+    if not root.is_file() or not key.is_file():
+        raise ValueError(f"{root} and {key} are needed; run "
+                         f"`python -m experiments.bootstrap_pki --algorithm pqc`")
+    ca = CertificateAuthority.from_files(provider, root.read_bytes(), key.read_bytes())
+    return CertificateRotationDriver(
+        dispatcher=dispatcher,
+        broker=broker,
+        ca=ca,
+        trigger_message_factory=lambda: call.TriggerMessage(
+            requested_message="SignChargingStationCertificate"),
+        certificate_signed_factory=lambda chain: call.CertificateSigned(
+            certificate_chain=chain, certificate_type="ChargingStationCertificate"),
+        close_connection=close_connection,
+        step_timeout_s=dispatcher.timeout_s,
     )

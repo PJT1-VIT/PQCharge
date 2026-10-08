@@ -192,9 +192,9 @@ def test_e4_measures_the_real_classical_certificates_against_the_limits():
 
 
 def test_e4_measures_the_post_quantum_artifacts_and_the_wire_messages():
-    pytest.importorskip("quantcrypt", reason="PQ backend; see requirements.txt")
+    pytest.importorskip("cryptography.hazmat.primitives.asymmetric.mldsa", reason="PQ backend needs cryptography>=50; see requirements.txt")
     rows = {(r["group"], r["label"]): r for r in e4_sizes.measure()["rows"]}
     assert rows[("post-quantum", "Signature")]["bytes"] == 2420      # ML-DSA-44
     assert rows[("post-quantum", "Public key")]["bytes"] == 1312
     install = rows[("on the wire", "InstallPQAuth payload")]["bytes"]
-    assert install > 2560 * 4 // 3, "base64 of a 2560-byte key, inside JSON"
+    assert install > 32 * 4 // 3, "base64 of the 32-byte ML-DSA-44 seed, inside JSON"

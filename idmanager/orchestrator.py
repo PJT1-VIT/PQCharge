@@ -50,6 +50,19 @@ against the wave's failure threshold. Built with skip_offline=True (and a
 fleet that answers is_connected), an offline station is DEFERRED instead:
 left PENDING, excluded from the threshold, and migratable by a later run.
 
+LIVE CERTIFICATE ROTATION (Phase 5 of the Python 3.14 plan):
+Built with rotation_driver (idmanager/rotation.py), each station's transition
+is the original plan's Stage 5 instead of Option B enrolment: the station makes
+its own ML-DSA-44 key, sends a CSR, receives an ML-DSA certificate, is
+disconnected by the CSMS and must come back presenting the NEW certificate.
+One CONNECTION_ATTEMPT (transition="cert_rotation") per station records it.
+Everything else -- capability gate, offline deferral, waves, canary, the
+failure threshold, the counters -- is the same code path. A wave that fails
+its threshold reverts its rotated stations: their new serials are refused and
+they fall back to their ECDSA certificates. Without rotation_driver the
+orchestrator behaves exactly as before (Option B stays available, as the plan
+requires, as the fallback).
+
 WHAT IT DOES NOT DO:
 It never writes per-command dispatch events -- csms/dispatch.py already
 emits MESSAGE_SENT with dispatched=True for every command it sends
@@ -174,6 +187,7 @@ class MigrationOrchestrator(MigrationController):
         challenge_message_factory: ChallengeMessageFactory | None = None,
         signature_parser: SignatureParser | None = None,
         skip_offline: bool = False,
+        rotation_driver: object | None = None,
     ) -> None:
         if (challenge_message_factory is None) != (signature_parser is None):
             raise ValueError(
@@ -192,6 +206,10 @@ class MigrationOrchestrator(MigrationController):
         self._threshold = failure_threshold
         self._dispatch_timeout_s = dispatch_timeout_s
         self._target_algorithm = target_algorithm
+        self._rotation = rotation_driver
+        self._new_serials: dict[str, str | None] = {}
+        """station -> serial issued by rotation in this run, for wave rollback."""
+        self._previous_serials: dict[str, str | None] = {}
 
         self._status: MigrationStatus | None = None
         self._task: asyncio.Task | None = None
@@ -224,9 +242,12 @@ class MigrationOrchestrator(MigrationController):
         self._enrolled_this_run = {}
         self._rollback_requested = set()
 
+        self._new_serials = {}
+        self._previous_serials = {}
         self._emit("migration_started", migration_id=migration_id,
                    target_mode=target_mode, total=len(candidates),
-                   wave_size=wave_size, canary_count=canary_count)
+                   wave_size=wave_size, canary_count=canary_count,
+                   method="cert_rotation" if self._rotation is not None else "pq_enrolment")
 
         self._task = asyncio.ensure_future(
             self._run(candidates, wave_size, canary_count, target_mode)
@@ -370,6 +391,9 @@ class MigrationOrchestrator(MigrationController):
 
         self._fleet.set_state(station_id, MigrationState.IN_PROGRESS, wave_id)
 
+        if self._rotation is not None:
+            return await self._rotate_station(station_id, wave_id)
+
         # Step 1: enrol the new identity FIRST -- overlap window opens.
         private_key, public_key = self._make_keypair()
         self._auth.enrol(station_id, public_key)
@@ -401,6 +425,36 @@ class MigrationOrchestrator(MigrationController):
                 return self._fail_station(station_id, wave_id)
 
         # Step 4: confirmed.
+        self._fleet.set_state(station_id, MigrationState.MIGRATED, wave_id)
+        self._fleet.mark_migrated_algorithm(station_id, self._target_algorithm)
+        return MigrationState.MIGRATED
+
+    async def _rotate_station(self, station_id: str, wave_id: int) -> MigrationState:
+        """
+        Live certificate rotation for one station (plan Phase 5). The overlap
+        invariant holds by construction: the old ECDSA certificate stays valid
+        and the station keeps it until the new one is confirmed in a real
+        handshake, so there is never a moment with no working identity.
+        """
+        outcome = await self._rotation.rotate(station_id)
+        self._emit("connection_attempt", transition="cert_rotation",
+                   station=station_id, wave_id=wave_id,
+                   result="success" if outcome.ok else "rejected",
+                   detail=outcome.detail, step=outcome.step,
+                   duration_ms=outcome.duration_ms,
+                   algorithm=self._target_algorithm,
+                   previous_serial=outcome.previous_serial,
+                   new_serial=outcome.new_serial)
+        if not outcome.ok:
+            self._fleet.set_state(station_id, MigrationState.ROLLED_BACK, wave_id)
+            return MigrationState.ROLLED_BACK
+
+        self._enrolled_this_run[wave_id].append(station_id)
+        self._new_serials[station_id] = outcome.new_serial
+        self._previous_serials[station_id] = outcome.previous_serial
+        record = getattr(self._fleet, "record_certificate", None)
+        if callable(record):
+            record(station_id, outcome.new_serial, outcome.previous_serial)
         self._fleet.set_state(station_id, MigrationState.MIGRATED, wave_id)
         self._fleet.mark_migrated_algorithm(station_id, self._target_algorithm)
         return MigrationState.MIGRATED
@@ -458,8 +512,16 @@ class MigrationOrchestrator(MigrationController):
         self._enrolled_this_run[wave_id] = []
 
     def _unenrol(self, station_id: str) -> None:
-        """Reverse an enrolment. PQAuthenticator.unenrol exists from Day 12;
-        the fallback stays only for authenticators built before it."""
+        """Reverse a station's transition. Rotation: refuse the new
+        certificate and disconnect, so the station falls back to its ECDSA
+        one. Enrolment: un-enrol the key. PQAuthenticator.unenrol exists from
+        Day 12; the fallback stays only for authenticators built before it."""
+        if self._rotation is not None:
+            self._rotation.revert_soon(station_id, self._new_serials.pop(station_id, None))
+            record = getattr(self._fleet, "record_certificate", None)
+            if callable(record) and station_id in self._previous_serials:
+                record(station_id, self._previous_serials.pop(station_id), None)
+            return
         unenrol = getattr(self._auth, "unenrol", None)
         if callable(unenrol):
             unenrol(station_id)

@@ -19,7 +19,7 @@ agent's handler rather than in a one-line script. If the server's
 verify_response returns True over a signature the agent produced from a
 DataTransfer it parsed, the two halves fit.
 
-These need the quantcrypt wheel (crypto/pq.py) and crypto/pq_auth.py. If
+These need cryptography>=50 (crypto/pq.py) and crypto/pq_auth.py. If
 either is absent the module skips, so a machine without the PQ backend
 still runs the rest of the suite.
 """
@@ -31,7 +31,7 @@ import pytest
 # The PQ backend and Track B's authenticator. Skip cleanly if either is
 # not present -- the same importorskip discipline Track B put on its own
 # PQ tests, so the suite stays green on a machine without the wheel.
-pytest.importorskip("quantcrypt", reason="PQ backend; see requirements.txt")
+pytest.importorskip("cryptography.hazmat.primitives.asymmetric.mldsa", reason="PQ backend needs cryptography>=50; see requirements.txt")
 pq = pytest.importorskip("crypto.pq", reason="Track B crypto/pq.py")
 pq_auth = pytest.importorskip("crypto.pq_auth", reason="Track B crypto/pq_auth.py")
 

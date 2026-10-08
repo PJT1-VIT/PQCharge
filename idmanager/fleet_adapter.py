@@ -120,3 +120,25 @@ class FleetAdapter:
             self._fleet.set_identity(identity)
         except KeyError:
             return
+
+    def record_certificate(
+        self,
+        station_id: str,
+        serial: str | None,
+        previous_serial: str | None,
+    ) -> None:
+        """
+        Record a certificate change in Contract 2 (live rotation, Phase 5):
+        certificate_serial becomes the new serial and previous_certificate_serial
+        the one it replaced. On a rollback the orchestrator calls this again
+        with the old serial and previous None. Track B fields only.
+        """
+        identity = self._fleet.get_identity(station_id)
+        if identity is None:
+            return
+        identity.certificate_serial = serial
+        identity.previous_certificate_serial = previous_serial
+        try:
+            self._fleet.set_identity(identity)
+        except KeyError:
+            return

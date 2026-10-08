@@ -140,9 +140,15 @@ def build_station_context(
     key: str | Path | None = None,
     ca: str | Path | None = None,
     check_hostname: bool = True,
+    crypto_mode: str | None = None,
 ) -> ssl.SSLContext:
     """
     This station's TLS context, built by Track A's builder.
+
+    crypto_mode (classical / hybrid / pqc) is checked against this process's
+    OPENSSL_CONF, which is what actually decides the key exchange (see Track B's
+    crypto/tls_mode.py). A mismatch is logged once per process, loudly: a run
+    labelled "pqc" that negotiates X25519 must never be recorded as pqc.
 
     Raises:
         TlsMaterialError: a file is missing, the material does not load,
@@ -184,6 +190,14 @@ def build_station_context(
     except TlsConfigError as exc:
         raise TlsMaterialError(f"station {station_id}: {exc}") from exc
 
+    _warn_once_if_mode_mismatch(crypto_mode)
+    if crypto_mode == "classical":
+        # Keep a classical station classical even in a process whose group
+        # list also allows ML-KEM (a rotation process: tls/rotation.cnf).
+        from crypto.tls_mode import pin_classical_key_exchange
+
+        pin_classical_key_exchange(context)
+
     if not check_hostname:
         # Loud, because switching this off is how a Raspberry Pi SAN
         # problem gets "fixed" at the demo and then silently weakens
@@ -201,6 +215,67 @@ def build_station_context(
         station_id, cert_path, ca_path, check_hostname,
     )
     return context
+
+
+def server_name_for_mode(crypto_mode: str | None) -> str | None:
+    """The TLS server name a station in this mode asks for: the CSMS's
+    post-quantum name for pqc (it then presents its ML-DSA identity), None
+    -- the URL host -- for classical and hybrid."""
+    if crypto_mode != "pqc":
+        return None
+    from crypto.tls_mode import PQ_SERVER_NAME
+
+    return PQ_SERVER_NAME
+
+
+def rotated_cert_paths(station_id: str, rotation_dir: str | Path) -> tuple[Path, Path]:
+    """Where live rotation stores this station's new certificate and key."""
+    directory = Path(rotation_dir)
+    return directory / f"{station_id}{CERT_SUFFIX}", directory / f"{station_id}{KEY_SUFFIX}"
+
+
+def build_rotated_context(
+    station_id: str,
+    rotation_dir: str | Path,
+    ca: str | Path,
+    *,
+    check_hostname: bool = True,
+) -> ssl.SSLContext:
+    """
+    The context a station uses AFTER live certificate rotation: its new
+    post-quantum certificate and the key it generated itself. Key exchange
+    follows the process group list (tls/rotation.cnf puts MLKEM768 first), so
+    the reconnect is fully post-quantum. `ca` must hold the ML-DSA root
+    (certs/roots_all.pem). Raises TlsMaterialError like build_station_context.
+    """
+    from csms.transport import TlsConfigError, build_client_context
+
+    cert_path, key_path = rotated_cert_paths(station_id, rotation_dir)
+    try:
+        context = build_client_context(cert_path, key_path, ca, check_hostname=check_hostname)
+    except TlsConfigError as exc:
+        raise TlsMaterialError(f"station {station_id}: rotated certificate unusable: {exc}") from exc
+    LOG.info("station %s: rotated TLS material loaded (cert=%s ca=%s)", station_id, cert_path, ca)
+    return context
+
+
+_MODE_CHECKED: set[str | None] = set()
+
+
+def _warn_once_if_mode_mismatch(crypto_mode: str | None) -> None:
+    """One warning per process and mode, not one per station: the load
+    generator builds five hundred contexts in one process."""
+    if crypto_mode is None or crypto_mode in _MODE_CHECKED:
+        return
+    _MODE_CHECKED.add(crypto_mode)
+    try:
+        from crypto.tls_mode import check_process_mode
+
+        problem = check_process_mode(crypto_mode)
+    except Exception as exc:  # noqa: BLE001 - a check, never a crash
+        problem = f"could not check the TLS mode configuration: {exc}"
+    if problem:
+        LOG.warning("TLS MODE: %s", problem)
 
 
 def describe_material(

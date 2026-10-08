@@ -46,6 +46,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timezone
+from typing import Any
 
 from ocpp.routing import on
 from ocpp.v201 import ChargePoint as CpBase
@@ -189,8 +190,12 @@ class CSMSHandlers(CpBase):
         log_messages: bool = False,
         auth_policy: AuthorizationPolicy | None = None,
         response_timeout_s: float = DEFAULT_RESPONSE_TIMEOUT_S,
+        certificate_broker: Any = None,
     ) -> None:
         super().__init__(station_id, connection, response_timeout=response_timeout_s)
+        self.certificate_broker = certificate_broker
+        """Track B's idmanager.rotation.RotationBroker when the CSMS runs
+        live certificate rotation; None otherwise."""
         self.registry = registry
         self.event_log = event_log
         self.heartbeat_interval_s = heartbeat_interval_s
@@ -347,6 +352,27 @@ class CSMSHandlers(CpBase):
             interval=self.heartbeat_interval_s,
             status=RegistrationStatusEnumType.accepted,
         )
+
+    # -- SignCertificate (live certificate rotation, plan Phase 5) ---------
+
+    @on("SignCertificate")
+    async def on_sign_certificate(self, csr, certificate_type=None, **kwargs):
+        """
+        A station sends the CSR for the key it just generated itself.
+
+        Accepted only when a rotation asked for it (TriggerMessage from the
+        orchestrator); the certificate itself goes back as a separate
+        CertificateSigned call, sent by the rotation driver -- never from
+        inside this handler (dispatch rule 1). An unsolicited CSR is
+        Rejected: this CSMS issues certificates only as part of a migration.
+        """
+        broker = self.certificate_broker
+        accepted = broker is not None and broker.on_sign_certificate(self.id, csr)
+        self._log_message("SignCertificate", csr_bytes=len(csr or ""),
+                          certificate_type=certificate_type)
+        LOGGER.info("SignCertificate from %s (%d-byte CSR): %s",
+                    self.id, len(csr or ""), "accepted" if accepted else "rejected (not requested)")
+        return call_result.SignCertificate(status="Accepted" if accepted else "Rejected")
 
     # -- Heartbeat -------------------------------------------------------
 

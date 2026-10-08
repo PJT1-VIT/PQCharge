@@ -1,0 +1,17 @@
+# PQCharge TLS mode: server (CSMS): offers every group; each charger's own config decides
+# Use: set OPENSSL_CONF to this file's full path BEFORE starting Python
+#   PowerShell:  $env:OPENSSL_CONF = "$PWD\tls\server.cnf"
+# OpenSSL reads it once, at start-up; it cannot be changed inside a running process.
+# Needs Python 3.14 (OpenSSL >= 3.5). See crypto/tls_mode.py.
+# Pure MLKEM768 is NOT in OpenSSL's default list, so without this file a pqc
+# charger fails with NO_SUITABLE_KEY_SHARE.
+openssl_conf = openssl_init
+
+[openssl_init]
+ssl_conf = ssl_sect
+
+[ssl_sect]
+system_default = sys_default
+
+[sys_default]
+Groups = X25519MLKEM768:X25519:MLKEM768

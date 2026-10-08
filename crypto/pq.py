@@ -4,29 +4,38 @@ establishment.
 
 Implements Contract 1 (CryptoProvider) for mode "pqc".
 
-BACKEND: quantcrypt (PQClean precompiled binaries), NOT liboqs.
-liboqs-python requires building the liboqs C library from source, which needs
-CMake + an MSVC toolchain not present on the Track B Windows machine. quantcrypt
-ships prebuilt PQClean wheels (quantcrypt==1.0.0 has a cp310 win_amd64 wheel),
-installs with no compiler, and implements the same NIST FIPS 203/204 parameter
-sets. Artifact sizes are standard-defined and therefore identical to liboqs
-(verified on this machine: ML-DSA-44 sig 2420 B, ML-KEM-768 ct 1088 B). Because
-everything sits behind Contract 1, the backend is swappable: final E1 *timing*
-numbers may later be produced on a liboqs machine (the Pi, or Track A's Mac)
-without changing this file's interface. Flagged to the team and recorded in
-docs/limitations.md.
+BACKEND: pyca/cryptography >= 50 (OpenSSL), replacing quantcrypt 1.0.0.
 
-TWO PLACES THIS BACKEND DIVERGES FROM Contract 1 / ClassicalProvider, both
-adapted here so callers see a uniform interface:
+History: Day 8 chose quantcrypt (prebuilt PQClean wheels) because liboqs-python
+needed CMake + MSVC, and cryptography 46 had no ML-DSA. quantcrypt has no
+working engine on Python 3.14 (PQAImportError), and cryptography 50 now ships
+ML-DSA-44/65/87 and ML-KEM-768/1024 natively in its prebuilt wheels, on Windows,
+macOS and Linux. Same NIST FIPS 203/204 parameter sets, so the public artifact
+sizes are unchanged (ML-DSA-44 public key 1312 B, signature 2420 B; ML-KEM-768
+public key 1184 B, ciphertext 1088 B, shared secret 32 B). The same library also
+signs ML-DSA X.509 certificates, which quantcrypt could not.
 
-  1. quantcrypt keygen() returns (public, secret) -- PUBLIC FIRST. Contract 1
-     and ClassicalProvider return (private, public). This module SWAPS the order
-     so PQProvider.generate_keypair() returns (private, public) like every other
-     provider. A caller must never see the quantcrypt order.
+PRIVATE KEY REPRESENTATION (changed from quantcrypt):
+  A private key crosses Contract 1 as its FIPS 203/204 SEED:
+    ML-DSA-44 private key = 32-byte seed  (quantcrypt: 2560-byte expanded key)
+    ML-KEM-768 private key = 64-byte seed (quantcrypt: 2400-byte expanded key)
+  The seed is the standard's own compact private-key form: the full key is
+  re-derived from it deterministically, so nothing is lost. cryptography exposes
+  only the seed (private_bytes_raw / from_seed_bytes). Effect outside this file:
+  the InstallPQAuth payload and the E4 "private key" row shrink.
 
-  2. quantcrypt verify() RAISES DSSVerifyFailedError on a bad signature. Contract
-     1 requires verify() to RETURN False and never raise, because Track A treats
-     it as an authentication decision. This module catches and returns False.
+CONTRACT 1 ADAPTATIONS (callers see a uniform interface):
+
+  1. Key order: cryptography returns key OBJECTS; this module returns
+     (private_bytes, public_bytes), the Contract 1 order.
+
+  2. verify(): cryptography RAISES InvalidSignature on a bad signature, and
+     ValueError on malformed key bytes. Contract 1 requires verify() to RETURN
+     False and never raise, because Track A treats it as an authentication
+     decision. This module catches and returns False.
+
+  3. encapsulate(): cryptography already returns (shared_secret, ciphertext),
+     the Contract 1 order -- no swap needed (quantcrypt needed one).
 
 Key material crosses the Contract 1 boundary as raw bytes, exactly as
 ClassicalProvider's does.
@@ -43,31 +52,28 @@ KEM_ALG = "ML-KEM-768"
 class PQProvider(CryptoProvider):
     """
     Pure post-quantum provider (mode "pqc"): ML-DSA-44 + ML-KEM-768 via
-    quantcrypt/PQClean.
+    pyca/cryptography.
 
     Hybrid mode (classical + PQC together) is a separate concern and, if built,
     is its own subclass -- this class is pure PQC only, so a measurement tagged
     "pqc" is unambiguously the post-quantum algorithms alone.
 
-    quantcrypt objects are constructed per call rather than held as instance
-    state: the library's DSS/KEM objects are cheap to make and constructing
-    fresh avoids any hidden per-object state leaking across the CryptoProvider's
-    stateless-by-contract methods.
+    Stateless: every method rebuilds key objects from the bytes it is given,
+    as Contract 1 requires (bytes in, bytes out).
     """
 
     def __init__(self, mode: CryptoMode = "pqc") -> None:
         if mode != "pqc":
             raise ValueError(f"PQProvider serves mode 'pqc', not {mode!r}")
         super().__init__(mode)
-        # Import here, not at module top level, so the rest of the package -- and
-        # every test that does not exercise PQ crypto -- imports without
-        # quantcrypt installed. Matches the deferred-import discipline the
-        # scaffolding established.
-        from quantcrypt.dss import MLDSA_44
-        from quantcrypt.kem import MLKEM_768
+        # Imported here, not at module top level, so that importing this module
+        # never fails on an older cryptography (< 50, no ML-DSA). Constructing
+        # PQProvider() fails loudly instead -- csms/migration.py's startup probe
+        # relies on exactly that to disable migration with a reason.
+        from cryptography.hazmat.primitives.asymmetric import mldsa, mlkem
 
-        self._MLDSA_44 = MLDSA_44
-        self._MLKEM_768 = MLKEM_768
+        self._mldsa = mldsa
+        self._mlkem = mlkem
 
     @property
     def signature_algorithm(self) -> str:
@@ -81,56 +87,55 @@ class PQProvider(CryptoProvider):
 
     def generate_keypair(self) -> tuple[bytes, bytes]:
         """
-        Returns (private_key, public_key) as raw bytes.
-
-        NOTE: quantcrypt's keygen() returns (public, secret). We swap to
-        Contract 1's (private, public) order so callers see the same shape as
-        every other provider.
+        Returns (private_key, public_key) as raw bytes:
+        a 32-byte ML-DSA-44 seed and the 1312-byte public key.
         """
-        public_key, private_key = self._MLDSA_44().keygen()
-        return private_key, public_key
+        key = self._mldsa.MLDSA44PrivateKey.generate()
+        return key.private_bytes_raw(), key.public_key().public_bytes_raw()
 
     def sign(self, private_key: bytes, message: bytes) -> bytes:
-        return self._MLDSA_44().sign(private_key, message)
+        """Sign with the 32-byte seed. Returns the 2420-byte signature."""
+        key = self._mldsa.MLDSA44PrivateKey.from_seed_bytes(private_key)
+        return key.sign(message)
 
     def verify(self, public_key: bytes, message: bytes, signature: bytes) -> bool:
         """
-        Returns True / False. quantcrypt raises DSSVerifyFailedError on a bad
-        signature; Contract 1 requires a bool, so the exception is caught here.
-        Any malformed input also returns False rather than propagating.
+        Returns True / False. cryptography raises InvalidSignature on a bad
+        signature and ValueError on malformed key bytes; Contract 1 requires a
+        bool, so every exception is caught here.
         """
         try:
-            return bool(self._MLDSA_44().verify(public_key, message, signature))
+            key = self._mldsa.MLDSA44PublicKey.from_public_bytes(public_key)
+            key.verify(signature, message)
+            return True
         except Exception:
-            # DSSVerifyFailedError on a bad/forged signature, plus any parse
-            # error on malformed key/signature bytes -- all are "not valid",
-            # never a raised exception, because Track A reads this as an
-            # authentication decision.
+            # InvalidSignature on a bad/forged signature, ValueError on a
+            # malformed key -- all are "not valid", never a raised exception,
+            # because Track A reads this as an authentication decision.
             return False
 
     # -- key establishment (ML-KEM-768) -------------------------------
 
     def generate_kem_keypair(self) -> tuple[bytes, bytes]:
         """
-        Returns (private_key, public_key) as raw bytes -- swapped from
-        quantcrypt's (public, secret) order, as generate_keypair() is.
+        Returns (private_key, public_key) as raw bytes:
+        a 64-byte ML-KEM-768 seed and the 1184-byte public key.
         """
-        public_key, private_key = self._MLKEM_768().keygen()
-        return private_key, public_key
+        key = self._mlkem.MLKEM768PrivateKey.generate()
+        return key.private_bytes_raw(), key.public_key().public_bytes_raw()
 
     def encapsulate(self, public_key: bytes) -> tuple[bytes, bytes]:
         """
-        Returns (shared_secret, ciphertext).
-
-        NOTE: quantcrypt's encaps() returns (ciphertext, shared_secret).
-        Contract 1 (and ClassicalProvider) order it (shared_secret, ciphertext),
-        so we swap. The ciphertext is transmitted to the peer; the shared secret
-        is not.
+        Returns (shared_secret, ciphertext): 32 B and 1088 B.
+        cryptography's encapsulate() already uses this order.
+        The ciphertext is transmitted to the peer; the shared secret is not.
         """
-        ciphertext, shared_secret = self._MLKEM_768().encaps(public_key)
+        key = self._mlkem.MLKEM768PublicKey.from_public_bytes(public_key)
+        shared_secret, ciphertext = key.encapsulate()
         return shared_secret, ciphertext
 
     def decapsulate(self, private_key: bytes, ciphertext: bytes) -> bytes:
         """Recover the shared secret. Identical to the value encapsulate()
         produced on the other side."""
-        return self._MLKEM_768().decaps(private_key, ciphertext)
+        key = self._mlkem.MLKEM768PrivateKey.from_seed_bytes(private_key)
+        return key.decapsulate(ciphertext)

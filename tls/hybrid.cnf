@@ -1,0 +1,17 @@
+# PQCharge TLS mode: hybrid charger: X25519MLKEM768 key exchange, ECDSA certificates
+# Use: set OPENSSL_CONF to this file's full path BEFORE starting Python
+#   PowerShell:  $env:OPENSSL_CONF = "$PWD\tls\hybrid.cnf"
+# OpenSSL reads it once, at start-up; it cannot be changed inside a running process.
+# Needs Python 3.14 (OpenSSL >= 3.5). See crypto/tls_mode.py.
+# SignatureAlgorithms keeps the server from choosing its ML-DSA certificate.
+openssl_conf = openssl_init
+
+[openssl_init]
+ssl_conf = ssl_sect
+
+[ssl_sect]
+system_default = sys_default
+
+[sys_default]
+Groups = X25519MLKEM768
+SignatureAlgorithms = ECDSA+SHA256:ECDSA+SHA384:ECDSA+SHA512

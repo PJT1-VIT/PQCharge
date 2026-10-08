@@ -135,6 +135,9 @@ def build_server_context(
     cafile: str | Path,
     *,
     client_certs: str = DEFAULT_CLIENT_CERT_MODE,
+    extra_identities: tuple[tuple[str | Path, str | Path], ...] = (),
+    extra_cafiles: tuple[str | Path, ...] = (),
+    pq_server_name: str | None = None,
 ) -> ssl.SSLContext:
     """
     The CSMS's TLS context.
@@ -143,6 +146,14 @@ def build_server_context(
         certfile/keyfile: the CSMS's own identity, from Track B's CA.
         cafile: the root that station certificates are verified against.
         client_certs: 'required' for Security Profile 3.
+        extra_identities: further (certfile, keyfile) pairs -- the ML-DSA
+            server certificate. Presented ONLY to a station that asks for the
+            post-quantum server name over TLS SNI (pq_server_name); every
+            other station -- classical, hybrid, legacy -- gets certfile
+            (Phase 4b: one CSMS for a mixed classical / post-quantum fleet).
+        extra_cafiles: further roots station certificates may chain to.
+        pq_server_name: the SNI that selects extra_identities; defaults to
+            Track B's crypto.tls_mode.PQ_SERVER_NAME ("pq.localhost").
 
     Raises:
         TlsConfigError: on an unknown mode, a missing file, or a
@@ -154,10 +165,12 @@ def build_server_context(
             f"expected one of {CLIENT_CERT_MODES}"
         )
 
+    identities = ((certfile, keyfile),) + tuple(extra_identities)
+    cafiles = (cafile,) + tuple(extra_cafiles)
     for label, path in (
-        ("certificate", certfile),
-        ("private key", keyfile),
-        ("CA root", cafile),
+        *(("certificate", c) for c, _ in identities),
+        *(("private key", k) for _, k in identities),
+        *(("CA root", a) for a in cafiles),
     ):
         if not Path(path).is_file():
             raise TlsConfigError(
@@ -165,18 +178,42 @@ def build_server_context(
                 f"`python -m experiments.bootstrap_pki` to generate the PKI."
             )
 
-    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    try:
-        context.load_cert_chain(certfile=str(certfile), keyfile=str(keyfile))
-        context.load_verify_locations(cafile=str(cafile))
-    except ssl.SSLError as exc:
-        raise TlsConfigError(f"could not load TLS material: {exc}") from exc
+    def _context(chain: tuple[tuple[str | Path, str | Path], ...]) -> ssl.SSLContext:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        try:
+            for cert, key in chain:
+                ctx.load_cert_chain(certfile=str(cert), keyfile=str(key))
+            for ca in cafiles:
+                ctx.load_verify_locations(cafile=str(ca))
+        except ssl.SSLError as exc:
+            raise TlsConfigError(f"could not load TLS material: {exc}") from exc
+        ctx.verify_mode = _VERIFY_MODES[client_certs]
+        _install_group_probe(ctx)
+        return ctx
 
-    context.verify_mode = _VERIFY_MODES[client_certs]
+    context = _context(identities[:1])
+    if extra_identities:
+        # The post-quantum identity lives in its own context, switched in by
+        # SNI. A station that does not ask for it never sees it -- so a
+        # classical station stays classical even when its OpenSSL could
+        # verify ML-DSA. Verified: the switched context's handshake callback
+        # (the group probe) is the one that fires.
+        pq_context = _context(tuple(extra_identities))
+        if pq_server_name is None:
+            from crypto.tls_mode import PQ_SERVER_NAME as pq_server_name
+
+        def _select_identity(ssl_object: Any, server_name: str | None, _ctx: Any) -> None:
+            if server_name == pq_server_name:
+                ssl_object.context = pq_context
+
+        context.sni_callback = _select_identity
+        context.pq_context = pq_context  # for tests and diagnostics
 
     LOGGER.info(
         "TLS enabled: cert=%s ca=%s client_certs=%s",
-        certfile, cafile, client_certs,
+        ", ".join(str(c) for c, _ in identities),
+        ", ".join(str(a) for a in cafiles),
+        client_certs,
     )
     if client_certs != "required":
         LOGGER.warning(
@@ -220,7 +257,20 @@ def build_client_context(
         context.load_verify_locations(cafile=str(cafile))
     except ssl.SSLError as exc:
         raise TlsConfigError(f"could not load TLS material: {exc}") from exc
+    _install_group_probe(context)
     return context
+
+
+def _install_group_probe(context: ssl.SSLContext) -> None:
+    """Let describe_connection_security() report the negotiated key-exchange
+    group (Track B's crypto/tls_mode.py; observation only, never changes the
+    handshake). Best effort: a missing probe must not stop the CSMS."""
+    try:
+        from crypto.tls_mode import install_group_probe
+
+        install_group_probe(context)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("negotiated-group probe unavailable: %s", exc)
 
 
 def peer_common_name(peer_cert: dict[str, Any] | None) -> str | None:
@@ -292,12 +342,32 @@ def peer_certificate(connection: Any) -> dict[str, Any] | None:
     return None
 
 
+def peer_certificate_der(connection: Any) -> bytes | None:
+    """The DER bytes of the certificate the station presented, or None.
+    Used by live certificate rotation to read the serial of each connection."""
+    for transport in _ssl_objects(connection):
+        get_extra_info = getattr(transport, "get_extra_info", None)
+        if get_extra_info is None:
+            continue
+        try:
+            ssl_object = get_extra_info("ssl_object")
+            der = ssl_object.getpeercert(binary_form=True) if ssl_object is not None else None
+        except Exception:  # noqa: BLE001 - library internals
+            der = None
+        if der:
+            return der
+    return None
+
+
 def describe_connection_security(connection: Any) -> dict[str, Any]:
     """
     TLS facts about one live connection, for the event log.
 
-    Returns keys tls_version, tls_cipher, peer_cert_bytes and
-    peer_common_name; each is None when unavailable. Empty dict values
+    Returns keys tls_version, tls_cipher, tls_group, peer_cert_bytes,
+    peer_key_type and peer_common_name; each is None when unavailable.
+    tls_group (x25519 / X25519MLKEM768 / MLKEM768) and peer_key_type
+    (ECDSA-P256 / ML-DSA-44) are what make the crypto mode a measured fact
+    rather than a label (Phase 4). Empty dict values
     are never invented -- an absent figure must read as absent, not as
     zero, because a zero certificate size would look like a measurement.
 
@@ -313,7 +383,9 @@ def describe_connection_security(connection: Any) -> dict[str, Any]:
     facts: dict[str, Any] = {
         "tls_version": None,
         "tls_cipher": None,
+        "tls_group": None,
         "peer_cert_bytes": None,
+        "peer_key_type": None,
         "peer_common_name": None,
     }
 
@@ -337,9 +409,17 @@ def describe_connection_security(connection: Any) -> dict[str, Any]:
             facts["tls_cipher"] = cipher[0] if cipher else None
         except Exception:  # noqa: BLE001
             pass
+        der = None
         try:
             der = ssl_object.getpeercert(binary_form=True)
             facts["peer_cert_bytes"] = len(der) if der else None
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            from crypto.tls_mode import certificate_key_type, negotiated_group
+
+            facts["tls_group"] = negotiated_group(ssl_object)
+            facts["peer_key_type"] = certificate_key_type(der)
         except Exception:  # noqa: BLE001
             pass
         break

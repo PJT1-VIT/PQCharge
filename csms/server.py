@@ -76,7 +76,9 @@ from csms.handlers import (
     CSMSHandlers,
 )
 from csms.migration import (
+    DEFAULT_MIGRATION_METHOD,
     DEFAULT_MIGRATION_MODE,
+    MIGRATION_METHODS,
     MIGRATION_MODES,
     SUPPORTED_TARGET_MODES,
     DisabledController,
@@ -104,6 +106,7 @@ from csms.transport import (
     check_identity,
     default_paths,
     describe_connection_security,
+    peer_certificate_der,
 )
 from idmanager.orchestrator import DEFAULT_FAILURE_THRESHOLD
 
@@ -300,6 +303,8 @@ class CSMS:
         fleet_profile: dict[str, list[str]] | None = None,
         fleet_profile_path: str | None = None,
         failure_threshold: float = DEFAULT_FAILURE_THRESHOLD,
+        migration_method: str = DEFAULT_MIGRATION_METHOD,
+        rotation_ca_dir: str | None = None,
     ) -> None:
         self.host = host
         self.port = port
@@ -383,6 +388,15 @@ class CSMS:
                 fleet_profile_path, len(fleet_profile), added, updated,
             )
 
+        self.certificate_broker = None
+        """Track B's RotationBroker when migrating by live certificate
+        rotation (plan Phase 5): sees every TLS connection's certificate and
+        every SignCertificate. None for Option B enrolment."""
+        if migration_method == "rotation" and ssl_context is not None:
+            from idmanager.rotation import RotationBroker
+
+            self.certificate_broker = RotationBroker()
+
         self.migration = build_migration(
             mode=migration_mode,
             registry=self.registry,
@@ -390,9 +404,23 @@ class CSMS:
             event_log=self.log,
             store=self.store,
             failure_threshold=failure_threshold,
+            method=migration_method,
+            rotation_ca_dir=rotation_ca_dir,
+            certificate_broker=self.certificate_broker,
+            close_connection=self.close_station if self.certificate_broker else None,
         )
         self.controller = self.migration.controller
         self.registry.attach_migration_controller(self.controller)
+
+    async def close_station(self, station_id: str, code: int, reason: str) -> None:
+        """Close one station's live connection (live rotation: "the CSMS
+        triggers a reconnect"). No-op when it is not connected."""
+        session = self.registry.get_session(station_id)
+        if session is None:
+            return
+        websocket = getattr(session.connection, "_connection", None)
+        if websocket is not None:
+            await websocket.close(code=code, reason=reason)
 
     # -- OCPP WebSocket side --------------------------------------------
 
@@ -441,6 +469,23 @@ class CSMS:
                 )
                 return
 
+        if self.certificate_broker is not None:
+            # Live rotation: record which certificate this connection uses
+            # (it confirms a rotation), and refuse one that was rolled back
+            # -- the station then falls back to its previous certificate.
+            from idmanager.rotation import CLOSE_CODE_REFUSED, CLOSE_REASON_REFUSED
+
+            if not self.certificate_broker.on_connected(station_id, peer_certificate_der(websocket)):
+                self.log.emit(
+                    EventType.CONNECTION_ATTEMPT,
+                    station_id,
+                    outcome=Outcome.REJECTED,
+                    transition="certificate_refused",
+                    reason="certificate rolled back",
+                )
+                await websocket.close(code=CLOSE_CODE_REFUSED, reason=CLOSE_REASON_REFUSED)
+                return
+
         seen_at_ns = getattr(websocket, CONNECTION_START_ATTR, None)
         setup_ms = (
             (time.monotonic_ns() - seen_at_ns) / 1e6
@@ -462,6 +507,7 @@ class CSMS:
             log_messages=self.log_messages,
             auth_policy=self.auth_policy,
             response_timeout_s=self.response_timeout_s,
+            certificate_broker=self.certificate_broker,
         )
         self.registry.register(
             station_id,
@@ -976,6 +1022,14 @@ def main() -> None:
     parser.add_argument("--key", default=None, help="server private key PEM")
     parser.add_argument("--ca", default=None, help="CA root PEM")
     parser.add_argument(
+        "--pq-cert-dir",
+        default=None,
+        help="also load the post-quantum (ML-DSA) server identity and root from "
+             "this directory (e.g. certs/pqc), so ONE CSMS accepts classical and "
+             "post-quantum chargers. Start the process with "
+             "OPENSSL_CONF=tls/server.cnf so every key-exchange group is offered",
+    )
+    parser.add_argument(
         "--tls-client-certs",
         default=DEFAULT_CLIENT_CERT_MODE,
         choices=CLIENT_CERT_MODES,
@@ -1007,6 +1061,15 @@ def main() -> None:
              "library is installed, otherwise starts with migration disabled "
              "and says why. 'off' never loads post-quantum code (classical "
              "baselines)",
+    )
+    parser.add_argument(
+        "--migration-method",
+        default=DEFAULT_MIGRATION_METHOD,
+        choices=MIGRATION_METHODS,
+        help="'enrolment': Option B (ML-DSA key installed + challenged). "
+             "'rotation': live certificate rotation -- each charger makes its own "
+             "ML-DSA key, SignCertificate -> CertificateSigned, reconnects on the "
+             "new certificate. Needs --tls and --pq-cert-dir",
     )
     parser.add_argument(
         "--fleet-profile",
@@ -1043,15 +1106,31 @@ def main() -> None:
     ssl_context = None
     if args.tls:
         cert, key, ca = default_paths(args.cert_dir, DEFAULT_SERVER_NAME)
+        extra_identities: tuple = ()
+        extra_cafiles: tuple = ()
+        if args.pq_cert_dir:
+            pq_cert, pq_key, pq_ca = default_paths(args.pq_cert_dir, DEFAULT_SERVER_NAME)
+            extra_identities = ((pq_cert, pq_key),)
+            extra_cafiles = (pq_ca,)
         try:
             ssl_context = build_server_context(
                 args.cert or cert,
                 args.key or key,
                 args.ca or ca,
                 client_certs=args.tls_client_certs,
+                extra_identities=extra_identities,
+                extra_cafiles=extra_cafiles,
             )
         except TlsConfigError as exc:
             parser.error(str(exc))
+        try:
+            from crypto.tls_mode import check_process_mode
+
+            problem = check_process_mode(None, server=True)
+        except Exception as exc:  # noqa: BLE001
+            problem = f"could not check the TLS mode configuration: {exc}"
+        if problem:
+            LOGGER.warning("TLS MODE: %s", problem)
 
     auth_policy = (
         AuthorizationPolicy.from_file(args.id_tokens, mode=args.auth_mode)
@@ -1079,6 +1158,8 @@ def main() -> None:
         fleet_profile=fleet_profile,
         fleet_profile_path=args.fleet_profile,
         failure_threshold=args.migration_failure_threshold,
+        migration_method=args.migration_method,
+        rotation_ca_dir=args.pq_cert_dir,
     )
     try:
         asyncio.run(csms.run())

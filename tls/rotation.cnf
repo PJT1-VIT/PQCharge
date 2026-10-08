@@ -1,0 +1,18 @@
+# PQCharge TLS mode: rotating charger: classical (X25519 + ECDSA) until its certificate is rotated, then pqc (MLKEM768 + ML-DSA-44), in one process
+# Use: set OPENSSL_CONF to this file's full path BEFORE starting Python
+#   PowerShell:  $env:OPENSSL_CONF = "$PWD\tls\rotation.cnf"
+# OpenSSL reads it once, at start-up; it cannot be changed inside a running process.
+# Needs Python 3.14 (OpenSSL >= 3.5). See crypto/tls_mode.py.
+
+openssl_conf = openssl_init
+
+[openssl_init]
+ssl_conf = ssl_sect
+
+[ssl_sect]
+system_default = sys_default
+
+[sys_default]
+# Classical connections pin X25519 in code (crypto/tls_mode.pin_classical_key_exchange);
+# the post-rotation connection uses this list, so MLKEM768 comes first.
+Groups = MLKEM768:X25519MLKEM768:X25519

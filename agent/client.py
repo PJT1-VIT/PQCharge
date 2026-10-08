@@ -223,6 +223,11 @@ class StationCommands:
 
     # -- Phase C8: the post-quantum migration path (Option B) --------------
 
+    def handle_certificate_signed(
+        self, certificate_chain: str, certificate_type: Any
+    ) -> tuple[bool, str]:
+        return False, "this station does not support certificate rotation"
+
     def handle_install_pq_auth(self, data: Any) -> tuple[bool, str]:
         """The orchestrator is installing this station's ML-DSA key."""
         return False, "no station is attached to this connection"
@@ -410,6 +415,19 @@ class StationClient(CpBase):
             status, interval,
         )
         return BootResult(status, interval)
+
+    # -- SignCertificate (live certificate rotation, plan Phase 5) ------------
+
+    async def send_sign_certificate(self, csr: str) -> str:
+        """Send the CSR for a key this station just generated. Returns the
+        CSMS's status (Accepted / Rejected)."""
+        response = await self._call(
+            call.SignCertificate(csr=csr, certificate_type="ChargingStationCertificate"),
+            "SignCertificate",
+        )
+        status = getattr(response, "status", None)
+        self.log.info("SignCertificate (%d-byte CSR) -> %s", len(csr), status)
+        return str(status)
 
     # -- Heartbeat -----------------------------------------------------------
 
@@ -802,6 +820,32 @@ class StationClient(CpBase):
             return call_result.TriggerMessage(status="Accepted")
         return call_result.TriggerMessage(
             status="NotImplemented", status_info=self._status_info(reason)
+        )
+
+    # -- CertificateSigned (live certificate rotation, plan Phase 5) --------
+
+    @on("CertificateSigned")
+    async def on_certificate_signed(
+        self, certificate_chain: str = "", certificate_type: Any = None, **kwargs: Any
+    ):
+        """
+        The CSMS returns the certificate for the CSR this station sent.
+
+        Accepted only if it carries the public half of the key this station
+        generated (and its own id); the station then stores it and will use it
+        from the next connection. Rejected otherwise -- the station keeps its
+        current certificate. OCPP 2.0.1 CertificateSignedStatusEnum.
+        """
+        accepted, reason = self._decide(
+            "CertificateSigned",
+            self.commands.handle_certificate_signed,
+            certificate_chain,
+            certificate_type,
+        )
+        if accepted:
+            return call_result.CertificateSigned(status="Accepted")
+        return call_result.CertificateSigned(
+            status="Rejected", status_info=self._status_info(reason)
         )
 
     # -- DataTransfer: the post-quantum migration channel (Phase C8) --------
