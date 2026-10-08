@@ -1,6 +1,6 @@
 # PQCharge — Open Items and Limitations
 
-**The single register of everything not yet resolved.** Started 2026-10-03, after the A+B+C integration. **Updated 2026-10-08:** every team item is agreed by A, B and C; L03 is decided; Contract 7 has been proposed (L18).
+**The single register of everything not yet resolved.** Started 2026-10-03, after the A+B+C integration. **Updated 2026-10-08:** every team item is agreed by A, B and C. **Contract 7 is frozen** (approved by A, B, C), so L03 (meaning of the modes) and L18 (contract approval) are resolved and removed.
 
 ## Rules (all three tracks)
 
@@ -30,7 +30,6 @@ Old numbers (F1, F13, F14, R11, …) differed between the dev plans; F14 meant t
 |---|---|---|---|---|
 | **L01** | **The server makes every charger's private key and sends it over the network.** The charger keeps it in memory only, so a restart loses it. *(old: F2+F3, A-F13, B-F13)* | **Agreed (A, B, C)** | The charger generates its own ML-DSA key, sends **only the public key**, and saves the private key in `certs/pq/<id>.json` (ignored by git). **Specified in Contract 7 §7.2–7.4.** | B (orchestrator install step), C (`agent/pqc_messages.py`, `agent/pq_identity.py`); A reviews |
 | **L02** | **The security mode is only a label.** The key is checked once, at migration, so "classical" and "post-quantum" chargers connect in exactly the same way. E1/E2 would compare identical things. *(old: F1, A-8)* | **Agreed (A, B, C)** | The server challenges every migrated charger after **each** accepted boot (Track A's boot listener); a failed check **closes the connection** (code 1008). **Specified in Contract 7 §7.5–7.7.** **E2 "recovered" in post-quantum mode = connected + boot accepted + key check passed.** **Presentation:** the migration must be visibly obvious to the panel (dashboard migration timeline, live ticker of waves and key checks, a readable console view). | A (boot hook, recovered rule), B (challenge on boot), C (agent; display) |
-| **L03** | **The three security modes need a real meaning.** *(old: F5)* | **Decided (A, B, C), 2026-10-08** | **classical** = classical TLS; **hybrid** = classical TLS + the ML-DSA key check at every boot; **pure PQC** (`pqc`) = post-quantum TLS via liboqs, with **no** extra key check. E2 stays 12 runs (4 sizes × 3 modes). Defined in Contract 7 §7.1. `pqc` details wait for L17. Remove this item once Contract 7 is frozen (L18). | B leads, with C |
 
 ## 2. Agreed fixes, not yet done
 
@@ -65,7 +64,6 @@ Old numbers (F1, F13, F14, R11, …) differed between the dev plans; F14 meant t
 | No. | Finding | Status | Action | Owner |
 |---|---|---|---|---|
 | **L17** | **Pure PQC may not run in Windows Python.** Our design record (`docs/limitations.md` R3) and Track B's plan say liboqs's OpenSSL provider does not load into Windows CPython. Pure-PQC runs may then need Linux (WSL or the Pi), a different platform from the other two modes, which affects the fairness of E1/E2. **Not yet tested with Python 3.13 / current OpenSSL.** | Not decided | *Recommended:* Track B runs a timeboxed test (2 days, as the design document's original transport decision did). On Windows: does Python 3.13's `ssl` load the oqs provider (or a native ML-KEM/ML-DSA OpenSSL)? If not, what works on WSL/Linux? Then decide where **all three** modes run, so the comparison stays like for like. Contract 7 v2 then fixes `pqc`. | B leads; A, C |
-| **L18** | **Contract 7 v1 (security modes, charger-made keys, key check at every boot) is proposed, not yet frozen.** | Proposed (Track C) | Tracks A and B review `PQCharge_Interface_Contracts.md` → Contract 7 and tick their approval box. Track C builds only the parts that need no other track (see Track C plan) until then. | A, B |
 | **L19** | **Charger key files cannot be locked down on Windows** (no `chmod 0600`). | Proposed (accepted limitation) | State it in the report. Simulated chargers only; the Pi (Linux) uses mode 0600. | C |
 
 ## 5. Accepted limitations (stay in the report)
@@ -91,5 +89,7 @@ Old numbers (F1, F13, F14, R11, …) differed between the dev plans; F14 meant t
 | Agent connection timer | PR #26 |
 | Stubs | PR #23 |
 | Server logs in evidence | PR #25 |
+| L03 (meaning of the three modes) | Contract 7 §7.1, frozen 2026-10-08 |
+| L18 (Contract 7 approval) | approved by A, B, C, 2026-10-08 |
 
 **Note:** `docs/limitations.md` R4 ("certificates carry no SAN") is out of date: the SAN mechanism was merged (Track B R2). Track B should update it.
