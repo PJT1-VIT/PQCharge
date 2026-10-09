@@ -823,11 +823,16 @@ def _watch_ssl_context(config: AgentConfig, station_id: str) -> ssl.SSLContext |
     Track A's preferred answer is an "operator" certificate issued by
     Track B's CA. Until that exists, the watcher borrows a station's
     certificate, which WORKS and is NOT RIGHT: the operator console is
-    an identity of its own, and once `--tls-identity-check enforce` is
-    on, a poll presenting CP0001's certificate from something that is
-    not CP0001 is exactly the impersonation the check exists to catch.
+    an identity of its own.
 
-    So it is loud, and it names the fix.
+    Corrected 2026-10-09 (L08, verified by Track B): the identity check
+    runs only in the WebSocket handler, and `/api/` is answered before
+    it, so this poll is NOT refused even under `--tls-identity-check
+    enforce`. That is the problem L08 records: any CA-signed charger
+    certificate opens every `/api` endpoint.
+
+    So it is loud, and it names the fix. Also used by
+    harness/watch_migration.py (C-P5).
     """
     if not config.uses_tls:
         return None
@@ -837,8 +842,9 @@ def _watch_ssl_context(config: AgentConfig, station_id: str) -> ssl.SSLContext |
     get_logger(__name__).warning(
         "fleet watcher is presenting station %s's certificate to poll /api/. "
         "This is a STAND-IN for the operator certificate Track A requested "
-        "from Track B (their §9.1). It will be refused once "
-        "--tls-identity-check is set to enforce.", station_id,
+        "from Track B (L08). /api is not identity-checked, so this works "
+        "even under --tls-identity-check enforce; that is the gap L08 records.",
+        station_id,
     )
     return build_station_context(
         station_id,
@@ -940,6 +946,7 @@ async def main_async(args: argparse.Namespace, config: AgentConfig) -> int:
             python=sys.version.split()[0],
             platform=sys.platform,
             pq_warmup_ms=pq_warmup_ms,
+            watch_machine=bool(args.watch_machine),
         )
         log.sync()
 
@@ -947,6 +954,7 @@ async def main_async(args: argparse.Namespace, config: AgentConfig) -> int:
         storm_task: asyncio.Task | None = None
         watcher: FleetWatcher | None = None
         watcher_task: asyncio.Task | None = None
+        machine_task: asyncio.Task | None = None
 
         try:
             if args.server_cmd:
@@ -964,6 +972,22 @@ async def main_async(args: argparse.Namespace, config: AgentConfig) -> int:
                     ssl_context=_watch_ssl_context(config, spec.station_ids()[0]),
                 )
                 watcher_task = asyncio.ensure_future(watcher.run())
+
+            if args.watch_machine:
+                # C-P6 (S1): is the laptop the bottleneck? See harness/machine.py.
+                from harness.machine import MachineWatcher
+
+                machine = MachineWatcher(
+                    log,
+                    interval_s=args.watch_machine_every,
+                    server_pid=args.server_pid,
+                    server_pid_fn=(
+                        (lambda: supervisor.process.pid
+                         if supervisor is not None and supervisor.process is not None else None)
+                        if supervisor is not None else None
+                    ),
+                )
+                machine_task = asyncio.ensure_future(machine.run())
 
             if args.storm_at is not None and supervisor is not None:
                 storm_task = asyncio.ensure_future(
@@ -985,7 +1009,7 @@ async def main_async(args: argparse.Namespace, config: AgentConfig) -> int:
             result = await runner.run(watcher=watcher, storm=storm_task)
 
         finally:
-            for task in (watcher_task, storm_task):
+            for task in (watcher_task, storm_task, machine_task):
                 if task is not None and not task.done():
                     task.cancel()
                     with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -1061,6 +1085,14 @@ def build_parser() -> argparse.ArgumentParser:
     watch.add_argument("--watch-fleet", default=None,
                        help="poll this /api/fleet URL and record each snapshot")
     watch.add_argument("--watch-every", type=float, default=1.0)
+    # C-P6 (S1): machine readings. Needs psutil (requirements.txt).
+    watch.add_argument("--watch-machine", action="store_true",
+                       help="record CPU, memory and event-loop lag once per "
+                            "interval (machine_sample lines); needs psutil")
+    watch.add_argument("--watch-machine-every", type=float, default=1.0)
+    watch.add_argument("--server-pid", type=int, default=None,
+                       help="the CSMS process to sample with --watch-machine "
+                            "(default: found automatically, 'python -m csms.server')")
 
     # Every agent flag, so the fleet is configured exactly as one station
     # would be. --station-id is accepted and ignored; the ids come from

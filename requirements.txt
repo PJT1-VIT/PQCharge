@@ -8,6 +8,9 @@ cryptography>=42.0.0
 # Data modelling for contracts
 pydantic>=2.6.0
 
+# Test-machine readings for S1 (harness/machine.py, --watch-machine)
+psutil>=5.9
+
 # Testing
 pytest>=8.0.0
 pytest-asyncio>=0.23.0

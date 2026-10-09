@@ -90,8 +90,10 @@ def check_diary(diary: ServerDiary) -> dict[str, Any]:
 
 
 def check_run(run: MatchedRun, overview: dict[str, Any], e1: dict[str, Any],
-              e3: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Checks on one matched run. `e3` adds the migration checks (C6.1)."""
+              e3: dict[str, Any] | None = None, *,
+              machine: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Checks on one matched run. `e3` adds the migration checks (C6.1);
+    `machine` the laptop-saturation check (C-P6)."""
     h: HarnessRun = run.harness
     issues: list[dict[str, str]] = []
     st = overview["stations"]
@@ -164,6 +166,16 @@ def check_run(run: MatchedRun, overview: dict[str, Any], e1: dict[str, Any],
         issues.append(_issue("warn", "no_station_side_timing", text))
 
     issues.extend(_contract7_issues(run, e1, e3))
+
+    # C-P6 (S1): an overloaded laptop makes every time in the run longer.
+    if machine is not None and machine.get("saturated"):
+        issues.append(_issue(
+            "warn", "machine_saturated",
+            "The test laptop was saturated during this run ("
+            + "; ".join(machine.get("saturation_reasons") or []) + "). Times measured in "
+            "this run may reflect the laptop, not the protocol: use fewer chargers per "
+            "machine, or report it as a limit of the test set-up.",
+        ))
 
     if e3 is not None:
         issues.extend(_migration_issues(e3))

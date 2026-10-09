@@ -17,7 +17,7 @@ load-generator run. Rebuilt from the diaries every time, so deleting it loses no
 | `diary_check` | `{status, issues[]}` for the server diary as a whole. |
 | `slot_order` | Slot keys in display order. |
 | `slots` | `{slot_key: slot}` — one per test setup, newest run wins. |
-| `comparisons` | Cross-run series: `e1_vs_n`, `e2_vs_n`, `overhead_vs_classical` (connection time); **v3:** `ready_vs_n`, `ready_overhead_vs_classical` (`ready_ms`, with `basis` and `added_median_ms`). |
+| `comparisons` | Cross-run series: `e1_vs_n`, `e2_vs_n`, `overhead_vs_classical` (connection time); **v3:** `ready_vs_n`, `ready_overhead_vs_classical` (`ready_ms`, with `basis` and `added_median_ms`). **C-P6 (S1, additive):** `machine_vs_n` — per series, one row per run: `n`, `cpu_p95`, `loop_lag_p95`, `tester_cpu_p95`, `tester_rss_mb_max`, `server_cpu_p95`, `server_rss_mb_max`, `saturated`. |
 | `e4` | `{limits, rows[], notes[]}` — artifact sizes (not tied to a run). |
 | `external_nodes` | Chargers the tester did not start: the Pi (`kind: "hardware"`, CP0100) and E6 clients. Each has `energy_source: "charger-reported"` (never add it to a fleet total), `pq_auth` (last key-check result) and `deferred`. |
 
@@ -36,6 +36,7 @@ Key: `experiment|n<N>|<mode>|tls` or `...|plain` — e.g. `e2|n500|pqc|tls`.
 | `e2` | `null` unless the server restarted in the run. Else `t50_s`, `t95_s`, `t100_s` (`null` = never reached), `population`, `recovered`, `unrecovered`, `curve`, `snapshot_curve`, `integrity{...}`. **v3:** `recovery_rule` (`boot` / `boot + key check`), `recovered_definition`, `key_checked_population`, `boot_checks_failed_after_restart`, `booted_but_key_check_not_passed[]` (Contract 7 §7.7). |
 | `e3` | `null` unless a migration happened. Else, for the **whole fleet**: `final_counts`, `state_timeline{state: [[s, count]]}`, `fleet_size`, `tester_chargers`; the controller's own `controller_counts` and `controller_sum_violations`; `waves[]`, `markers[]`, `rollbacks`, `manual_rollbacks`, `failures[]`, `duration_s`, `phase`; `verification` (`authenticated` / `key installed (not authenticated)` / `partly authenticated` / `nothing migrated`); `pq_checks{total, passed, rejected, rejections[], algorithm, round_trip_ms, first_per_charger_ms, later_ms}`; `deferred{count, station_ids}`; `agent_view{available, migrated_but_no_key[]}`; `charging{...}` (tester's chargers). **v3:** `pq_checks` counts `trigger: "migration"` only (no trigger = migration); `boot_checks{total, passed, rejected, round_trip_ms}`; `pq_enrolled{count, key_ids{}}`; `keys_at_start{known, count, station_ids[]}`. |
 | `e5` | `identity_checks`, `identity_rejected`, `identity_mismatches` (let in by `warn` mode), `identity_mode`, `identity_rejections[]`, `pq_checks`, `pq_passed`, `pq_rejected`, `pq_rejections[]` (v3: each with `trigger`), `connection_failures{}`, `callerrors`, `commands_received`. **v3:** `pq_by_trigger{migration, boot}` (each `{checks, passed, rejected}`), `pq_cut_off`, `pq_cut_off_ids[]` (closed with reason `pq_auth_failed`). |
+| `machine` | **C-P6 (S1, additive; `null` without `--watch-machine`).** `samples`, `cpu_count`, `cpu_pct`, `mem_pct`, `loop_lag_ms` (each `{n, median, p95, max}`, not a full distribution), `mem_used_mb_max`, `tester{cpu_pct, rss_mb_max, threads_max}`, `server{found, samples, cpu_pct, rss_mb_max, threads_max}`, `timeline{cpu_pct, loop_lag_ms, tester_cpu_pct, server_cpu_pct, tester_rss_mb}` as `[[s, value]]`, `limits{cpu_p95_pct: 85, loop_lag_p95_ms: 50}`, `saturated`, `saturation_reasons[]`. Tester/server CPU is % of ONE core. |
 
 ## A distribution
 
@@ -70,3 +71,5 @@ box: {whisker_low, q1, median, q3, whisker_high, outliers[]}, ecdf: [[value, per
   `reason: "pq_auth_failed"`; every line's `crypto_mode` (compared with the tester's mode).
 - New trust checks: `mode_mismatch` (warn), `started_with_saved_keys` (warn in a migration
   run, else info), `hybrid_without_boot_checks` (warn).
+- C-P6: `machine_saturated` (warn) when machine CPU p95 > 85 % or tester loop lag p95 > 50 ms.
+  `machine` and `machine_vs_n` are additive, so the format stays v3.

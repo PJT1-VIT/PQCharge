@@ -43,7 +43,8 @@ from typing import Any
 
 from analysis import check, collect, match, store
 from analysis.measures import (
-    compare, e1_handshake, e2_storm, e3_migration, e4_sizes, e5_security, e6_nodes, overview,
+    compare, e1_handshake, e2_storm, e3_migration, e4_sizes, e5_security, e6_nodes, machine,
+    overview,
 )
 
 LOG = logging.getLogger("analysis")
@@ -66,7 +67,8 @@ def analyse_run(matched: match.MatchedRun) -> dict[str, Any]:
     ov = overview.measure(matched)
     e1 = e1_handshake.measure(matched)
     e3 = e3_migration.measure(matched)
-    trust = check.check_run(matched, ov, e1, e3)
+    mach = machine.measure(matched)         # C-P6 (S1); None without --watch-machine
+    trust = check.check_run(matched, ov, e1, e3, machine=mach)
     return {
         "key": store.slot_key(h.experiment, h.n_stations, h.crypto_mode, h.tls),
         "experiment": h.experiment,
@@ -87,6 +89,7 @@ def analyse_run(matched: match.MatchedRun) -> dict[str, Any]:
         "e2": e2_storm.measure(matched),
         "e3": e3,
         "e5": e5_security.measure(matched),
+        "machine": mach,
     }
 
 
@@ -206,7 +209,13 @@ def summary(results: dict[str, Any]) -> str:
             mig = (f"  migration: {fc['migrated']} migrated / {fc['rolled_back']} rolled back / "
                    f"{fc['incompatible']} incompatible / {fc['pending']} pending"
                    f" -- {e3['verification']}, {e3['pq_checks']['passed']} key check(s) passed")
-        lines.append(f"  {key:<32} trust={s['trust']['status']:<5} connect median={med}{storm}{mig}")
+        m = s.get("machine")
+        mach = ""
+        if m:
+            mach = (f"  machine: CPU p95 {m['cpu_pct'].get('p95') or 0:.0f}%, loop lag p95 "
+                    f"{m['loop_lag_ms'].get('p95') or 0:.1f} ms"
+                    + (" -- SATURATED" if m.get("saturated") else ""))
+        lines.append(f"  {key:<32} trust={s['trust']['status']:<5} connect median={med}{storm}{mig}{mach}")
     if results["external_nodes"]:
         lines.append("chargers not started by the tester: "
                      + ", ".join(n["station_id"] for n in results["external_nodes"]))

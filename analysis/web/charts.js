@@ -246,7 +246,7 @@
       '<div class="grid two">' +
       '<div class="card"><h3>Chargers connected and charging</h3><p class="sub">Counted from the server diary, second by second</p><div class="chart" id="cConn"></div></div>' +
       '<div class="card"><h3>Fleet power</h3><p class="sub">Sum of the latest accepted meter readings (kW); a disconnected charger stops counting</p><div class="chart" id="cPower"></div></div>' +
-      "</div>";
+      "</div>" + machineCard(s);
 
     var tl = ov.timeline;
     mount(document.getElementById("cConn"), function (p) {
@@ -272,6 +272,103 @@
         { step: "end", areaStyle: { color: p.alt, opacity: 0.12 } })];
       return o;
     });
+    mountMachine(s);
+  }
+
+  // ------------------------------------------------- machine (C-P6, S1)
+
+  function machineCard(s) {
+    var m = s.machine;
+    if (!m) return "";
+    var sv = m.server || {};
+    return '<div class="card" style="margin-top:16px"><h3>Test machine</h3><p class="sub">' +
+      "Recorded once a second with <code>--watch-machine</code>. If the laptop is overloaded, every time in this run is " +
+      "partly the laptop's cost. Loop lag = how late a 1 s timer fired inside the tester (all chargers share it).</p>" +
+      (m.saturated ? '<div class="banner">' + badge("warn") + " Saturated: " + esc(m.saturation_reasons.join("; ")) + "</div>" : "") +
+      '<div class="tiles">' +
+      tile("Machine CPU (p95)", isNum(m.cpu_pct.p95) ? fmt(m.cpu_pct.p95, 0) + "%" : "—",
+        "limit " + fmt(m.limits.cpu_p95_pct, 0) + "% · max " + (isNum(m.cpu_pct.max) ? fmt(m.cpu_pct.max, 0) + "%" : "—")) +
+      tile("Loop lag (p95)", ms(m.loop_lag_ms.p95), "limit " + ms(m.limits.loop_lag_p95_ms) + " · max " + ms(m.loop_lag_ms.max)) +
+      tile("Memory (max)", isNum(m.mem_pct.max) ? fmt(m.mem_pct.max, 0) + "%" : "—", fmt(m.mem_used_mb_max, 0) + " MB in use") +
+      tile("Tester process", isNum(m.tester.cpu_pct.p95) ? fmt(m.tester.cpu_pct.p95, 0) + "% CPU" : "—",
+        "p95, % of one core · " + fmt(m.tester.rss_mb_max, 0) + " MB") +
+      tile("Server process", sv.found && isNum((sv.cpu_pct || {}).p95) ? fmt(sv.cpu_pct.p95, 0) + "% CPU" : "not found",
+        sv.found ? "p95, % of one core · " + fmt(sv.rss_mb_max, 0) + " MB" : "ran elsewhere, or not running") +
+      "</div>" +
+      '<div class="chart" id="cMachine"></div></div>';
+  }
+
+  function mountMachine(s) {
+    var m = s.machine, el = document.getElementById("cMachine");
+    if (!m || !el) return;
+    mount(el, function (p) {
+      var o = base(p, "machine_" + s.key.replace(/\|/g, "_"));
+      o.tooltip.trigger = "axis";
+      o.tooltip.axisPointer = { type: "line", lineStyle: { color: p.axis } };
+      o.xAxis = valueAxis(p, "Seconds since the run started", { splitLine: { show: false } });
+      o.yAxis = [valueAxis(p, "CPU (%)", { max: 100 }), valueAxis(p, "Loop lag (ms)", { splitLine: { show: false } })];
+      o.series = [
+        line("Machine CPU %", p.alt, m.timeline.cpu_pct, {}),
+        line("Loop lag (ms)", p.status.warning, m.timeline.loop_lag_ms, { yAxisIndex: 1 })
+      ];
+      return o;
+    });
+  }
+
+  function renderS1(root) {
+    var cmp = (DATA.comparisons || {}).machine_vs_n || {};
+    var names = Object.keys(cmp);
+    var head = '<section id="s1"><h2>S1 · Scale test</h2><p class="lede">Can one laptop run the fleet without ' +
+      "becoming the bottleneck? Each point is one run recorded with <code>--watch-machine</code>. Above the dashed " +
+      "limits (CPU p95 85%, loop lag p95 50 ms) the run's times are partly the laptop's cost.</p>";
+    if (!names.length) {
+      root.insertAdjacentHTML("beforeend", head + empty(
+        "No run with machine readings yet. Run, for example: <code>python -m harness.load_generator --n 500 " +
+        "--experiment s1 --csms-url ws://localhost:9000 --watch-fleet http://localhost:9000/api/fleet " +
+        "--watch-machine --charge-for 120 --pq-key-dir none</code>") + "</section>");
+      return;
+    }
+    var html = head +
+      '<div class="grid two"><div class="card"><h3>Machine CPU (p95) against fleet size</h3><div class="chart" id="cS1cpu"></div></div>' +
+      '<div class="card"><h3>Tester loop lag (p95) against fleet size</h3><div class="chart" id="cS1lag"></div></div></div>' +
+      '<div class="card" style="margin-top:16px"><h3>Numbers</h3>' +
+      table([{ t: "Series" }, { t: "Chargers", num: true }, { t: "CPU p95", num: true }, { t: "Loop lag p95", num: true },
+             { t: "Tester CPU p95", num: true }, { t: "Tester memory", num: true }, { t: "Server CPU p95", num: true },
+             { t: "Server memory", num: true }, { t: "Saturated" }],
+        [].concat.apply([], names.map(function (name) {
+          return cmp[name].map(function (r) {
+            return [esc(name), int(r.n), isNum(r.cpu_p95) ? fmt(r.cpu_p95, 0) + "%" : "—", ms(r.loop_lag_p95),
+              isNum(r.tester_cpu_p95) ? fmt(r.tester_cpu_p95, 0) + "%" : "—",
+              isNum(r.tester_rss_mb_max) ? fmt(r.tester_rss_mb_max, 0) + " MB" : "—",
+              isNum(r.server_cpu_p95) ? fmt(r.server_cpu_p95, 0) + "%" : "—",
+              isNum(r.server_rss_mb_max) ? fmt(r.server_rss_mb_max, 0) + " MB" : "—",
+              r.saturated ? "yes" : "no"];
+          });
+        }))) + "</div></section>";
+    root.insertAdjacentHTML("beforeend", html);
+
+    function vsN(id, file, axisName, key, limit, fmtY) {
+      mount(document.getElementById(id), function (p) {
+        var o = base(p, file);
+        o.tooltip.trigger = "item";
+        o.tooltip.formatter = function (it) { return esc(it.seriesName) + "<br>" + int(it.value[0]) + " chargers: " + fmtY(it.value[1]); };
+        o.xAxis = valueAxis(p, "Chargers in the run", { splitLine: { show: false }, minInterval: 1 });
+        // Always show the limit line, even when every run is far below it.
+        o.yAxis = valueAxis(p, axisName, { max: function (v) { return Math.ceil(Math.max(v.max * 1.1, limit * 1.15)); } });
+        o.series = names.map(function (name, i) {
+          var rows = cmp[name];
+          return line(name, modeColor(p, rows[0].mode), rows.filter(function (r) { return isNum(r[key]); })
+            .map(function (r) { return [r.n, r[key]]; }), {
+              showSymbol: true,
+              markLine: i === 0 ? { symbol: "none", silent: true, lineStyle: { color: p.axis, type: "dashed" },
+                label: { color: p.ink2, formatter: "limit" }, data: [{ yAxis: limit }] } : undefined
+            });
+        });
+        return o;
+      });
+    }
+    vsN("cS1cpu", "s1_cpu_vs_fleet_size", "Machine CPU p95 (%)", "cpu_p95", 85, function (v) { return fmt(v, 0) + "%"; });
+    vsN("cS1lag", "s1_loop_lag_vs_fleet_size", "Loop lag p95 (ms)", "loop_lag_p95", 50, ms);
   }
 
   // ---------------------------------------------------------------- E1
@@ -878,6 +975,7 @@
     var root = document.getElementById("root");
     root.innerHTML = "";
     renderRuns(root);
+    renderS1(root);
     renderE1(root);
     renderE2(root);
     renderE3(root);
