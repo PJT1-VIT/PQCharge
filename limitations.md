@@ -1,6 +1,6 @@
 # PQCharge — Open Items and Limitations
 
-**The single register of everything not yet resolved.** Started 2026-10-03, after the A+B+C integration. **Updated 2026-10-09:** fleet-migration audit added L26–L29. **Earlier, 2026-10-08:** every team item is agreed by A, B and C. **Contract 7 is frozen** (approved by A, B, C), so L03 (meaning of the modes) and L18 (contract approval) are resolved and removed.
+**The single register of everything not yet resolved.** Started 2026-10-03, after the A+B+C integration. **Updated 2026-10-09:** fleet-migration audit added L26–L29. **Later, 2026-10-09 (Track B, B-P1):** L01 progress, L08 verified, L31 added. **Earlier, 2026-10-08:** every team item is agreed by A, B and C. **Contract 7 is frozen** (approved by A, B, C), so L03 (meaning of the modes) and L18 (contract approval) are resolved and removed.
 
 ## Rules (all three tracks)
 
@@ -28,7 +28,7 @@ Old numbers (F1, F13, F14, R11, …) differed between the dev plans; F14 meant t
 
 | No. | Finding | Status | Action | Owner |
 |---|---|---|---|---|
-| **L01** | **The server makes every charger's private key and sends it over the network.** The charger keeps it in memory only, so a restart loses it. *(old: F2+F3, A-F13, B-F13)* | **Agreed (A, B, C)** | The charger generates its own ML-DSA key, sends **only the public key**, and saves the private key in `certs/pq/<id>.json` (ignored by git). **Specified in Contract 7 §7.2–7.4.** | B (orchestrator install step), C (`agent/pqc_messages.py`, `agent/pq_identity.py`); A reviews |
+| **L01** | **The server makes every charger's private key and sends it over the network.** The charger keeps it in memory only, so a restart loses it. *(old: F2+F3, A-F13, B-F13)* | **Agreed (A, B, C)** | The charger generates its own ML-DSA key, sends **only the public key**, and saves the private key in `certs/pq/<id>.json` (ignored by git). **Specified in Contract 7 §7.2–7.4.** **Progress 2026-10-09:** Track C's side merged (C-P1, C-P2). Track B's side done (B-P1): the orchestrator takes `enrolment_request_factory` + `public_key_parser`; live check with Track C's builders and agents: 3 migrated, 1 incompatible, key files only on the chargers, no `private_key` in the server log or diary. **Remaining:** Track A switches `csms/migration.py` to the new options (A-P4), then the A+B+C re-test. Until then the live server still uses `InstallPQAuth`. | B (orchestrator install step), C (`agent/pqc_messages.py`, `agent/pq_identity.py`); A reviews |
 | **L02** | **The security mode is only a label.** The key is checked once, at migration, so "classical" and "post-quantum" chargers connect in exactly the same way. E1/E2 would compare identical things. *(old: F1, A-8)* | **Agreed (A, B, C)** | The server challenges every migrated charger after **each** accepted boot (Track A's boot listener); a failed check **closes the connection** (code 1008). **Specified in Contract 7 §7.5–7.7.** **E2 "recovered" in post-quantum mode = connected + boot accepted + key check passed.** **Presentation:** the migration must be visibly obvious to the panel (dashboard migration timeline, live ticker of waves and key checks, a readable console view). | A (boot hook, recovered rule), B (challenge on boot), C (agent; display) |
 
 ## 2. Agreed fixes, not yet done
@@ -54,7 +54,7 @@ Old numbers (F1, F13, F14, R11, …) differed between the dev plans; F14 meant t
 
 | No. | Finding | Status | Action | Owner |
 |---|---|---|---|---|
-| L08 | **Under TLS, the tester's fleet watcher borrows CP0001's certificate** to call `/api` (no operator certificate exists). **Not verified whether the identity check inspects `/api` requests.** | Not decided | *Recommended:* Track B issues one operator certificate. | B, C |
+| L08 | **Under TLS, the tester's fleet watcher borrows CP0001's certificate** to call `/api` (no operator certificate exists). **Verified 2026-10-09 (Track B, code read of `csms/server.py`):** the identity check does **not** inspect `/api`. `process_request` answers every `/api/` path itself; `check_identity` runs only in the WebSocket handler, which `/api` never reaches. With `--tls-client-certs required` the TLS layer still demands a certificate signed by our CA, so **any** station's certificate opens every `/api` endpoint, including `/api/migration/start`. | Not decided | *Recommended:* Track B issues one operator certificate. | B, C |
 | L12 | **E6's second half is not done:** our agent against a third-party CSMS. The first half (a third-party charger on our server) passed on Day 10. | Not decided | *Recommended:* compare CitrineOS and MaEVe (both OCPP 2.0.1, open source) on install effort, then pick one. **Install effort not yet investigated.** | C + A |
 | L13 | **Raspberry Pi hardware status unknown** (Pi, relay, INA219 sensor). | Not decided | Confirm what is bought. On the Pi: Track A's quantcrypt 1312 check; certificate SAN for the laptop's `.local` name (old B-R4). | Team; C (C9) |
 
@@ -69,6 +69,12 @@ Old numbers (F1, F13, F14, R11, …) differed between the dev plans; F14 meant t
 | **L28** | **Migration target label mismatch** (M6): `/api/migration/start` accepts only `target_mode=pqc`, but under Contract 7 an enrolled charger is in **hybrid** mode. | Proposed | Accept `target_mode=hybrid` for the ML-DSA enrolment migration; keep `pqc` for the pure-PQC flow. Track A (A-P7) and Track B (B-P7) change it together. | A + B |
 | **L29** | **The pure-PQC migration flow is not designed** (M7): switching chargers to post-quantum TLS certificates in waves, with rollback. | Not decided | After the liboqs test (L17), Track B designs it as Contract 7 v2 (B-P8). Then Track A adds post-quantum TLS on the server (A-P9) and Track C the charger TLS (C-P10). | B (A, C) |
 | **L30** | **The charger cannot tell a boot key check from any other challenge.** The analysis (C-P4) counts the *first* challenge of a connection that opened with a key held as the boot check (E1 secure-ready). If the server ever sends a different challenge first on such a connection (for example a rotation, L26), it would be counted as secure-ready. Today the boot check is the only such challenge, and a hybrid run with keys but no boot checks is already flagged (`hybrid_without_boot_checks`). | Proposed | Contract 7 v2: add an optional `reason` (`boot` / `migration` / `rotation`) to `PQAuthChallenge`; the charger copies it into `station_authenticated`; the analysis then uses it instead of "first challenge". Decide together with the rotation flow (B-P6). | C (B) |
+
+## 4c. New items (2026-10-09)
+
+| No. | Finding | Status | Action | Owner |
+|---|---|---|---|---|
+| **L31** | **Where `source` in the post-quantum events comes from.** Contract 7 §7.6 lists `source: "orchestrator"\|"boot_verifier"` in the `pq_auth` payload. In code, Track B's orchestrator must **not** put `source` in a payload: Track A's `orchestrator_emitter` (`csms/migration.py`) already adds `source="orchestrator"`, and a second `source` keyword raises `TypeError` inside `EventLog.emit` (verified 2026-10-09). B-P1 follows this, and the live diary shows `source: "orchestrator"` on every `pq_enrolled` and `pq_auth` line. **Open for B-P2:** the boot verifier's `source: "boot_verifier"` must come the same way, from the emitter Track A builds for it (A-P3). | Proposed (needs Track A) | Track A's emitter for the boot verifier writes `source="boot_verifier"`; Track B's verifier never puts `source` in its payload. Contract 7 text unchanged (the event shape is the same); add one sentence to §7.6 at the next revision. | A + B |
 
 ## 5. Accepted limitations (stay in the report)
 
