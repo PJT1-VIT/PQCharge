@@ -44,6 +44,21 @@ is marked MIGRATED only if its ML-DSA signature verifies against the key
 just enrolled. Without those two arguments the behaviour is exactly as
 before (install accepted = migrated), so existing callers keep working.
 
+ENROLMENT BY PUBLIC KEY (Contract 7 section 7.4, B-P1, added 2026-10-09):
+Built with enrolment_request_factory and public_key_parser (always given
+together), the orchestrator no longer makes any key. It sends each station
+a RequestPQEnrolment; the station makes its own ML-DSA key pair, keeps the
+private half, and answers with {algorithm, public_key, key_id}. Only then is
+the public key enrolled -- the server cannot enrol a key it does not have --
+and the station is challenged with that key_id. The overlap guarantee is
+unchanged: the station only USES the key when challenged, and the challenge
+is sent only after enrolment. In this mode keypair_factory and
+install_message_factory are not used and may be omitted, and proof of
+possession (challenge_message_factory + signature_parser) is required: a
+public key alone proves nothing about who holds the private half. Without
+the two new arguments the old InstallPQAuth flow runs exactly as before,
+until it is removed after the A+B+C re-test (Contract 7 section 7.8, B-P5).
+
 OFFLINE STATIONS (added Day 12):
 By default a station that is not connected fails its install and counts
 against the wave's failure threshold. Built with skip_offline=True (and a
@@ -56,9 +71,14 @@ emits MESSAGE_SENT with dispatched=True for every command it sends
 (Contract 3 belongs to Track A's CSMS). The orchestrator emits only the
 migration-level events (MIGRATION_STARTED, WAVE_STARTED, WAVE_COMPLETED,
 WAVE_ROLLED_BACK, MIGRATION_COMPLETED), plus one CONNECTION_ATTEMPT
-(transition="pq_auth") per verified station when proof of possession is
-wired, and "station_deferred" when skip_offline defers a station, through
-the event_emitter Track A supplies. "station_deferred" and
+(transition="pq_auth", trigger="migration") per checked station when proof
+of possession is wired, one CERTIFICATE_INSTALLED (transition="pq_enrolled")
+per station whose own public key was enrolled (Contract 7 section 7.6), and
+"station_deferred" when skip_offline defers a station, through the
+event_emitter Track A supplies. The orchestrator never puts "source" in a
+payload: Track A's emitter (csms/migration.py orchestrator_emitter) already
+writes source="orchestrator", and a second "source" keyword would raise
+TypeError inside EventLog.emit. "station_deferred" and
 "migration_failed" are not Contract 3 EventType members -- see the dev plan.
 """
 
@@ -148,6 +168,19 @@ ChallengeMessageFactory = Callable[[bytes], object]
 #     lambda response: agent.pqc_messages.parse_signature(response.data)
 SignatureParser = Callable[[object], bytes]
 
+# Contract 7 section 7.4. Builds the RequestPQEnrolment call for a station.
+# In the live CSMS: agent.pqc_messages.build_enrolment_request, which takes
+# (station_id, *, algorithm=...). The orchestrator calls it as
+# factory(station_id, algorithm=target_algorithm).
+EnrolmentRequestFactory = Callable[..., object]
+
+# Contract 7 section 7.4. Reads the station's enrolment answer out of the
+# dispatcher's response object and returns (algorithm, public_key, key_id).
+# Must raise on anything malformed -- a private key in the reply, a missing
+# field, a key_id that does not match the key. In the live CSMS:
+#     lambda response: agent.pqc_messages.parse_enrolment_reply(response.data)
+PublicKeyParser = Callable[[object], tuple[str, bytes, str]]
+
 
 class MigrationOrchestrator(MigrationController):
     """
@@ -165,8 +198,8 @@ class MigrationOrchestrator(MigrationController):
         dispatcher: DispatchLike,
         authenticator: AuthenticatorLike,
         fleet: FleetLike,
-        keypair_factory: KeypairFactory,
-        install_message_factory: InstallMessageFactory,
+        keypair_factory: KeypairFactory | None = None,
+        install_message_factory: InstallMessageFactory | None = None,
         event_emitter: Callable[..., object] | None = None,
         failure_threshold: float = DEFAULT_FAILURE_THRESHOLD,
         dispatch_timeout_s: float | None = None,
@@ -174,12 +207,35 @@ class MigrationOrchestrator(MigrationController):
         challenge_message_factory: ChallengeMessageFactory | None = None,
         signature_parser: SignatureParser | None = None,
         skip_offline: bool = False,
+        enrolment_request_factory: EnrolmentRequestFactory | None = None,
+        public_key_parser: PublicKeyParser | None = None,
     ) -> None:
         if (challenge_message_factory is None) != (signature_parser is None):
             raise ValueError(
                 "challenge_message_factory and signature_parser must be given "
                 "together: one without the other cannot verify a station"
             )
+        if (enrolment_request_factory is None) != (public_key_parser is None):
+            raise ValueError(
+                "enrolment_request_factory and public_key_parser must be given "
+                "together (Contract 7 section 7.4): a request whose answer "
+                "cannot be read enrols nothing"
+            )
+        if enrolment_request_factory is not None:
+            if challenge_message_factory is None:
+                raise ValueError(
+                    "enrolment by public key needs challenge_message_factory "
+                    "and signature_parser: a public key alone does not prove "
+                    "the station holds the private half"
+                )
+        elif keypair_factory is None or install_message_factory is None:
+            raise ValueError(
+                "keypair_factory and install_message_factory are required "
+                "unless enrolment_request_factory and public_key_parser are "
+                "given (Contract 7 section 7.4)"
+            )
+        self._make_enrolment_req = enrolment_request_factory
+        self._parse_public_key = public_key_parser
         self._make_challenge_msg = challenge_message_factory
         self._parse_signature = signature_parser
         self._skip_offline = skip_offline
@@ -370,6 +426,12 @@ class MigrationOrchestrator(MigrationController):
 
         self._fleet.set_state(station_id, MigrationState.IN_PROGRESS, wave_id)
 
+        if self._make_enrolment_req is not None:
+            return await self._enrol_by_public_key(station_id, wave_id)
+
+        # --- Deprecated InstallPQAuth flow (server makes the key). Kept
+        # --- until the A+B+C re-test; removed in B-P5 (Contract 7 section 7.8).
+
         # Step 1: enrol the new identity FIRST -- overlap window opens.
         private_key, public_key = self._make_keypair()
         self._auth.enrol(station_id, public_key)
@@ -387,37 +449,124 @@ class MigrationOrchestrator(MigrationController):
         # signing a fresh challenge. Without this, "migrated" only means
         # "the station accepted a message".
         if self._make_challenge_msg is not None:
-            verified, detail, duration_ms = await self._verify_possession(station_id)
-            # Same event shape Track A uses for its identity check, so Track
-            # C's E5 measure counts both. station_id travels as `station`
-            # because the orchestrator's emitter writes events with no
-            # top-level station (a wave is not one station).
-            self._emit("connection_attempt", transition="pq_auth",
-                       station=station_id, wave_id=wave_id,
-                       result="success" if verified else "rejected",
-                       detail=detail, duration_ms=duration_ms,
-                       algorithm=self._target_algorithm)
+            verified = await self._check_and_report(station_id, wave_id, key_id=None)
             if not verified:
                 return self._fail_station(station_id, wave_id)
 
         # Step 4: confirmed.
+        return self._mark_migrated(station_id, wave_id)
+
+    async def _enrol_by_public_key(self, station_id: str, wave_id: int) -> MigrationState:
+        """
+        Contract 7 section 7.4: the station makes its own key pair.
+
+            send RequestPQEnrolment -> station answers {algorithm, public_key, key_id}
+            -> enrol(station_id, public_key) -> PQAuthChallenge {nonce, key_id}
+            -> verify -> MIGRATED; any failure: un-enrol, ROLLED_BACK
+
+        Never raises for a station's bad answer: a refusal, a timeout, an
+        unreadable reply, a reply carrying a private key, a mismatched
+        key_id or the wrong algorithm all make a failed station, never a
+        crashed wave. Nothing is enrolled until the reply has been read
+        and checked, so a failure before enrolment has nothing to undo
+        (_fail_station's un-enrol is then a harmless no-op).
+        """
+        # Step 1: ask the station to make its key pair.
+        request = self._make_enrolment_req(station_id, algorithm=self._target_algorithm)
+        result = await self._dispatch.send(
+            station_id, request, timeout_s=self._dispatch_timeout_s
+        )
+        if not getattr(result, "ok", False):
+            LOGGER.warning(
+                "%s: RequestPQEnrolment not accepted (outcome=%s, status=%s)",
+                station_id, getattr(result, "outcome", None),
+                getattr(result, "status", None),
+            )
+            return self._fail_station(station_id, wave_id)
+
+        # Step 2: read and check the answer. The parser raises on anything
+        # malformed, including a private key in the reply (L04) and a
+        # key_id that does not match the public key.
+        try:
+            algorithm, public_key, key_id = self._parse_public_key(
+                getattr(result, "response", None)
+            )
+        except Exception as exc:  # noqa: BLE001 - malformed answer = failed station
+            LOGGER.warning("%s: unreadable enrolment reply: %s: %s",
+                           station_id, type(exc).__name__, exc)
+            return self._fail_station(station_id, wave_id)
+        if algorithm != self._target_algorithm:
+            LOGGER.warning("%s: enrolment reply is %r, expected %r",
+                           station_id, algorithm, self._target_algorithm)
+            return self._fail_station(station_id, wave_id)
+
+        # Step 3: enrol the station's own public key -- overlap window opens.
+        self._auth.enrol(station_id, public_key)
+        self._enrolled_this_run[wave_id].append(station_id)
+        self._emit("certificate_installed", transition="pq_enrolled",
+                   station=station_id, key_id=key_id, algorithm=algorithm,
+                   trigger="migration", wave_id=wave_id)
+
+        # Step 4: the station must prove it holds the private half, signing
+        # with the key it just reported (named by key_id).
+        verified = await self._check_and_report(station_id, wave_id, key_id=key_id)
+        if not verified:
+            return self._fail_station(station_id, wave_id)
+
+        # Step 5: confirmed.
+        return self._mark_migrated(station_id, wave_id)
+
+    async def _check_and_report(self, station_id: str, wave_id: int, *,
+                                key_id: str | None) -> bool:
+        """
+        Run one migration key check and write its pq_auth line.
+
+        Contract 7 section 7.6 shape: the same event Track A uses for its
+        identity check, so Track C's E5 measure counts both. station_id
+        travels as `station` because the orchestrator's emitter writes
+        events with no top-level station (a wave is not one station).
+        key_id is None on the deprecated InstallPQAuth path. "source" is
+        added by Track A's emitter, not here (see the module docstring).
+        """
+        verified, detail, duration_ms = await self._verify_possession(
+            station_id, key_id=key_id
+        )
+        self._emit("connection_attempt", transition="pq_auth",
+                   station=station_id, wave_id=wave_id,
+                   result="success" if verified else "rejected",
+                   detail=detail, duration_ms=duration_ms,
+                   algorithm=self._target_algorithm,
+                   key_id=key_id, trigger="migration")
+        return verified
+
+    def _mark_migrated(self, station_id: str, wave_id: int) -> MigrationState:
         self._fleet.set_state(station_id, MigrationState.MIGRATED, wave_id)
         self._fleet.mark_migrated_algorithm(station_id, self._target_algorithm)
         return MigrationState.MIGRATED
 
-    async def _verify_possession(self, station_id: str) -> tuple[bool, str, float | None]:
+    async def _verify_possession(
+        self, station_id: str, *, key_id: str | None = None
+    ) -> tuple[bool, str, float | None]:
         """
-        Challenge a just-installed station and verify its ML-DSA signature
-        against the key enrolled for it in Step 1.
+        Challenge a station and verify its ML-DSA signature against the key
+        enrolled for it.
+
+        key_id (Contract 7 section 7.2) names which of the station's keys
+        must sign. It is passed to the challenge factory only when known,
+        so a factory written as `lambda nonce: ...` keeps working on the
+        deprecated path.
 
         Returns (verified, detail, round_trip_ms). Never raises: a station
         that answers badly -- refuses, times out, sends garbage, or signs
         with the wrong key -- is a failed station, not a crashed wave.
         """
         nonce = self._auth.issue_challenge(station_id)
+        if key_id is None:
+            challenge = self._make_challenge_msg(nonce)
+        else:
+            challenge = self._make_challenge_msg(nonce, key_id=key_id)
         result = await self._dispatch.send(
-            station_id, self._make_challenge_msg(nonce),
-            timeout_s=self._dispatch_timeout_s,
+            station_id, challenge, timeout_s=self._dispatch_timeout_s,
         )
         duration_ms = getattr(result, "duration_ms", None)
 
