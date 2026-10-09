@@ -190,6 +190,15 @@ class StationOutcome:
     """Keys received (more than 1 = rotated)."""
     pq_challenges_signed: int = 0
     """Post-quantum key checks this station answered with a signature."""
+    pq_key_id: str | None = None
+    """PHASE C-P3. key_id of the key held at the end (None: no key, or a key
+    from the deprecated InstallPQAuth)."""
+    pq_key_held_at_start: bool = False
+    """PHASE C-P3. Whether the station started the run already holding a key
+    (loaded from certs/pq/, saved by an earlier run). The analysis warns when
+    a migration run starts with saved keys."""
+    pq_key_id_at_start: str | None = None
+    """PHASE C-P3. key_id of that saved key (None if none)."""
 
     wall_s: float = 0.0
 
@@ -243,6 +252,8 @@ class FleetResult:
             # PHASE C6.1: the stations' own post-quantum view, totalled.
             "pq_keys_installed": sum(1 for o in self.outcomes if o.pq_key_installed),
             "pq_challenges_signed": self.total("pq_challenges_signed"),
+            # C-P3: chargers that started with a key saved by an earlier run.
+            "pq_keys_at_start": sum(1 for o in self.outcomes if o.pq_key_held_at_start),
         }
 
     def describe(self) -> str:
@@ -271,6 +282,8 @@ class FleetResult:
             f"  PQ keys held         {sum(1 for o in self.outcomes if o.pq_key_installed)}"
             f"/{self.n_stations}",
             f"  PQ checks signed     {self.total('pq_challenges_signed'):.0f}",
+            f"  PQ keys at start     {sum(1 for o in self.outcomes if o.pq_key_held_at_start)}"
+            f"/{self.n_stations}  (saved by an earlier run)",
         ]
 
         # The three lines that decide whether this run's data is usable.
@@ -592,7 +605,14 @@ class FleetRunner:
 
         try:
             station = ChargingStation(self.config_for(station_id))
-            station.on_connected = self._connected_hook(station_id)
+            station.on_connected = self._connected_hook(station_id, station)
+            # C-P3: ready times (Contract 7 section 7.6).
+            station.on_booted = self._booted_hook(station_id)
+            station.on_authenticated = self._authenticated_hook(station_id)
+            # The key file (if any) is loaded in the constructor, so this is
+            # the key the station brings from an earlier run.
+            outcome.pq_key_held_at_start = station.pq.is_migrated
+            outcome.pq_key_id_at_start = station.pq.key_id
             outcome.ok = await station.run()
 
         except asyncio.CancelledError:
@@ -627,6 +647,7 @@ class FleetRunner:
                 outcome.pq_algorithm = station.pq.algorithm
                 outcome.pq_installs = station.pq.installs
                 outcome.pq_challenges_signed = station.pq.challenges_signed
+                outcome.pq_key_id = station.pq.key_id
 
             self.finished += 1
             self.log.emit(
@@ -638,17 +659,52 @@ class FleetRunner:
 
         return outcome
 
-    def _connected_hook(self, station_id: str) -> Callable[[float, int, int], None]:
+    def _connected_hook(
+        self, station_id: str, station: ChargingStation | None = None,
+    ) -> Callable[[float, int, int], None]:
         """
         PHASE C6.2. Write each connection time to the tester diary the
         moment the connection opens (station_connected), instead of only
         in station_finished at the end. A run stopped with Ctrl-C keeps
         every connection time that happened before the stop.
+
+        PHASE C-P3: with the station given, the line also says whether the
+        station held a post-quantum key when this connection opened
+        (pq_key_held, pq_key_id). The analysis uses it to tell a boot key
+        check (key held at connect) from a migration's first check.
         """
         def hook(connect_ms: float, connection: int, attempt: int) -> None:
+            extra: dict[str, Any] = {}
+            if station is not None:
+                extra = {"pq_key_held": station.pq.is_migrated,
+                         "pq_key_id": station.pq.key_id}
             self.log.emit(
                 tl.STATION_CONNECTED, station_id,
                 connect_ms=connect_ms, connection=connection, attempt=attempt,
+                **extra,
+            )
+        return hook
+
+    def _booted_hook(self, station_id: str) -> Callable[..., None]:
+        """PHASE C-P3. One station_booted line per accepted boot."""
+        def hook(*, since_connect_ms: float | None, connection: int) -> None:
+            self.log.emit(
+                tl.STATION_BOOTED, station_id,
+                connection=connection, since_connect_ms=since_connect_ms,
+            )
+        return hook
+
+    def _authenticated_hook(self, station_id: str) -> Callable[..., None]:
+        """
+        PHASE C-P3, Contract 7 section 7.6. One station_authenticated line
+        per signed challenge. Carries key_id only -- never key material.
+        """
+        def hook(*, since_connect_ms: float | None, sign_ms: float,
+                 key_id: str | None, connection: int, challenge_no: int) -> None:
+            self.log.emit(
+                tl.STATION_AUTHENTICATED, station_id,
+                connection=connection, challenge_no=challenge_no,
+                since_connect_ms=since_connect_ms, sign_ms=sign_ms, key_id=key_id,
             )
         return hook
 

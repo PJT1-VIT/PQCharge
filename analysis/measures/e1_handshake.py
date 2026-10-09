@@ -31,6 +31,27 @@ under a reconnection storm (E2), not in calm conditions.
 
 Also reported: bytes exchanged per connection (post-quantum keys cost
 bytes, not just time) and the TLS version/cipher actually negotiated.
+
+--------------------------------------------------------------------
+PHASE C-P4 (Contract 7): READY TIMES, LIKE FOR LIKE
+
+The connection time above is the same work in classical and hybrid mode
+(hybrid keeps classical TLS). What differs is what happens AFTER it, so
+E1 also measures, from the same dial start, when a charger may work:
+
+    boot_ready_ms    dial -> BootNotification accepted (station_booted).
+                     A classical charger is ready here.
+    secure_ready_ms  dial -> first key check answered (station_authenticated,
+                     challenge 1 of a connection opened with a key held).
+                     A hybrid, enrolled charger is ready here (section 7.6).
+    ready_ms         the run's own "ready": secure_ready_ms in a hybrid run
+                     that has it, else boot_ready_ms. ready_basis says which.
+                     compare.py compares ready_ms across modes.
+
+    sign_ms          the charger's signing time alone, every challenge.
+
+First connections only for the headline distributions; reconnections
+(an E2 storm) are in secure_ready_reconnect_ms.
 """
 
 from __future__ import annotations
@@ -82,6 +103,21 @@ def measure(run: MatchedRun) -> dict[str, Any]:
     def top(c: Counter[str]) -> str | None:
         return c.most_common(1)[0][0] if c else None
 
+    # -- C-P4: ready times (Contract 7 section 7.6) --------------------------
+    h = run.harness
+    boot_first = [times[0] for times in h.boot_ready_times().values() if times]
+    secure = h.secure_ready_times()
+    secure_first = [ms for rows in secure.values() for conn, ms in rows if conn == 1]
+    secure_later = [ms for rows in secure.values() for conn, ms in rows if conn > 1]
+    held_first = sorted(sid for (sid, conn), held in h.keys_at_connect().items()
+                        if conn == 1 and held)
+    if h.crypto_mode == "hybrid" and secure_first:
+        ready, basis = secure_first, "secure-ready (boot + key check)"
+    elif boot_first:
+        ready, basis = boot_first, "boot accepted"
+    else:
+        ready, basis = [], None
+
     return {
         "station_side_available": have_station_side,
         "station_connect_ms": stats.describe(initial),
@@ -96,4 +132,12 @@ def measure(run: MatchedRun) -> dict[str, Any]:
             "cipher": top(ciphers),
             "client_cert_bytes_median": stats.percentile(cert_bytes, 50) if cert_bytes else None,
         },
+        # C-P4 (Contract 7)
+        "boot_ready_ms": stats.describe(boot_first),
+        "secure_ready_ms": stats.describe(secure_first),
+        "secure_ready_reconnect_ms": stats.describe(secure_later),
+        "ready_ms": stats.describe(ready),
+        "ready_basis": basis,
+        "sign_ms": stats.describe(h.sign_times()),
+        "chargers_with_key_at_connect": len(held_first),
     }

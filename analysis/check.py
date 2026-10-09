@@ -163,6 +163,8 @@ def check_run(run: MatchedRun, overview: dict[str, Any], e1: dict[str, Any],
                     "(recorded before C6.2). E1's headline number is unavailable for it.")
         issues.append(_issue("warn", "no_station_side_timing", text))
 
+    issues.extend(_contract7_issues(run, e1, e3))
+
     if e3 is not None:
         issues.extend(_migration_issues(e3))
 
@@ -174,6 +176,66 @@ def check_run(run: MatchedRun, overview: dict[str, Any], e1: dict[str, Any],
         ))
 
     return {"status": _status(issues), "issues": issues}
+
+
+def _contract7_issues(run: MatchedRun, e1: dict[str, Any],
+                      e3: dict[str, Any] | None) -> list[dict[str, str]]:
+    """
+    PHASE C-P4 — checks that Contract 7's security modes were set up right.
+
+    mode_mismatch     the tester and the server must name the same mode
+                      (section 7.1); otherwise the slot's label is wrong.
+    started_with_saved_keys
+                      chargers loaded keys saved by an earlier run. Keys
+                      persist on BOTH sides (certs/pq/ and the server's
+                      --db), so they must be reset or reused TOGETHER. In a
+                      migration run this makes it a rotation, not a first
+                      enrolment: warn. Otherwise just note it.
+    hybrid_without_boot_checks
+                      a hybrid run whose chargers held keys, but the server
+                      never checked a key after boot: the server is not
+                      running the boot check, and E1's secure-ready time is
+                      missing.
+    """
+    h: HarnessRun = run.harness
+    issues: list[dict[str, str]] = []
+
+    server_mode = run.server_mode
+    if server_mode and h.crypto_mode and server_mode != h.crypto_mode:
+        issues.append(_issue(
+            "warn", "mode_mismatch",
+            f"The tester ran in '{h.crypto_mode}' mode but the server logged "
+            f"'{server_mode}'. Contract 7 requires both to name the same mode; this "
+            "run is filed under the tester's mode, which may be wrong.",
+        ))
+
+    started = sorted(sid for sid, held in h.keys_at_start().items() if held)
+    if started:
+        sample = ", ".join(started[:3])
+        if e3 is not None:
+            issues.append(_issue(
+                "warn", "started_with_saved_keys",
+                f"{len(started)} charger(s) started with a post-quantum key saved by an "
+                f"earlier run (e.g. {sample}), so this migration is a key rotation for them, "
+                "not a first enrolment. For a clean E3, clear certs/pq/ AND use a fresh "
+                "server --db together.",
+            ))
+        else:
+            issues.append(_issue(
+                "info", "started_with_saved_keys",
+                f"{len(started)} charger(s) started with a post-quantum key saved by an "
+                f"earlier run (e.g. {sample}).",
+            ))
+
+    held = e1.get("chargers_with_key_at_connect") or 0
+    if h.crypto_mode == "hybrid" and held and not run.pq_checks("boot"):
+        issues.append(_issue(
+            "warn", "hybrid_without_boot_checks",
+            f"{held} charger(s) held a key in this hybrid run, but the server never "
+            "checked a key after boot. The server is not running Contract 7's boot "
+            "check, so E1's secure-ready time is missing and E2 uses the boot-only rule.",
+        ))
+    return issues
 
 
 def _migration_issues(e3: dict[str, Any]) -> list[dict[str, str]]:

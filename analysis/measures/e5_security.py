@@ -49,8 +49,21 @@ def measure(run: MatchedRun) -> dict[str, Any]:
     # PHASE C6.1: the post-quantum key checks (pq_auth). Fleet-wide, because
     # a failing charger may be one the tester did not start. Result is in
     # `outcome` (filled from payload.result by collect.py).
-    pq = run.migration("connection_attempt", transition="pq_auth")
+    pq = run.pq_checks()
     pq_rejected = [e for e in pq if (e.get("outcome") or "") != "success"]
+
+    # C-P4 (Contract 7 sections 7.5, 7.6): split by why the check ran, and
+    # count the chargers cut off for failing the check after boot (E5's
+    # attack demonstration: a charger with a wrong key is refused).
+    def split(trigger: str) -> dict[str, int]:
+        rows = run.pq_checks(trigger)
+        ok = sum(1 for e in rows if (e.get("outcome") or "") == "success")
+        return {"checks": len(rows), "passed": ok, "rejected": len(rows) - ok}
+
+    cut_off = [
+        e for e in run.events("connection_closed")
+        if (e.get("payload") or {}).get("reason") == "pq_auth_failed"
+    ]
 
     failures: Counter[str] = Counter(
         str((e.get("payload") or {}).get("reason") or "unknown")
@@ -80,10 +93,14 @@ def measure(run: MatchedRun) -> dict[str, Any]:
             {
                 "station_id": e.get("station_id"),
                 "detail": (e.get("payload") or {}).get("detail"),
+                "trigger": (e.get("payload") or {}).get("trigger") or "migration",
                 "at_s": round(e["_t"] - (run.harness.started_at or e["_t"]), 3),
             }
             for e in pq_rejected[:50]
         ],
+        "pq_by_trigger": {"migration": split("migration"), "boot": split("boot")},
+        "pq_cut_off": len(cut_off),
+        "pq_cut_off_ids": sorted({e.get("station_id") for e in cut_off if e.get("station_id")})[:50],
         "connection_failures": dict(failures),
         "callerrors": float(sum((r.get("callerrors") or 0) for r in rows)),
         "commands_received": float(sum((r.get("commands_received") or 0) for r in rows)),

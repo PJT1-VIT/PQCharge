@@ -194,6 +194,9 @@ def summary(results: dict[str, Any]) -> str:
         s = results["slots"][key]
         e1 = (s.get("e1") or {}).get("station_connect_ms") or {}
         med = f"{e1['median']:.1f} ms" if e1.get("n") else "n/a"
+        rd = (s.get("e1") or {}).get("ready_ms") or {}
+        if rd.get("n"):
+            med += f"  ready median={rd['median']:.1f} ms ({s['e1'].get('ready_basis')})"
         e2 = s.get("e2")
         storm = f"  T95={e2['t95_s']:.2f}s" if e2 and e2.get("t95_s") is not None else ""
         e3 = s.get("e3")

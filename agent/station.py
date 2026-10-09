@@ -404,6 +404,38 @@ class ChargingStation(StationCommands):
         final row. Off (None) for a single station. A failing hook is
         logged and ignored: it must never cost the station its session.
         """
+        self.on_booted: Callable[..., None] | None = None
+        """
+        PHASE C-P3. Called once per connection, the moment the CSMS accepts
+        BootNotification, with keyword arguments
+        (since_connect_ms, connection).
+
+        since_connect_ms runs from the dial (the same start as connect_ms)
+        to the accepted boot: the time until a classical charger may work.
+        It is the classical side of E1's like-for-like "ready" comparison
+        (hybrid's side is on_authenticated below). Same rules as
+        on_connected: off (None) for a single station; a failing hook is
+        logged and ignored.
+        """
+        self.on_authenticated: Callable[..., None] | None = None
+        """
+        PHASE C-P3 (Contract 7 section 7.6). Called each time this station
+        signs a PQAuthChallenge, with keyword arguments
+        (since_connect_ms, sign_ms, key_id, connection, challenge_no).
+
+        since_connect_ms runs from the dial to the moment the signature is
+        ready (just before the reply is sent). On the FIRST challenge of a
+        connection of a charger that already held a key, that is the
+        secure-ready time: dial -> TLS -> WebSocket -> boot -> key check
+        answered. sign_ms is the signing alone. key_id is the key used
+        (the one the server asked for, else the current one; None for a
+        key from the deprecated InstallPQAuth). The load generator writes
+        a station_authenticated line from it. Same rules as on_connected.
+        """
+        self._dial_started: float | None = None
+        """perf_counter() at the dial of the CURRENT connection (C-P3)."""
+        self._challenges_this_connection = 0
+        """Challenges signed on the current connection; reset on connect."""
         self.reconnections = 0
         self.total_downtime_s = 0.0
         """
@@ -729,12 +761,55 @@ class ChargingStation(StationCommands):
         try:
             nonce, meta = pqc.parse_challenge_data(data)
             # Contract 7: the server may name which key to sign with.
-            signature = self.pq.answer_challenge(nonce, pqc.challenge_key_id(meta))
+            wanted = pqc.challenge_key_id(meta)
+            sign_started = time.perf_counter()
+            signature = self.pq.answer_challenge(nonce, wanted)
+            signed_at = time.perf_counter()
         except Exception as exc:  # noqa: BLE001 - reported, never a CALLError
             self.log.warning("PQAuthChallenge could not be answered: %s", exc)
             return False, f"could not sign challenge: {exc}", None
 
+        self._challenges_this_connection += 1
+        self._report_authenticated(
+            signed_at=signed_at,
+            sign_ms=(signed_at - sign_started) * 1000.0,
+            key_id=wanted if wanted is not None else self.pq.key_id,
+        )
         return True, "challenge signed", signature
+
+    def _since_dial_ms(self, now: float) -> float | None:
+        """Milliseconds from this connection's dial to `now` (C-P3)."""
+        if self._dial_started is None:
+            return None
+        return (now - self._dial_started) * 1000.0
+
+    def _report_authenticated(self, *, signed_at: float, sign_ms: float,
+                              key_id: str | None) -> None:
+        """Call on_authenticated (C-P3). Instrumentation only: never raises."""
+        if self.on_authenticated is None:
+            return
+        try:
+            self.on_authenticated(
+                since_connect_ms=self._since_dial_ms(signed_at),
+                sign_ms=sign_ms,
+                key_id=key_id,
+                connection=len(self.connect_times_ms),
+                challenge_no=self._challenges_this_connection,
+            )
+        except Exception:  # noqa: BLE001 - instrumentation only
+            self.log.warning("on_authenticated hook failed", exc_info=True)
+
+    def _report_booted(self) -> None:
+        """Call on_booted (C-P3). Instrumentation only: never raises."""
+        if self.on_booted is None:
+            return
+        try:
+            self.on_booted(
+                since_connect_ms=self._since_dial_ms(time.perf_counter()),
+                connection=len(self.connect_times_ms),
+            )
+        except Exception:  # noqa: BLE001 - instrumentation only
+            self.log.warning("on_booted hook failed", exc_info=True)
 
     # -- serving what the commands asked for -------------------------------
 
@@ -1300,6 +1375,11 @@ class ChargingStation(StationCommands):
         async with connect(cfg.ws_url, **connect_kwargs) as ws:
             elapsed_ms = (time.perf_counter() - started) * 1000.0
             self.connect_times_ms.append(elapsed_ms)
+            # C-P3: the dial time of THIS connection, for the ready times,
+            # and a fresh challenge count (the first challenge of each
+            # connection is the boot key check in hybrid mode).
+            self._dial_started = started
+            self._challenges_this_connection = 0
             self.log.info("connected in %.1fms", elapsed_ms)
             if self.on_connected is not None:
                 try:
@@ -1434,6 +1514,9 @@ class ChargingStation(StationCommands):
             self._session_complete = True
             self._session_ok = False
             return False
+
+        # C-P3: boot accepted -- the classical "ready" moment.
+        self._report_booted()
 
         self._heartbeat_task = asyncio.ensure_future(
             client.heartbeat_loop(interval)

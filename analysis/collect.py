@@ -306,6 +306,73 @@ class HarnessRun:
                         and len(from_final) >= len(from_live) else from_live)
         return out
 
+    # -- PHASE C-P4: Contract 7 lines (tester diary) ------------------------
+
+    def keys_at_connect(self) -> dict[tuple[str, int], bool]:
+        """
+        (charger, connection number) -> did the charger hold a post-quantum
+        key when that connection opened. From station_connected's
+        pq_key_held (C-P3). Connections recorded before C-P3 are absent.
+        """
+        out: dict[tuple[str, int], bool] = {}
+        for r in self.of_type("station_connected"):
+            sid, conn = r.get("station_id"), r.get("connection")
+            if sid and conn is not None and "pq_key_held" in r:
+                out[(sid, int(conn))] = bool(r.get("pq_key_held"))
+        return out
+
+    def keys_at_start(self) -> dict[str, bool]:
+        """
+        Charger -> did it START the run holding a key (saved by an earlier
+        run in certs/pq/). From station_finished's pq_key_held_at_start, else
+        from the first connection's pq_key_held (survives Ctrl-C). Chargers
+        recorded before C-P3 are absent.
+        """
+        out: dict[str, bool] = {}
+        for (sid, conn), held in sorted(self.keys_at_connect().items()):
+            if conn == 1:
+                out[sid] = held
+        for r in self.of_type("station_finished", "station_crashed"):
+            sid = r.get("station_id")
+            if sid and "pq_key_held_at_start" in r:
+                out[sid] = bool(r.get("pq_key_held_at_start"))
+        return out
+
+    def boot_ready_times(self) -> dict[str, list[float]]:
+        """
+        Charger -> dial-to-boot-accepted times (ms), one per connection,
+        oldest first (station_booted, C-P3). The classical "ready" time.
+        """
+        rows: dict[str, list[tuple[int, int, float]]] = {}
+        for i, r in enumerate(self.of_type("station_booted")):
+            sid, ms = r.get("station_id"), r.get("since_connect_ms")
+            if not sid or ms is None:
+                continue
+            rows.setdefault(sid, []).append((int(r.get("connection") or 0), i, float(ms)))
+        return {sid: [ms for _, _, ms in sorted(v)] for sid, v in rows.items()}
+
+    def secure_ready_times(self) -> dict[str, list[tuple[int, float]]]:
+        """
+        Charger -> [(connection, secure-ready ms), ...] (Contract 7 section
+        7.6): the FIRST challenge signed on a connection that opened with a
+        key already held. A first challenge on a connection without a key is
+        a migration's check, not a boot check, and is left out.
+        """
+        held = self.keys_at_connect()
+        out: dict[str, list[tuple[int, float]]] = {}
+        for r in self.of_type("station_authenticated"):
+            sid, conn, ms = r.get("station_id"), r.get("connection"), r.get("since_connect_ms")
+            if not sid or conn is None or ms is None or int(r.get("challenge_no") or 0) != 1:
+                continue
+            if held.get((sid, int(conn))):
+                out.setdefault(sid, []).append((int(conn), float(ms)))
+        return {sid: sorted(v) for sid, v in out.items()}
+
+    def sign_times(self) -> list[float]:
+        """Every signing time (ms) in station_authenticated lines."""
+        return [float(r["sign_ms"]) for r in self.of_type("station_authenticated")
+                if isinstance(r.get("sign_ms"), (int, float))]
+
     @property
     def station_ids(self) -> list[str]:
         seen: dict[str, None] = {}

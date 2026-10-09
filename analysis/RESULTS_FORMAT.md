@@ -1,4 +1,4 @@
-# analysis/output/results.json — format v2
+# analysis/output/results.json — format v3
 
 The contract between **C6 (analysis)**, which writes this file, and **C7 (dashboard)**, which
 reads it. Written by `python -m analysis.run` and automatically at the end of every
@@ -11,13 +11,13 @@ load-generator run. Rebuilt from the diaries every time, so deleting it loses no
 
 | Key | What it is |
 |---|---|
-| `format_version` | `2` (C6.1). Bumped when a field's meaning changes or a field is removed. v2: E3 counts the **whole fleet**; new E3/E5/node fields; several server diaries. |
+| `format_version` | `3` (C-P4). Bumped when a field's meaning changes or a field is removed. v2: E3 counts the **whole fleet**; new E3/E5/node fields; several server diaries. **v3 (Contract 7):** E3's key checks are the migration's only (boot checks apart); E2's "recovered" depends on the mode; new E1 ready times. |
 | `generated_at` | When the analysis ran (ISO-8601 UTC). The page reloads when this changes. |
 | `sources` | Which diaries were read (`server_diaries[]`), how many lines, duplicates dropped, lines whose charger id came from `payload.station`, runs found / kept. |
 | `diary_check` | `{status, issues[]}` for the server diary as a whole. |
 | `slot_order` | Slot keys in display order. |
 | `slots` | `{slot_key: slot}` — one per test setup, newest run wins. |
-| `comparisons` | Cross-run series: `e1_vs_n`, `e2_vs_n`, `overhead_vs_classical`. |
+| `comparisons` | Cross-run series: `e1_vs_n`, `e2_vs_n`, `overhead_vs_classical` (connection time); **v3:** `ready_vs_n`, `ready_overhead_vs_classical` (`ready_ms`, with `basis` and `added_median_ms`). |
 | `e4` | `{limits, rows[], notes[]}` — artifact sizes (not tied to a run). |
 | `external_nodes` | Chargers the tester did not start: the Pi (`kind: "hardware"`, CP0100) and E6 clients. Each has `energy_source: "charger-reported"` (never add it to a fleet total), `pq_auth` (last key-check result) and `deferred`. |
 
@@ -32,10 +32,10 @@ Key: `experiment|n<N>|<mode>|tls` or `...|plain` — e.g. `e2|n500|pqc|tls`.
 | `started_at`, `finished_at`, `wall_s`, `completed` | Timing; `completed=false` means the run was stopped early. |
 | `trust` | `{status: pass/warn/fail, issues[{level, code, message}]}`. **Show it next to every number.** |
 | `overview` | `stations`, `connections`, `sessions`, `meter`, `offline_queue`, and `timeline` (`connected`, `charging`, `power_w` as `[[seconds, value], ...]`). |
-| `e1` | `station_connect_ms` (headline), `reconnect_connect_ms`, `server_upgrade_ms`, `bytes_per_connection` — each a *distribution* (below) — plus `tls`. |
-| `e2` | `null` unless the server restarted in the run. Else `t50_s`, `t95_s`, `t100_s` (`null` = never reached), `population`, `recovered`, `unrecovered`, `curve`, `snapshot_curve`, `integrity{...}`. |
-| `e3` | `null` unless a migration happened. Else, for the **whole fleet**: `final_counts`, `state_timeline{state: [[s, count]]}`, `fleet_size`, `tester_chargers`; the controller's own `controller_counts` and `controller_sum_violations`; `waves[]`, `markers[]`, `rollbacks`, `manual_rollbacks`, `failures[]`, `duration_s`, `phase`; `verification` (`authenticated` / `key installed (not authenticated)` / `partly authenticated` / `nothing migrated`); `pq_checks{total, passed, rejected, rejections[], algorithm, round_trip_ms, first_per_charger_ms, later_ms}`; `deferred{count, station_ids}`; `agent_view{available, migrated_but_no_key[]}`; `charging{...}` (tester's chargers). |
-| `e5` | `identity_checks`, `identity_rejected`, `identity_mismatches` (let in by `warn` mode), `identity_mode`, `identity_rejections[]`, `pq_checks`, `pq_passed`, `pq_rejected`, `pq_rejections[]`, `connection_failures{}`, `callerrors`, `commands_received`. |
+| `e1` | `station_connect_ms` (TCP + TLS + WebSocket), `reconnect_connect_ms`, `server_upgrade_ms`, `bytes_per_connection` — each a *distribution* (below) — plus `tls`. **v3:** `boot_ready_ms` (dial → boot accepted), `secure_ready_ms` (dial → first key check answered, connections opened with a key held), `secure_ready_reconnect_ms`, `ready_ms` + `ready_basis` (the run's own "ready": secure-ready in a hybrid run that has it, else boot accepted), `sign_ms`, `chargers_with_key_at_connect`. First connections only, except `*_reconnect_*`. |
+| `e2` | `null` unless the server restarted in the run. Else `t50_s`, `t95_s`, `t100_s` (`null` = never reached), `population`, `recovered`, `unrecovered`, `curve`, `snapshot_curve`, `integrity{...}`. **v3:** `recovery_rule` (`boot` / `boot + key check`), `recovered_definition`, `key_checked_population`, `boot_checks_failed_after_restart`, `booted_but_key_check_not_passed[]` (Contract 7 §7.7). |
+| `e3` | `null` unless a migration happened. Else, for the **whole fleet**: `final_counts`, `state_timeline{state: [[s, count]]}`, `fleet_size`, `tester_chargers`; the controller's own `controller_counts` and `controller_sum_violations`; `waves[]`, `markers[]`, `rollbacks`, `manual_rollbacks`, `failures[]`, `duration_s`, `phase`; `verification` (`authenticated` / `key installed (not authenticated)` / `partly authenticated` / `nothing migrated`); `pq_checks{total, passed, rejected, rejections[], algorithm, round_trip_ms, first_per_charger_ms, later_ms}`; `deferred{count, station_ids}`; `agent_view{available, migrated_but_no_key[]}`; `charging{...}` (tester's chargers). **v3:** `pq_checks` counts `trigger: "migration"` only (no trigger = migration); `boot_checks{total, passed, rejected, round_trip_ms}`; `pq_enrolled{count, key_ids{}}`; `keys_at_start{known, count, station_ids[]}`. |
+| `e5` | `identity_checks`, `identity_rejected`, `identity_mismatches` (let in by `warn` mode), `identity_mode`, `identity_rejections[]`, `pq_checks`, `pq_passed`, `pq_rejected`, `pq_rejections[]` (v3: each with `trigger`), `connection_failures{}`, `callerrors`, `commands_received`. **v3:** `pq_by_trigger{migration, boot}` (each `{checks, passed, rejected}`), `pq_cut_off`, `pq_cut_off_ids[]` (closed with reason `pq_auth_failed`). |
 
 ## A distribution
 
@@ -59,3 +59,14 @@ box: {whisker_low, q1, median, q3, whisker_high, outliers[]}, ecdf: [[value, per
 - Track B's orchestrator lines have an empty top-level `station_id`/`outcome`;
   the analysis fills them from `payload.station` / `payload.result` in memory
   only (the file is never changed). A filled top-level field is never replaced.
+
+## Contract 7 lines read (v3)
+
+- Tester diary (Track C): `station_connected.pq_key_held` / `pq_key_id`; `station_booted`
+  `{connection, since_connect_ms}`; `station_authenticated` `{connection, challenge_no,
+  since_connect_ms, sign_ms, key_id}`; `station_finished.pq_key_held_at_start`.
+- Server diary: `pq_auth` lines' `payload.trigger` (`migration` / `boot`);
+  `certificate_installed` with `transition: "pq_enrolled"`; `connection_closed` with
+  `reason: "pq_auth_failed"`; every line's `crypto_mode` (compared with the tester's mode).
+- New trust checks: `mode_mismatch` (warn), `started_with_saved_keys` (warn in a migration
+  run, else info), `hybrid_without_boot_checks` (warn).
