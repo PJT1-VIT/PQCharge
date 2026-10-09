@@ -1,6 +1,6 @@
 # PQCharge — Open Items and Limitations
 
-**The single register of everything not yet resolved.** Started 2026-10-03, after the A+B+C integration. **Updated 2026-10-08:** every team item is agreed by A, B and C. **Contract 7 is frozen** (approved by A, B, C), so L03 (meaning of the modes) and L18 (contract approval) are resolved and removed.
+**The single register of everything not yet resolved.** Started 2026-10-03, after the A+B+C integration. **Updated 2026-10-09:** fleet-migration audit added L26–L29. **Earlier, 2026-10-08:** every team item is agreed by A, B and C. **Contract 7 is frozen** (approved by A, B, C), so L03 (meaning of the modes) and L18 (contract approval) are resolved and removed.
 
 ## Rules (all three tracks)
 
@@ -64,6 +64,10 @@ Old numbers (F1, F13, F14, R11, …) differed between the dev plans; F14 meant t
 |---|---|---|---|---|
 | **L17** | **Pure PQC may not run in Windows Python.** Our design record (`docs/limitations.md` R3) and Track B's plan say liboqs's OpenSSL provider does not load into Windows CPython. Pure-PQC runs may then need Linux (WSL or the Pi), a different platform from the other two modes, which affects the fairness of E1/E2. **Not yet tested with Python 3.13 / current OpenSSL.** | Not decided | *Recommended:* Track B runs a timeboxed test (2 days, as the design document's original transport decision did). On Windows: does Python 3.13's `ssl` load the oqs provider (or a native ML-KEM/ML-DSA OpenSSL)? If not, what works on WSL/Linux? Then decide where **all three** modes run, so the comparison stays like for like. Contract 7 v2 then fixes `pqc`. | B leads; A, C |
 | **L19** | **Charger key files cannot be locked down on Windows** (no `chmod 0600`). | Proposed (accepted limitation) | State it in the report. Simulated chargers only; the Pi (Linux) uses mode 0600. | C |
+| **L26** | **Key rotation of already-migrated chargers has no overlap window** (fleet-migration piece M5, the design document's "mid-session rotation" claim). `PQAuthenticator` holds one key per charger, so re-running a migration overwrites the old key before the new one is proven; a failure leaves the charger with no post-quantum identity. The orchestrator itself says rotation "is added later". | Agreed (owner) | Track B builds a rotation flow: keep old + new key during the window, challenge with the new `key_id`, drop the old key only after it verifies, keep the old key on failure (B-P6). Track A adds the trigger endpoint (A-P8); Track C does the analysis and display (C-P11). The charger side is ready (C-P2 keeps the previous key). | B (A, C) |
+| **L27** | **A server restart in the middle of a migration is untested** (M9). Per-charger migration state and enrolled keys survive a restart; the running migration task and its wave status live in memory only. | Not decided | Track B tests it (B-T1) and decides the behaviour (for example: an interrupted migration is reported as `failed`, and in-progress chargers return to `pending`). | B (A) |
+| **L28** | **Migration target label mismatch** (M6): `/api/migration/start` accepts only `target_mode=pqc`, but under Contract 7 an enrolled charger is in **hybrid** mode. | Proposed | Accept `target_mode=hybrid` for the ML-DSA enrolment migration; keep `pqc` for the pure-PQC flow. Track A (A-P7) and Track B (B-P7) change it together. | A + B |
+| **L29** | **The pure-PQC migration flow is not designed** (M7): switching chargers to post-quantum TLS certificates in waves, with rollback. | Not decided | After the liboqs test (L17), Track B designs it as Contract 7 v2 (B-P8). Then Track A adds post-quantum TLS on the server (A-P9) and Track C the charger TLS (C-P10). | B (A, C) |
 
 ## 5. Accepted limitations (stay in the report)
 
