@@ -78,4 +78,41 @@ def measure(slots: list[dict[str, Any]]) -> dict[str, Any]:
                 "median_ms": d["median"], "classical_median_ms": base["median"],
             })
 
-    return {"e1_vs_n": dict(e1), "e2_vs_n": dict(e2), "overhead_vs_classical": overhead}
+    # -- C-P4: "ready" time, like for like (Contract 7) ---------------------
+    # Classical is ready at boot accepted; hybrid once its key check after
+    # boot is answered (e1_handshake.ready_ms). Same dial start for both.
+    ready: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    ready_groups: dict[tuple, dict[str, dict[str, Any]]] = defaultdict(dict)
+    for s in slots:
+        e = s.get("e1") or {}
+        d = e.get("ready_ms") or {}
+        if not d.get("n"):
+            continue
+        ready[_series_name(s)].append({
+            "experiment": s["experiment"], "n": s["n_stations"], "median": d["median"],
+            "p95": d["p95"], "basis": e.get("ready_basis"), "slot": s["key"],
+            "mode": s["crypto_mode"], "tls": s["tls"],
+        })
+        ready_groups[(s["experiment"], s["n_stations"], s["tls"])][s["crypto_mode"]] = e
+    for rows in ready.values():
+        rows.sort(key=lambda r: r["n"])
+    ready_overhead = []
+    for (exp, n, tls), by_mode in sorted(ready_groups.items(), key=lambda kv: (kv[0][0], kv[0][1])):
+        base = (by_mode.get("classical") or {}).get("ready_ms")
+        if not base:
+            continue
+        for mode, e in by_mode.items():
+            if mode == "classical":
+                continue
+            d = e["ready_ms"]
+            ready_overhead.append({
+                "experiment": exp, "n": n, "tls": tls, "mode": mode, "basis": e.get("ready_basis"),
+                "median_ms": d["median"], "classical_median_ms": base["median"],
+                "added_median_ms": (d["median"] - base["median"])
+                if d.get("median") is not None and base.get("median") is not None else None,
+                "median_ratio": (d["median"] / base["median"]) if base.get("median") else None,
+                "p95_ratio": (d["p95"] / base["p95"]) if base.get("p95") else None,
+            })
+
+    return {"e1_vs_n": dict(e1), "e2_vs_n": dict(e2), "overhead_vs_classical": overhead,
+            "ready_vs_n": dict(ready), "ready_overhead_vs_classical": ready_overhead}

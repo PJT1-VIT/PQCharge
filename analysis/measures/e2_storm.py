@@ -18,6 +18,16 @@ its BootNotification again. That is Track A's own definition
 (StationView.is_recovered) -- measured here from the server's "booted"
 line, whose timestamp is exact rather than rounded to a one-second poll.
 
+PHASE C-P4 (Contract 7 section 7.7): in hybrid mode an ENROLLED charger
+must also pass its key check after the boot. So, per charger:
+    not key-checked  recovered = its first "booted" line after the restart
+    key-checked      recovered = the later of that "booted" line and its
+                     first PASSED boot key check (pq_auth, trigger "boot")
+                     after the restart; no passed check -> not recovered.
+"Key-checked" is read from the server's own lines: the boot verifier only
+challenges enrolled chargers, so a charger with a boot key check anywhere in
+the run is enrolled. This is the same rule as Track A's is_recovered.
+
 The clock starts at the RESTART, not the kill: time spent with no server at
 all is the length of the outage we chose, not a property of the fleet.
 
@@ -112,11 +122,34 @@ def measure(run: MatchedRun) -> dict[str, Any] | None:
     population_ids = {e["station_id"] for e in booted if e["_t"] < cutoff}
     population = len(population_ids)
 
-    recovery: dict[str, float] = {}
+    booted_after: dict[str, float] = {}
     for e in booted:
         sid = e["station_id"]
-        if sid in population_ids and e["_t"] >= restart_t and sid not in recovery:
-            recovery[sid] = e["_t"] - restart_t
+        if sid in population_ids and e["_t"] >= restart_t and sid not in booted_after:
+            booted_after[sid] = e["_t"]
+
+    # C-P4: the key check after boot, for enrolled chargers (section 7.7).
+    boot_checks = [c for c in run.pq_checks("boot") if c.get("station_id") in population_ids]
+    key_checked = {c["station_id"] for c in boot_checks}
+    passed_after: dict[str, float] = {}
+    failed_after = 0
+    for c in boot_checks:
+        if c["_t"] < restart_t:
+            continue
+        if (c.get("outcome") or "") == "success":
+            passed_after.setdefault(c["station_id"], c["_t"])
+        else:
+            failed_after += 1
+
+    recovery: dict[str, float] = {}
+    for sid, tb in booted_after.items():
+        if sid in key_checked:
+            tp = passed_after.get(sid)
+            if tp is None:
+                continue  # booted, but never passed its key check: not recovered
+            recovery[sid] = max(tb, tp) - restart_t
+        else:
+            recovery[sid] = tb - restart_t
     times = sorted(recovery.values())
 
     # -- data integrity across the outage ---------------------------------
@@ -168,7 +201,16 @@ def measure(run: MatchedRun) -> dict[str, Any] | None:
     snap_t95 = next((x for x, y in snap if y >= 95.0), None)
 
     return {
-        "recovered_definition": "connected AND BootNotification accepted (Track A StationView.is_recovered)",
+        "recovered_definition": (
+            "connected AND BootNotification accepted, AND (enrolled chargers in hybrid mode) "
+            "key check after boot passed (Contract 7 section 7.7)"
+            if key_checked else
+            "connected AND BootNotification accepted (Track A StationView.is_recovered)"),
+        "recovery_rule": "boot + key check" if key_checked else "boot",
+        "key_checked_population": len(key_checked),
+        "boot_checks_failed_after_restart": failed_after,
+        "booted_but_key_check_not_passed": sorted(
+            sid for sid in booted_after if sid in key_checked and sid not in passed_after)[:50],
         "kill_at_s": (kill_t - run.harness.started_at) if kill_t and run.harness.started_at else None,
         "restart_at_s": restart_t - (run.harness.started_at or restart_t),
         "outage_s": (restart_t - kill_t) if kill_t is not None else None,

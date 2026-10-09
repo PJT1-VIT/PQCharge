@@ -48,6 +48,19 @@ WHERE THE DATA COMES FROM
        C6.1 includes whether the charger holds a key.
 
 Run the load generator with --watch-fleet for (1).
+
+--------------------------------------------------------------------
+PHASE C-P4 (Contract 7)
+
+    - The key checks counted here are the MIGRATION's (trigger
+      "migration", or no trigger in older diaries). The checks after every
+      boot (trigger "boot", hybrid mode) are reported apart, in boot_checks:
+      they are not part of the migration and must not inflate its numbers.
+    - pq_enrolled: chargers that made their own key during the migration
+      (certificate_installed, transition "pq_enrolled"), with their key_ids.
+    - keys_at_start: the tester's chargers that started the
+      run already holding a key saved by an earlier run. For them this
+      migration is a rotation, not a first enrolment (see check.py).
 """
 
 from __future__ import annotations
@@ -110,22 +123,29 @@ def measure(run: MatchedRun) -> dict[str, Any] | None:
         "migration_started", "wave_started", "wave_completed",
         "wave_rolled_back", "migration_completed", "migration_failed",
     )
-    checks = run.migration("connection_attempt", transition="pq_auth")
+    # C-P4: migration checks only; boot checks are reported apart.
+    checks = run.pq_checks("migration")
+    boot_checks = run.pq_checks("boot")
     deferrals = run.migration("station_deferred")
+    enrolled_lines = [
+        e for e in run.migration("certificate_installed")
+        if (e.get("payload") or {}).get("transition") == "pq_enrolled"
+    ]
 
     active_snapshots = [
         (t, s) for t, s in snapshots
         if (s.get("migration") or {}).get("phase", "idle") not in ("idle", None)
         or any(st.get("migration_state") not in (None, "pending") for st in s.get("stations", []))
     ]
-    if not markers and not active_snapshots and not checks and not deferrals:
+    if (not markers and not active_snapshots and not checks and not deferrals
+            and not enrolled_lines):
         return None
 
     # -- the migration window ----------------------------------------------
     begin_candidates = [m["_t"] for m in markers if m.get("event_type") == "migration_started"]
     if active_snapshots:
         begin_candidates.append(active_snapshots[0][0])
-    for group in (markers, checks, deferrals):
+    for group in (markers, checks, deferrals, enrolled_lines):
         if group:
             begin_candidates.append(group[0]["_t"])
     began = min(begin_candidates)
@@ -254,6 +274,21 @@ def measure(run: MatchedRun) -> dict[str, Any] | None:
     agent_view_available = any(
         "pq_key_installed" in r for r in run.harness.of_type("station_finished", "station_crashed")
     )
+    keys_at_start = run.harness.keys_at_start()
+    started_with_keys = sorted(sid for sid, held in keys_at_start.items() if held)
+
+    # -- C-P4: boot checks (hybrid), apart from the migration ----------------
+    boot_passed = [c for c in boot_checks if _result(c) == "success"]
+    boot_durations = [
+        float((c.get("payload") or {}).get("duration_ms"))
+        for c in boot_checks if isinstance((c.get("payload") or {}).get("duration_ms"), (int, float))
+    ]
+    enrolled_key_ids: dict[str, str] = {}
+    for e in enrolled_lines:
+        sid = e.get("station_id")
+        kid = (e.get("payload") or {}).get("key_id")
+        if sid:
+            enrolled_key_ids[sid] = kid
 
     # -- was charging disturbed? (the tester's charging chargers) ----------
     window_end = ended if ended is not None else (run.harness.finished_at or began)
@@ -331,9 +366,25 @@ def measure(run: MatchedRun) -> dict[str, Any] | None:
             "later_ms": stats.describe(later_durations),
         },
         "deferred": {"count": len(deferred_ids), "station_ids": deferred_ids[:50]},
+        "boot_checks": {
+            "total": len(boot_checks),
+            "passed": len(boot_passed),
+            "rejected": len(boot_checks) - len(boot_passed),
+            "round_trip_ms": stats.describe(boot_durations),
+        },
+        "pq_enrolled": {
+            "count": len(enrolled_key_ids),
+            "key_ids": dict(sorted(enrolled_key_ids.items())[:50]),
+        },
         "agent_view": {
             "available": agent_view_available,
             "migrated_but_no_key": sorted(no_key)[:50],
+        },
+        # C-P4: the tester's chargers that started with a saved key.
+        "keys_at_start": {
+            "known": bool(keys_at_start),
+            "count": len(started_with_keys),
+            "station_ids": started_with_keys[:50],
         },
         "charging": {
             "sessions_running_at_start": len(running_at_start),

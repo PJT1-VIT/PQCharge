@@ -96,7 +96,23 @@ STATION_CONNECTED = "station_connected"
 opens: connect_ms (TCP + TLS + WebSocket, station-side), connection (1 =
 first, 2+ = reconnections) and attempt. The same times also appear in
 station_finished's connect_ms list; this line exists so they survive a
-run that is stopped before the station reports (Ctrl-C)."""
+run that is stopped before the station reports (Ctrl-C).
+PHASE C-P3 adds pq_key_held (bool) and pq_key_id: whether the charger held
+a post-quantum key when this connection opened, and which."""
+
+STATION_BOOTED = "station_booted"
+"""PHASE C-P3. One line per connection, the moment the CSMS accepts
+BootNotification: connection and since_connect_ms (dial -> boot accepted,
+same start as connect_ms). The classical "ready" time for E1."""
+
+STATION_AUTHENTICATED = "station_authenticated"
+"""PHASE C-P3, Contract 7 section 7.6. One line each time a charger signs a
+PQAuthChallenge: connection, challenge_no (1 = first on that connection),
+since_connect_ms (dial -> signature ready), sign_ms (signing alone) and
+key_id (never the key itself). On the first challenge of a connection of a
+charger that already held a key, since_connect_ms is the SECURE-READY time,
+E1's hybrid headline. Whether it held a key is on station_connected
+(pq_key_held)."""
 
 STATION_FINISHED = "station_finished"
 """An agent returned. Carries its own counters: attempts, reconnections,

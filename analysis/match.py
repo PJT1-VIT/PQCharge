@@ -89,6 +89,34 @@ class MatchedRun:
             out = [e for e in out if (e.get("payload") or {}).get("transition") == transition]
         return out
 
+    @property
+    def server_mode(self) -> str | None:
+        """
+        PHASE C-P4. The crypto_mode the SERVER wrote on this run's lines
+        (Contract 3 puts it on every line); the most common one if mixed.
+        None when the server has no lines for this run.
+        """
+        counts: dict[str, int] = {}
+        for ev in self.station_events + self.server_events:
+            mode = ev.get("crypto_mode")
+            if mode:
+                counts[mode] = counts.get(mode, 0) + 1
+        return max(counts, key=lambda m: counts[m]) if counts else None
+
+    def pq_checks(self, trigger: str | None = None) -> list[dict[str, Any]]:
+        """
+        PHASE C-P4. Fleet-wide key checks (connection_attempt, transition
+        "pq_auth"). trigger="boot" -> the checks after every accepted boot
+        (Contract 7 section 7.5); trigger="migration" -> the orchestrator's.
+        A line with no trigger (written before Contract 7) is a migration
+        check: that was the only kind.
+        """
+        rows = self.migration("connection_attempt", transition="pq_auth")
+        if trigger is None:
+            return rows
+        return [e for e in rows
+                if ((e.get("payload") or {}).get("trigger") or "migration") == trigger]
+
     def transitions(self, name: str) -> list[dict[str, Any]]:
         """Server lines whose payload.transition equals `name` (e.g. "booted")."""
         return [

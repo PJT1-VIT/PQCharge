@@ -285,7 +285,9 @@
     var html = '<section id="e1"><h2>E1 · Handshake cost</h2><p class="lede">How long a charger takes ' +
       "to connect securely — network connection, TLS encryption, certificate exchange and protocol " +
       "upgrade — measured by the charger itself from dial to ready. The box shows where the middle " +
-      "half of chargers fell; <strong>p95</strong> is the time 95 of every 100 chargers beat.</p>";
+      "half of chargers fell; <strong>p95</strong> is the time 95 of every 100 chargers beat. " +
+      "<strong>Ready</strong> (Contract 7) is measured from the same dial: a classical charger is ready when " +
+      "the server accepts its boot; a hybrid charger only once it has also passed its post-quantum key check.</p>";
 
     if (!list.length) {
       root.insertAdjacentHTML("beforeend", html + empty(
@@ -330,6 +332,22 @@
             esc((s.e1.tls && s.e1.tls.version) || (s.tls ? "?" : "off"))];
         })) + "</div>";
 
+    var readyRows = list.filter(function (s) { return s.e1.ready_ms && s.e1.ready_ms.n; });
+    if (readyRows.length) {
+      html += '<div class="card" style="margin-top:16px"><h3>Time until ready</h3><p class="sub">From the same dial. Boot accepted = the server accepted the charger. Secure-ready = boot accepted <em>and</em> the post-quantum key check answered (hybrid, chargers that already held a key). Signing = the charger\'s signing time alone.</p>' +
+        table([{ t: "Run" }, { t: "Mode" }, { t: "Ready means" }, { t: "Chargers", num: true },
+               { t: "Ready (median)", num: true }, { t: "Ready (p95)", num: true },
+               { t: "Boot accepted (median)", num: true }, { t: "Secure-ready (median)", num: true },
+               { t: "Signing (median)", num: true }],
+          readyRows.map(function (s) {
+            var e = s.e1, r = e.ready_ms, b = e.boot_ready_ms || { n: 0 },
+              sr = e.secure_ready_ms || { n: 0 }, sg = e.sign_ms || { n: 0 };
+            return [esc(slotShort(s)), modeCell(s.crypto_mode), esc(e.ready_basis), int(r.n),
+              ms(r.median), ms(r.p95), b.n ? ms(b.median) : "—", sr.n ? ms(sr.median) : "—",
+              sg.n ? ms(sg.median) : "—"];
+          })) + "</div>";
+    }
+
     var over = (DATA.comparisons.overhead_vs_classical || []).filter(function (r) {
       return e1Exp === "all" || r.experiment === e1Exp;
     });
@@ -339,6 +357,21 @@
                { t: "Classical median", num: true }, { t: "× median", num: true }, { t: "× p95", num: true }],
           over.map(function (r) {
             return [esc(r.experiment), int(r.n), modeCell(r.mode), ms(r.median_ms), ms(r.classical_median_ms),
+              isNum(r.median_ratio) ? fmt(r.median_ratio, 2) + "×" : "—",
+              isNum(r.p95_ratio) ? fmt(r.p95_ratio, 2) + "×" : "—"];
+          })) + "</div>";
+    }
+    var rover = (DATA.comparisons.ready_overhead_vs_classical || []).filter(function (r) {
+      return e1Exp === "all" || r.experiment === e1Exp;
+    });
+    if (rover.length) {
+      html += '<div class="card" style="margin-top:16px"><h3>Time until ready, against classical</h3><p class="sub">Same dial start. Classical = boot accepted; hybrid = boot accepted and key check answered. Added = the extra milliseconds the post-quantum check costs.</p>' +
+        table([{ t: "Experiment" }, { t: "Chargers", num: true }, { t: "Mode" }, { t: "Ready means" },
+               { t: "Median", num: true }, { t: "Classical median", num: true }, { t: "Added", num: true },
+               { t: "× median", num: true }, { t: "× p95", num: true }],
+          rover.map(function (r) {
+            return [esc(r.experiment), int(r.n), modeCell(r.mode), esc(r.basis), ms(r.median_ms), ms(r.classical_median_ms),
+              ms(r.added_median_ms),
               isNum(r.median_ratio) ? fmt(r.median_ratio, 2) + "×" : "—",
               isNum(r.p95_ratio) ? fmt(r.p95_ratio, 2) + "×" : "—"];
           })) + "</div>";
@@ -431,7 +464,8 @@
     var html = '<section id="e2"><h2>E2 · Reconnection storm</h2><p class="lede">The server is killed ' +
       "and restarted mid-run. Every charger reconnects at once, each doing a full secure handshake. " +
       "A charger counts as <strong>recovered</strong> when it is connected <em>and</em> the server has " +
-      "accepted it again (Track A's definition, fixed for every run). The clock starts at the restart.</p>";
+      "accepted it again (Track A's definition, fixed for every run). In hybrid mode an enrolled charger must " +
+      "<em>also</em> pass its post-quantum key check after the boot (Contract 7). The clock starts at the restart.</p>";
 
     if (!list.length) {
       root.insertAdjacentHTML("beforeend", html + empty(
@@ -452,14 +486,16 @@
         [{ t: "Run" }, { t: "Mode" }, { t: "Outage", num: true }, { t: "Had to recover", num: true },
          { t: "T50", num: true }, { t: "T95", num: true }, { t: "T100", num: true }, { t: "Never recovered", num: true },
          { t: "Sessions kept", num: true }, { t: "Lost in transit", num: true }, { t: "Dropped by charger queue", num: true },
-         { t: "Replayed", num: true }, { t: "T95 (fleet polls)", num: true }],
+         { t: "Replayed", num: true }, { t: "T95 (fleet polls)", num: true }, { t: "Recovered means" }],
         list.map(function (s) {
           var e = s.e2, g = e.integrity;
           return [esc(slotShort(s)), modeCell(s.crypto_mode), sec(e.outage_s), int(e.population),
             sec(e.t50_s), sec(e.t95_s), sec(e.t100_s), int(e.unrecovered),
             int(g.sessions_resumed_after_restart) + " / " + int(g.sessions_in_flight_at_kill),
             int(g.events_lost_in_transit), int(g.events_dropped_by_agent_queue),
-            int(g.readings_replayed_from_offline_queue), sec(e.snapshot_t95_s)];
+            int(g.readings_replayed_from_offline_queue), sec(e.snapshot_t95_s),
+            esc(e.recovery_rule === "boot + key check"
+              ? "boot + key check (" + int(e.key_checked_population) + " chargers)" : "boot accepted")];
         })) + "</div>";
     root.insertAdjacentHTML("beforeend", html + "</section>");
 
@@ -544,7 +580,12 @@
       tile("Skipped (offline)", int(d.count), "not attempted, not failed") +
       tile("Duration", sec(e.duration_s), "migration start to finish") +
       tile("Sessions disturbed", int(c.sessions_disturbed) + " / " + int(c.sessions_running_at_start), "tester's chargers charging when it began") +
+      ((e.pq_enrolled || {}).count ? tile("Keys made by chargers", int(e.pq_enrolled.count), "private key never left the charger") : "") +
+      ((e.boot_checks || {}).total ? tile("Boot key checks", int(e.boot_checks.passed) + " / " + int(e.boot_checks.total),
+        "after each boot; not part of the migration") : "") +
       "</div>" +
+      ((e.keys_at_start || {}).count ? '<div class="banner">' + badge("warn") + " " + int(e.keys_at_start.count) +
+        " charger(s) started with a key saved by an earlier run, so for them this migration was a key rotation, not a first enrolment.</div>" : "") +
       '<div class="card"><h3>Chargers by migration state (whole fleet)</h3><p class="sub">Stacked: every charger is in exactly one state; vertical lines mark waves</p><div class="chart tall" id="cE3"></div></div>';
     var rt = q.round_trip_ms || { n: 0 };
     if (rt.n) {
@@ -752,6 +793,9 @@
       tile("Mismatches let in", int(e.identity_mismatches),
         e.identity_mode === "warn" ? "server in 'warn' mode: logged, not refused" : "certificate name did not match") +
       tile("Key checks", int(e.pq_passed) + " / " + int(e.pq_checks), int(e.pq_rejected) + " rejected (post-quantum)") +
+      (e.pq_by_trigger && e.pq_by_trigger.boot.checks ? tile("Boot key checks", int(e.pq_by_trigger.boot.passed) + " / " +
+        int(e.pq_by_trigger.boot.checks), "checked after every boot (hybrid)") : "") +
+      tile("Cut off", int(e.pq_cut_off), "failed the key check after boot; connection closed") +
       tile("Connection failures", int(failures.reduce(function (a, k) { return a + e.connection_failures[k]; }, 0)), failures.join(", ") || "none") +
       tile("Protocol errors", int(e.callerrors), "CALLErrors reported by chargers") +
       tile("Commands received", int(e.commands_received), "e.g. power limits, remote stop") +
@@ -764,8 +808,8 @@
     }
     if (e.pq_rejections && e.pq_rejections.length) {
       html += '<div class="card" style="margin-top:16px"><h3>Rejected post-quantum key checks</h3>' + table(
-        [{ t: "Charger id" }, { t: "At", num: true }, { t: "Reason" }],
-        e.pq_rejections.map(function (r) { return [esc(r.station_id), sec(r.at_s), esc(r.detail)]; })) + "</div>";
+        [{ t: "Charger id" }, { t: "At", num: true }, { t: "When" }, { t: "Reason" }],
+        e.pq_rejections.map(function (r) { return [esc(r.station_id), sec(r.at_s), esc(r.trigger || "migration"), esc(r.detail)]; })) + "</div>";
     }
     root.insertAdjacentHTML("beforeend", html + "</section>");
 
