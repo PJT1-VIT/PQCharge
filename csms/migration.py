@@ -99,9 +99,8 @@ class DisabledController(MigrationController):
     """
     Contract 4 with migration switched off -- and the reason attached.
 
-    Replaces idmanager/stub.py's StubController in the CSMS, so Track A no
-    longer imports Track B's stub and Track B can delete it whenever the
-    coordinated stub removal happens. Same behaviour: IDLE status (the
+    Took over from idmanager/stub.py's StubController (that stub was
+    deleted in PR #23). Same behaviour as the stub had: IDLE status (the
     dashboard's migration panel still works), and the two mutating calls
     raise NotImplementedError, which the HTTP layer turns into a 501 that
     carries the reason.
