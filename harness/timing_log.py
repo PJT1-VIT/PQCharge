@@ -132,6 +132,12 @@ recovery becomes measurable after the fact -- see load_generator's
 FleetWatcher for why the raw snapshot is stored rather than a computed
 verdict."""
 
+MACHINE_SAMPLE = "machine_sample"
+"""PHASE C-P6 (S1). One line per second with --watch-machine: whole-machine
+CPU % and memory %, the tester process's and the CSMS process's CPU / RSS /
+threads, and the tester's event-loop lag (how late a 1 s timer fired).
+station_id is null. Written by harness/machine.py."""
+
 STORM_KILL = "storm_kill"
 STORM_RESTART = "storm_restart"
 """The E2 event itself: the moment the CSMS was taken down, and the

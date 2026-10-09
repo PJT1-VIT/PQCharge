@@ -114,5 +114,26 @@ def measure(slots: list[dict[str, Any]]) -> dict[str, Any]:
                 "p95_ratio": (d["p95"] / base["p95"]) if base.get("p95") else None,
             })
 
+    # -- C-P6 (S1): the laptop against fleet size -----------------------------
+    machine: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for s in slots:
+        m = s.get("machine")
+        if not m:
+            continue
+        machine[_series_name(s)].append({
+            "experiment": s["experiment"], "n": s["n_stations"], "slot": s["key"],
+            "mode": s["crypto_mode"], "tls": s["tls"],
+            "cpu_p95": (m.get("cpu_pct") or {}).get("p95"),
+            "loop_lag_p95": (m.get("loop_lag_ms") or {}).get("p95"),
+            "tester_cpu_p95": ((m.get("tester") or {}).get("cpu_pct") or {}).get("p95"),
+            "tester_rss_mb_max": (m.get("tester") or {}).get("rss_mb_max"),
+            "server_cpu_p95": ((m.get("server") or {}).get("cpu_pct") or {}).get("p95"),
+            "server_rss_mb_max": (m.get("server") or {}).get("rss_mb_max"),
+            "saturated": bool(m.get("saturated")),
+        })
+    for rows in machine.values():
+        rows.sort(key=lambda r: r["n"])
+
     return {"e1_vs_n": dict(e1), "e2_vs_n": dict(e2), "overhead_vs_classical": overhead,
-            "ready_vs_n": dict(ready), "ready_overhead_vs_classical": ready_overhead}
+            "ready_vs_n": dict(ready), "ready_overhead_vs_classical": ready_overhead,
+            "machine_vs_n": dict(machine)}
