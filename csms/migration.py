@@ -350,6 +350,7 @@ def orchestrator_emitter(
     *,
     source: str = "orchestrator",
     on_pq_auth_success: Callable[[str], Any] | None = None,
+    on_pq_auth: Callable[[str, dict[str, Any]], Any] | None = None,
 ) -> Callable[..., Any]:
     """
     The event_emitter the orchestrator is built with.
@@ -375,6 +376,11 @@ def orchestrator_emitter(
     pq_verified, so a station migrated on this connection counts as
     recovered under the hybrid rule without having to reconnect. A
     failure there is logged and never drops the event.
+
+    A-F4: on_pq_auth(station, payload) is called for EVERY key check,
+    success or failure, whatever its trigger (migration, rotation, boot);
+    the server uses it to keep each station's last_pq_check for the
+    dashboard. Same rule: a failure there never drops the event.
     """
 
     def emit(event_type: str, **payload: Any) -> Any:
@@ -387,12 +393,21 @@ def orchestrator_emitter(
         event = event_log.emit(
             event_type, None, source=source, **_safe_payload(payload)
         )
+        is_check = (
+            event_type == "connection_attempt"
+            and payload.get("transition") == "pq_auth"
+            and bool(payload.get("station"))
+        )
+        if is_check and on_pq_auth is not None:
+            try:
+                on_pq_auth(payload["station"], payload)
+            except Exception:  # noqa: BLE001 - never lose the event over this
+                LOGGER.exception("recording the key check of %s failed",
+                                 payload["station"])
         if (
             on_pq_auth_success is not None
-            and event_type == "connection_attempt"
-            and payload.get("transition") == "pq_auth"
+            and is_check
             and payload.get("result") == "success"
-            and payload.get("station")
         ):
             try:
                 on_pq_auth_success(payload["station"])
@@ -401,6 +416,20 @@ def orchestrator_emitter(
         return event
 
     return emit
+
+
+def record_pq_check(registry: Any) -> Callable[[str, dict[str, Any]], None]:
+    """The on_pq_auth hook: keep the station's latest check (A-F4)."""
+
+    def record(station_id: str, payload: dict[str, Any]) -> None:
+        registry.record_pq_check(
+            station_id,
+            result=payload.get("result"),
+            trigger=payload.get("trigger"),
+            duration_ms=payload.get("duration_ms"),
+        )
+
+    return record
 
 
 # =====================================================================
@@ -504,6 +533,8 @@ def build_migration(
             # L34: a passed migration key check also verifies the
             # station's current connection (hybrid recovery rule).
             on_pq_auth_success=registry.mark_pq_verified,
+            # A-F4: every check (migration or rotation) -> last_pq_check.
+            on_pq_auth=record_pq_check(registry),
         ),
         failure_threshold=failure_threshold,
         dispatch_timeout_s=dispatcher.timeout_s,
@@ -540,6 +571,14 @@ def build_migration(
     # Contract 7 section 7.7: lets the registry tell, per station, whether
     # the hybrid recovery rule (wait for the key check) applies.
     registry.set_enrolment_lookup(authenticator.is_enrolled)
+
+    # A-F4: the dashboard shows which key the server holds for each station
+    # (changes after a rotation).
+    def key_id_of(station_id: str) -> str | None:
+        public_key = authenticator.public_key(station_id)
+        return key_id_for(public_key) if public_key else None
+
+    registry.set_key_id_lookup(key_id_of)
 
     reason = (
         f"orchestrator active ({algorithm}, {restored} key(s) restored, "
@@ -616,7 +655,10 @@ def install_boot_check(
         challenge_message_factory=build_challenge_message,
         signature_parser=lambda response: parse_signature(response.data),
         key_id_for=key_id_for,
-        event_emitter=orchestrator_emitter(event_log, source="boot_verifier"),
+        event_emitter=orchestrator_emitter(
+            event_log, source="boot_verifier",
+            on_pq_auth=record_pq_check(registry),     # A-F4
+        ),
         dispatch_timeout_s=dispatcher.timeout_s,
     )
 

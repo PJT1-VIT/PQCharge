@@ -274,6 +274,28 @@ class StationView:
     beside Track B's static measurement of certificates on disk; on
     Day 8 the same field shows the post-quantum certificate arriving."""
 
+    tls_cipher: str | None = None
+    """The TLS cipher suite negotiated on this connection (A-F4, for the
+    dashboard's security inspector). None for plain ws://."""
+
+    identity_ok: bool | None = None
+    """Whether the certificate's Common Name matched the station id on
+    this connection (the --tls-identity-check, A-F4). None for plain ws://
+    or when the check is off. False is only possible in 'warn' mode:
+    'enforce' (the default) refuses a mismatch before the station connects."""
+
+    pq_key_id: str | None = None
+    """key_id of the ML-DSA public key the SERVER holds for this station
+    (Contract 7 section 7.2; A-F4). None if not enrolled. Changes after a
+    key rotation."""
+
+    last_pq_check: dict[str, Any] | None = None
+    """The station's most recent post-quantum key check, whatever started
+    it (A-F4): {at, result, trigger, duration_ms}, where trigger is
+    "migration", "boot" or "rotation" and result "success" or "rejected".
+    Station-level (kept across reconnects, not persisted); None if never
+    checked since the server started."""
+
     power_is_stale: bool = False
     """True when power_w and energy_wh are last-known rather than current
     -- i.e. the station is not connected.
