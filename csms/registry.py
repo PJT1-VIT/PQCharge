@@ -123,6 +123,10 @@ class StationSession:
     reason as boot_accepted: a reconnected station has not proved its
     key again until it is challenged again."""
 
+    identity_ok: bool | None = None
+    """Result of the certificate-CN check on THIS connection (A-F4).
+    None for plain ws:// or when the check is off."""
+
     close_reason: str | None = None
     """Why the SERVER is closing this connection, when it is (A-F1: a
     failed boot key check -> "pq_auth_failed"). deregister() writes it
@@ -303,6 +307,13 @@ class SessionRegistry(FleetView):
         collect a task mid-flight (asyncio keeps only weak references)."""
 
         self._is_enrolled: Callable[[str], bool] | None = None
+        self._key_id_of: Callable[[str], str | None] | None = None
+        """Answers "key_id of the key the server holds for this station"
+        (A-F4); wired by csms/migration.py. None -> pq_key_id is None."""
+
+        self._last_pq_check: dict[str, dict[str, Any]] = {}
+        """station_id -> its latest key check {at, result, trigger,
+        duration_ms} (A-F4). In memory only."""
         """Answers 'does this station hold an enrolled post-quantum key on
         the server?'. Wired by csms/migration.py when migration is
         enabled; None means nobody is enrolled (classical behaviour)."""
@@ -395,6 +406,7 @@ class SessionRegistry(FleetView):
         handshake_ms: float | None = None,
         security: dict[str, Any] | None = None,
         extra: dict[str, Any] | None = None,
+        identity_ok: bool | None = None,
     ) -> StationSession:
         """
         Record a newly opened connection.
@@ -425,6 +437,7 @@ class SessionRegistry(FleetView):
             last_handshake_ms=handshake_ms,
             tls_version=security.get("tls_version"),
             tls_cipher=security.get("tls_cipher"),
+            identity_ok=identity_ok,
             peer_cert_bytes=security.get("peer_cert_bytes"),
         )
         self._sessions[station_id] = session
@@ -655,6 +668,35 @@ class SessionRegistry(FleetView):
         StationView.pq_check_required in hybrid mode.
         """
         self._is_enrolled = is_enrolled
+
+    def set_key_id_lookup(self, key_id_of: Callable[[str], str | None] | None) -> None:
+        """How to read the key_id of a station's enrolled key (A-F4)."""
+        self._key_id_of = key_id_of
+
+    def record_pq_check(
+        self,
+        station_id: str,
+        *,
+        result: str | None,
+        trigger: str | None,
+        duration_ms: float | None,
+    ) -> None:
+        """Remember a station's latest post-quantum key check (A-F4)."""
+        self._last_pq_check[station_id] = {
+            "at": _now().isoformat(),
+            "result": result,
+            "trigger": trigger,
+            "duration_ms": duration_ms,
+        }
+
+    def _pq_key_id(self, station_id: str) -> str | None:
+        if self._key_id_of is None:
+            return None
+        try:
+            return self._key_id_of(station_id)
+        except Exception:  # noqa: BLE001 - a view must always build
+            LOGGER.exception("key_id lookup failed for %s", station_id)
+            return None
 
     def _pq_check_required(self, station_id: str) -> bool:
         """Contract 7 section 7.7: hybrid mode AND enrolled."""
@@ -1034,6 +1076,11 @@ class SessionRegistry(FleetView):
             bytes_rx=session.bytes_rx if session else 0,
             tls_version=session.tls_version if session else None,
             peer_cert_bytes=session.peer_cert_bytes if session else None,
+            tls_cipher=session.tls_cipher if session else None,
+            identity_ok=session.identity_ok if session else None,
+            pq_key_id=self._pq_key_id(station_id),
+            last_pq_check=(dict(self._last_pq_check[station_id])
+                           if station_id in self._last_pq_check else None),
             ocpp_status=state.ocpp_status,
             charging_state=state.charging_state,
             active_transaction_id=state.active_transaction_id,

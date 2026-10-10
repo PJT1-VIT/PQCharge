@@ -58,6 +58,7 @@ import math
 import signal
 import time
 from http import HTTPStatus
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -221,6 +222,46 @@ def _json_response(status: HTTPStatus, payload: Any) -> Response:
         }
     )
     return Response(status.value, status.phrase, headers, body)
+
+
+DASHBOARD_DIR = Path(__file__).resolve().parent.parent / "dashboard" / "static"
+"""Track C's live dashboard (C-F6). Served at /dashboard/ (A-F4)."""
+
+DASHBOARD_TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".js": "application/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".json": "application/json",
+    ".txt": "text/plain; charset=utf-8",
+}
+"""The file types the dashboard needs; anything else is not served."""
+
+
+def _dashboard_response(path: str) -> Response:
+    """
+    Serve one file of dashboard/static/ for a /dashboard/... path (A-F4).
+
+    /dashboard redirects to /dashboard/ (so the page's relative links
+    work); /dashboard/ is index.html. Only files INSIDE dashboard/static/
+    with a listed type are served: "..", absolute paths and anything that
+    resolves outside the folder get 404, never a file from elsewhere.
+    """
+    if path == "/dashboard":
+        headers = Headers({"Location": "/dashboard/", "Content-Length": "0",
+                           "Connection": "close"})
+        return Response(HTTPStatus.MOVED_PERMANENTLY.value,
+                         HTTPStatus.MOVED_PERMANENTLY.phrase, headers, b"")
+    relative = unquote(path[len("/dashboard/"):]) or "index.html"
+    root = DASHBOARD_DIR.resolve()
+    target = (root / relative).resolve()
+    content_type = DASHBOARD_TYPES.get(target.suffix.lower())
+    if (root not in target.parents) or content_type is None or not target.is_file():
+        return _json_response(HTTPStatus.NOT_FOUND, {"error": "not found", "path": path})
+    body = target.read_bytes()
+    headers = Headers({"Content-Type": content_type, "Content-Length": str(len(body)),
+                       "Cache-Control": "no-cache", "Connection": "close"})
+    return Response(HTTPStatus.OK.value, HTTPStatus.OK.phrase, headers, body)
 
 
 def _fleet_summary(results: list[Any], **extra: Any) -> dict[str, Any]:
@@ -439,6 +480,7 @@ class CSMS:
             await websocket.close(code=1008, reason="station id required in path")
             return
 
+        identity_ok: bool | None = None   # A-F4: None for ws:// or check off
         if self.ssl_context is not None:
             ok, common_name = check_identity(
                 station_id, websocket, mode=self.identity_check
@@ -457,6 +499,8 @@ class CSMS:
                     code=1008, reason="certificate identity mismatch"
                 )
                 return
+            if self.identity_check != "off":
+                identity_ok = common_name == station_id
 
         seen_at_ns = getattr(websocket, CONNECTION_START_ATTR, None)
         setup_ms = (
@@ -487,6 +531,7 @@ class CSMS:
             security={k: v for k, v in security.items()
                       if k != "peer_common_name"},
             extra={"handshake_scope": HANDSHAKE_SCOPE},
+            identity_ok=identity_ok,
         )
         LOGGER.info("station connected: %s", station_id)
 
@@ -529,6 +574,17 @@ class CSMS:
         parsed = urlparse(request.path)
         path = parsed.path
 
+        if path == "/dashboard" or path.startswith("/dashboard/"):
+            # A-F4: Track C's live page. Before the WebSocket check because
+            # a browser asks for it with an ordinary GET.
+            try:
+                return _dashboard_response(path)
+            except Exception:
+                LOGGER.exception("dashboard: error serving %s", path)
+                return _json_response(
+                    HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal error"}
+                )
+
         if not path.startswith("/api/"):
             return None  # not ours — proceed with the WebSocket handshake
 
@@ -558,8 +614,28 @@ class CSMS:
                     "run_id": self.log.run_id,
                     "crypto_mode": self.crypto_mode,
                     "migration": self.migration.reason,
+                    # A-F4: the dashboard header
+                    "tls": self.ssl_context is not None,
+                    "identity_check": (
+                        self.identity_check if self.ssl_context is not None else "off"
+                    ),
+                    "pq_algorithm": self.migration.algorithm,
+                    "boot_check": self.boot_verifier is not None,
                 },
             )
+
+        if path == "/api/events":
+            # A-F4: the dashboard's live ticker. ?after=<seq>&limit=<n>
+            try:
+                after = int(query.get("after", ["0"])[0] or 0)
+                limit = int(query.get("limit", ["500"])[0] or 500)
+            except ValueError:
+                return _json_response(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "after and limit must be integers",
+                     "example": "/api/events?after=0&limit=500"},
+                )
+            return _json_response(HTTPStatus.OK, self.log.events_after(after, limit))
 
         if path == "/api/fleet":
             return _json_response(HTTPStatus.OK, self.registry.snapshot().to_dict())

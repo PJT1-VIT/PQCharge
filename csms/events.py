@@ -24,6 +24,7 @@ import os
 import threading
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from enum import Enum
@@ -172,6 +173,10 @@ class Event:
         return cls(**json.loads(line))
 
 
+RECENT_EVENTS = 2000
+"""How many recent events EventLog keeps in memory for /api/events."""
+
+
 class EventLog:
     """
     Append-only writer. One instance per server process.
@@ -193,6 +198,11 @@ class EventLog:
         self.crypto_mode = crypto_mode
         self._lock = threading.Lock()
         self._fh = self.path.open("a", encoding="utf-8")
+        self._seq = 0
+        self._recent: deque[tuple[int, str]] = deque(maxlen=RECENT_EVENTS)
+        """The last RECENT_EVENTS lines, in memory, each with a sequence
+        number, for the live dashboard (A-F4, GET /api/events). The seq is
+        NOT written to the file: the JSONL format above is unchanged."""
 
     def emit(
         self,
@@ -232,7 +242,31 @@ class EventLog:
             self._fh.write(line + "\n")
             self._fh.flush()
             os.fsync(self._fh.fileno())
+            self._seq += 1
+            self._recent.append((self._seq, line))
         return event
+
+    def events_after(self, after: int = 0, limit: int = 500) -> dict[str, Any]:
+        """
+        The recent events with seq > after, oldest first, at most `limit`
+        (A-F4, GET /api/events). Each event is the exact dict written to the
+        file plus "seq". Returns {"events": [...], "last_seq": n}.
+
+        last_seq is the newest seq this process has given out. A reader
+        whose `after` is larger (the server restarted, numbering began
+        again) gets no events and the smaller last_seq, and simply
+        continues from there.
+        """
+        limit = max(1, min(int(limit), RECENT_EVENTS))
+        with self._lock:
+            last_seq = self._seq
+            picked = [(seq, line) for seq, line in self._recent if seq > after][:limit]
+        events = []
+        for seq, line in picked:
+            event = json.loads(line)
+            event["seq"] = seq
+            events.append(event)
+        return {"events": events, "last_seq": last_seq}
 
     def close(self) -> None:
         with self._lock:
