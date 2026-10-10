@@ -49,7 +49,8 @@ rather than by lock. There is no field either track may write.
 
   Track A (csms) owns:   connection_state, ocpp_status, charging_state,
                          power_w, energy_wh, active_transaction_id,
-                         boot_accepted, last_heartbeat_at,
+                         boot_accepted, pq_verified,
+                         pq_check_required, last_heartbeat_at,
                          connected_since, last_handshake_ms
   Track B (idmanager)    migration_state, migration_wave,
   owns:                  certificate_serial, certificate_expiry,
@@ -189,6 +190,25 @@ class StationView:
     AND boot_accepted -- the first instant at which the station is
     genuinely back in the fleet rather than merely reachable."""
 
+    pq_verified: bool = False
+    """Whether this station has passed a post-quantum key check (ML-DSA
+    signature over a fresh nonce) on its CURRENT connection. Contract 7
+    section 7.7.
+
+    Session-scoped exactly like boot_accepted: every new connection
+    starts False. Set by a passed boot check (Track B's boot verifier,
+    wired by Track A in A-P3) or by a passed migration check on the same
+    connection (L34)."""
+
+    pq_check_required: bool = False
+    """Whether is_recovered must wait for pq_verified: True only when the
+    server runs --mode hybrid AND this station is enrolled (holds an
+    ML-DSA public key on the server). Computed by the server, not by the
+    reader, so every consumer of /api/fleet -- Track C's watcher, E2
+    analysis, the dashboard -- applies the same rule from the row alone
+    (Contract 7 section 7.7). False for classical runs and for stations
+    not yet enrolled, which therefore recover exactly as before."""
+
     connected_since: datetime | None = None
     """When the current connection opened. None when not connected.
     Timezone-aware UTC."""
@@ -317,10 +337,19 @@ class StationView:
         comparison across all twelve runs. Putting it here means the
         dashboard, the load generator and the analysis scripts cannot
         disagree about it.
+
+        Contract 7 section 7.7, per mode:
+          - classical, or a station not enrolled: connected AND booted
+            (unchanged);
+          - hybrid AND enrolled (pq_check_required): connected AND booted
+            AND pq_verified on this connection.
+        It reads only fields of this row, so a reader that rebuilds a
+        StationView from /api/fleet JSON gets the same answer.
         """
         return (
             self.connection_state == ConnectionState.CONNECTED.value
             and self.boot_accepted
+            and (self.pq_verified or not self.pq_check_required)
         )
 
 

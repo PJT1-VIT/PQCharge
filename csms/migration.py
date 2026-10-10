@@ -16,8 +16,8 @@ in crypto/, idmanager/ or agent/:
     build_migration()           builds the real orchestrator with the real
                                 CommandDispatcher, the real registry (via
                                 Track B's FleetAdapter) and Track C's
-                                build_install_message -- or, if the
-                                post-quantum library is missing, a
+                                enrolment builders (Contract 7) -- or, if
+                                the post-quantum library is missing, a
                                 DisabledController that says why.
 
     PersistentPQAuthenticator   Track B's PQAuthenticator, plus storage:
@@ -32,7 +32,9 @@ in crypto/, idmanager/ or agent/:
                                 "incompatible".
 
     orchestrator_emitter        routes the orchestrator's migration events
-                                into Contract 3, marked source="orchestrator".
+                                into Contract 3, marked source="orchestrator"
+                                (L31), and marks the station's connection
+                                pq_verified when a key check passes (L34).
 
 --------------------------------------------------------------------
 WHO OWNS WHAT (agreed Day 9)
@@ -41,16 +43,30 @@ WHO OWNS WHAT (agreed Day 9)
   Track B  the orchestrator's behaviour; the fleet-profile CONTENTS (which
            stations support what -- supported_algorithms is a Track B field
            under Contract 6); the post-quantum challenge check itself.
-  Track C  the station's answer to InstallPQAuth / PQAuthChallenge.
+  Track C  the station's answer to RequestPQEnrolment / PQAuthChallenge.
+
+HOW A STATION IS ENROLLED (Contract 7 section 7.4, since A-P4)
+
+The orchestrator sends RequestPQEnrolment. The STATION makes its own
+ML-DSA key pair, keeps the private key on its own disk, and answers with
+the public key and its key_id only. The orchestrator enrols that public
+key, then sends a PQAuthChallenge naming the key_id. No private key is
+made by, sent by, or ever seen by this server (L01). Before A-P4 the
+server made the key pair and sent the private key in InstallPQAuth; that
+path is still built (keypair_factory / install_message_factory below) but
+is NOT USED while the two Contract 7 factories are given -- it stays only
+so the switch can be undone in one edit if the A+B+C re-test fails, and
+is removed in A-P6.
 
 WHAT "MIGRATED" MEANS (since Track B's Day 12, PR #19)
 
-After a station ACCEPTS its InstallPQAuth, the orchestrator sends it a
-PQAuthChallenge (a fresh nonce) and marks it MIGRATED only if the ML-DSA
-signature it returns verifies against the public key just enrolled.
-"Migrated" therefore means AUTHENTICATED, not "accepted a message". Each
-check is logged as connection_attempt / transition="pq_auth", with the
-station id in payload.station and the result in payload.result.
+The orchestrator marks a station MIGRATED only if the ML-DSA signature it
+returns to a PQAuthChallenge (a fresh nonce) verifies against the public
+key just enrolled. "Migrated" therefore means AUTHENTICATED, not
+"accepted a message". Each check is logged as connection_attempt /
+transition="pq_auth", with the station id in payload.station and the
+result in payload.result; each enrolment as certificate_installed /
+transition="pq_enrolled" with the key_id.
 
 A station that is not connected when its wave runs is skipped
 (skip_offline): it stays PENDING, is never sent a key, gets one
@@ -315,7 +331,12 @@ def apply_fleet_profile(registry: Any, profile: dict[str, list[str]]) -> tuple[i
 # =====================================================================
 
 
-def orchestrator_emitter(event_log: Any) -> Callable[..., Any]:
+def orchestrator_emitter(
+    event_log: Any,
+    *,
+    source: str = "orchestrator",
+    on_pq_auth_success: Callable[[str], Any] | None = None,
+) -> Callable[..., Any]:
     """
     The event_emitter the orchestrator is built with.
 
@@ -327,12 +348,43 @@ def orchestrator_emitter(event_log: Any) -> Callable[..., Any]:
     _safe_payload guard as the handlers: a key that shadowed an emit()
     parameter would raise inside the migration task and silently drop
     the event -- the A3 bug, in a new place.
+
+    L31 (agreed by Track A 2026-10-10): `source` is added HERE, never by
+    the caller. A caller that passes its own `source` anyway has it
+    dropped with a warning instead of raising TypeError inside
+    EventLog.emit (which would lose the event). The boot verifier's
+    emitter (A-P3) is this same function with source="boot_verifier".
+
+    L34: when a key check passes (connection_attempt, transition
+    "pq_auth", result "success"), on_pq_auth_success(station) is called --
+    the server uses it to mark that station's current connection
+    pq_verified, so a station migrated on this connection counts as
+    recovered under the hybrid rule without having to reconnect. A
+    failure there is logged and never drops the event.
     """
 
     def emit(event_type: str, **payload: Any) -> Any:
-        return event_log.emit(
-            event_type, None, source="orchestrator", **_safe_payload(payload)
+        if "source" in payload:
+            LOGGER.warning(
+                "event %s: caller passed source=%r; ignored, this emitter "
+                "writes source=%r (L31)", event_type, payload["source"], source,
+            )
+            payload = {k: v for k, v in payload.items() if k != "source"}
+        event = event_log.emit(
+            event_type, None, source=source, **_safe_payload(payload)
         )
+        if (
+            on_pq_auth_success is not None
+            and event_type == "connection_attempt"
+            and payload.get("transition") == "pq_auth"
+            and payload.get("result") == "success"
+            and payload.get("station")
+        ):
+            try:
+                on_pq_auth_success(payload["station"])
+            except Exception:  # noqa: BLE001 - never lose the event over this
+                LOGGER.exception("marking %s pq_verified failed", payload["station"])
+        return event
 
     return emit
 
@@ -380,7 +432,9 @@ def build_migration(
         from crypto.pq import PQProvider
         from agent.pqc_messages import (
             build_challenge_message,
+            build_enrolment_request,
             build_install_message,
+            parse_enrolment_reply,
             parse_signature,
         )
         from idmanager.fleet_adapter import FleetAdapter
@@ -412,16 +466,33 @@ def build_migration(
         dispatcher=dispatcher,
         authenticator=authenticator,
         fleet=FleetAdapter(registry),
+        # A-P4 (Contract 7 section 7.4): the STATION makes its key pair and
+        # answers with the public key only. Given together, these two
+        # replace keypair_factory / install_message_factory below, which the
+        # orchestrator then never calls (Track B, PR #32). The parser raises
+        # on a reply that contains a private key or a key_id that does not
+        # match the key; the orchestrator fails that one station for it.
+        enrolment_request_factory=build_enrolment_request,
+        public_key_parser=lambda response: parse_enrolment_reply(response.data),
+        # Deprecated InstallPQAuth path: unused while the two above are
+        # given. Kept only so A-P4 can be undone by deleting two lines if
+        # the A+B+C re-test fails; removed in A-P6 (closes L04).
         keypair_factory=provider.generate_keypair,
         install_message_factory=functools.partial(
             build_install_message, algorithm=algorithm
         ),
-        event_emitter=orchestrator_emitter(event_log),
+        event_emitter=orchestrator_emitter(
+            event_log,
+            # L34: a passed migration key check also verifies the
+            # station's current connection (hybrid recovery rule).
+            on_pq_auth_success=registry.mark_pq_verified,
+        ),
         failure_threshold=failure_threshold,
         dispatch_timeout_s=dispatcher.timeout_s,
         target_algorithm=algorithm,
-        # Day 12 (Track B, PR #19): proof of possession. After InstallPQAuth
-        # is accepted, send PQAuthChallenge; MIGRATED only if it verifies.
+        # Day 12 (Track B, PR #19): proof of possession. After the station's
+        # public key is enrolled, send PQAuthChallenge (with its key_id);
+        # MIGRATED only if it verifies.
         # The orchestrator calls the parser only for an answered challenge
         # and treats any exception from it as a failed station.
         challenge_message_factory=build_challenge_message,
@@ -448,9 +519,14 @@ def build_migration(
             len(orphans), ", ".join(orphans[:5]),
         )
 
+    # Contract 7 section 7.7: lets the registry tell, per station, whether
+    # the hybrid recovery rule (wait for the key check) applies.
+    registry.set_enrolment_lookup(authenticator.is_enrolled)
+
     reason = (
         f"orchestrator active ({algorithm}, {restored} key(s) restored, "
-        f"challenge after install, offline stations deferred)"
+        f"station-made keys, challenge after enrolment, "
+        f"offline stations deferred)"
     )
     LOGGER.info("migration: %s", reason)
     return MigrationSetup(

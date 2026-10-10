@@ -32,11 +32,13 @@ called from elsewhere.
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import logging
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from crypto.identity import MigrationState, StationIdentity
 from csms.events import EventLog, EventType, Outcome
@@ -105,6 +107,12 @@ class StationSession:
     StationState: a reconnected station has not identified itself until
     it boots again, and the E2 recovery predicate depends on that being
     true. Half of Contract 6's is_recovered."""
+
+    pq_verified: bool = False
+    """Set when this station passes a post-quantum key check on THIS
+    connection (Contract 7 section 7.7). Per-connection for the same
+    reason as boot_accepted: a reconnected station has not proved its
+    key again until it is challenged again."""
 
     last_heartbeat_at: datetime | None = None
     """Per-connection: a heartbeat proves this socket is alive."""
@@ -270,6 +278,19 @@ class SessionRegistry(FleetView):
         self._crypto_mode = crypto_mode
         self._run_id = run_id
         self._migration_controller = migration_controller
+
+        self._boot_listeners: list[Callable[[str], Any]] = []
+        """Called after every accepted and answered BootNotification
+        (Contract 7 section 7.5 (1)). See add_boot_listener."""
+
+        self._listener_tasks: set[asyncio.Task] = set()
+        """Running listener tasks. Held so the event loop cannot garbage-
+        collect a task mid-flight (asyncio keeps only weak references)."""
+
+        self._is_enrolled: Callable[[str], bool] | None = None
+        """Answers 'does this station hold an enrolled post-quantum key on
+        the server?'. Wired by csms/migration.py when migration is
+        enabled; None means nobody is enrolled (classical behaviour)."""
 
     def attach_migration_controller(self, controller: Any) -> None:
         """
@@ -492,6 +513,102 @@ class SessionRegistry(FleetView):
         session = self._sessions.get(station_id)
         if session is not None:
             session.boot_accepted = True
+
+    # -- Contract 7: boot hook and post-quantum verification (A-P1, A-P2) --
+
+    def add_boot_listener(self, fn: Callable[[str], Any]) -> None:
+        """
+        Register fn(station_id) to run after every BootNotification that
+        was accepted AND answered (Contract 7 section 7.5 (1)).
+
+        fn may be a plain function or a coroutine function. Each call runs
+        on its OWN asyncio task, never on the station's receive loop, so a
+        listener may `await dispatcher.send(...)` to the same station --
+        dispatch rule 1 refuses only the receive-loop task itself.
+
+        A listener that raises is logged and ignored: it never affects the
+        station's connection or the other listeners.
+        """
+        self._boot_listeners.append(fn)
+
+    def notify_boot(self, station_id: str, connection: Any) -> list[asyncio.Task]:
+        """
+        Fire the boot listeners for one station. Called by csms/handlers.py
+        from the ocpp library's @after("BootNotification") hook, which runs
+        only after the BootNotification reply has been sent.
+
+        Fires only if `connection` is still this station's current session
+        and its boot was accepted -- a boot answered on a connection that
+        has since been replaced is not announced. Returns the tasks started
+        (for tests); callers need not await them.
+        """
+        session = self._sessions.get(station_id)
+        if session is None or session.connection is not connection:
+            return []
+        if not session.boot_accepted:
+            return []
+        tasks = []
+        for fn in list(self._boot_listeners):
+            task = asyncio.get_running_loop().create_task(
+                self._run_boot_listener(fn, station_id),
+                name=f"boot-listener:{station_id}",
+            )
+            self._listener_tasks.add(task)
+            task.add_done_callback(self._listener_tasks.discard)
+            tasks.append(task)
+        return tasks
+
+    @staticmethod
+    async def _run_boot_listener(fn: Callable[[str], Any], station_id: str) -> None:
+        try:
+            result = fn(station_id)
+            if inspect.isawaitable(result):
+                await result
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - a listener must never hurt the station
+            LOGGER.exception("boot listener %r failed for %s", fn, station_id)
+
+    def mark_pq_verified(
+        self, station_id: str, *, session: StationSession | None = None
+    ) -> bool:
+        """
+        Record that the station passed a post-quantum key check on its
+        current connection (Contract 7 section 7.7).
+
+        Pass `session` (from get_session, taken when the check STARTED) to
+        guard against a reconnect during the check: if the station has
+        reconnected since, the result belongs to a connection that no
+        longer exists and nothing is marked. Same race, same remedy, as
+        deregister()'s connection check.
+
+        Returns True if a session was marked.
+        """
+        current = self._sessions.get(station_id)
+        if current is None:
+            return False
+        if session is not None and current is not session:
+            return False
+        current.pq_verified = True
+        return True
+
+    def set_enrolment_lookup(self, is_enrolled: Callable[[str], bool] | None) -> None:
+        """
+        Tell the registry how to ask whether a station is enrolled
+        (normally PQAuthenticator.is_enrolled). Used only to compute
+        StationView.pq_check_required in hybrid mode.
+        """
+        self._is_enrolled = is_enrolled
+
+    def _pq_check_required(self, station_id: str) -> bool:
+        """Contract 7 section 7.7: hybrid mode AND enrolled."""
+        if self._crypto_mode != "hybrid" or self._is_enrolled is None:
+            return False
+        try:
+            return bool(self._is_enrolled(station_id))
+        except Exception:  # noqa: BLE001 - a view must always build
+            LOGGER.exception("enrolment lookup failed for %s", station_id)
+            return False
 
     def record_bytes(
         self, station_id: str, *, tx: int = 0, rx: int = 0
@@ -850,6 +967,8 @@ class SessionRegistry(FleetView):
             station_id=station_id,
             connection_state=connection_state.value,
             boot_accepted=bool(session and session.boot_accepted),
+            pq_verified=bool(session and session.pq_verified),
+            pq_check_required=self._pq_check_required(station_id),
             connected_since=session.connected_since if session else None,
             last_seen_at=state.last_seen_at,
             last_heartbeat_at=session.last_heartbeat_at if session else None,
