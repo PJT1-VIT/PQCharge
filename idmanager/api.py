@@ -111,6 +111,13 @@ class MigrationStatus:
     started_at: datetime | None = None
     completed_at: datetime | None = None
 
+    kind: str = "migration"
+    """"migration" (enrol stations onto ML-DSA) or "rotation" (give already
+    enrolled stations a new key with an overlap window; B-F2). In a
+    rotation run, `migrated` counts stations rotated and `rolled_back`
+    counts stations that KEPT THEIR OLD KEY (failed rotation, or their wave
+    was rolled back) -- they stay migrated and keep working."""
+
     def to_dict(self) -> dict[str, Any]:
         """
         JSON-serialisable form for the status page.
@@ -167,6 +174,18 @@ class MigrationController(ABC):
                 concurrent migrations over one fleet would produce
                 stations in indeterminate states.
         """
+
+    def start_rotation(self, wave_size: int, canary_count: int) -> str:
+        """
+        Give every enrolled station a NEW ML-DSA key, in canary and waves,
+        with an overlap window: the old key stays valid until the new one is
+        proven (B-F2, M5, L26). Returns a run id; progress is reported by
+        get_migration_status() with kind="rotation".
+
+        Not abstract, so controllers that cannot rotate (Track A's
+        DisabledController) need no change: they refuse.
+        """
+        raise NotImplementedError("key rotation is not available")
 
     @abstractmethod
     def rollback(self, wave_id: int) -> bool:

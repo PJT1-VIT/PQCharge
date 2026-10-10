@@ -97,6 +97,9 @@ class PQAuthenticator:
         self._provider = provider
         self._ttl_s = challenge_ttl_s
         self._enrolled: dict[str, bytes] = {}
+        self._staged: dict[str, bytes] = {}
+        """station_id -> a NEW public key being rotated in (B-F2, L26). The
+        enrolled (old) key stays the station's identity until commit."""
         self._outstanding: dict[str, dict[bytes, Challenge]] = {}
         """station_id -> {nonce: Challenge}, oldest first (dicts keep
         insertion order)."""
@@ -126,6 +129,41 @@ class PQAuthenticator:
         """
         self._enrolled.pop(station_id, None)
         self._outstanding.pop(station_id, None)
+        self._staged.pop(station_id, None)
+
+    # -- key rotation with an overlap window (B-F2, M5, L26) -----------------
+    #
+    #   stage_key(new)  -> the old key is STILL the station's identity: boot
+    #                      checks and everything else verify against it;
+    #   verify_response(..., staged=True) checks a challenge against the new key;
+    #   commit_staged() -> the new key replaces the old one (via enrol(), so
+    #                      Track A's PersistentPQAuthenticator saves it);
+    #   discard_staged() -> the new key is forgotten, the old one is untouched.
+    #
+    # So at no moment is the station left without a working identity: that
+    # is the overlap window the design document's rotation claim needs.
+
+    def stage_key(self, station_id: str, new_public_key: bytes) -> None:
+        """Hold a new key next to the enrolled one. Station must be enrolled."""
+        if station_id not in self._enrolled:
+            raise AuthError(f"station {station_id!r} is not enrolled; nothing to rotate")
+        self._staged[station_id] = bytes(new_public_key)
+
+    def staged_key(self, station_id: str) -> bytes | None:
+        return self._staged.get(station_id)
+
+    def commit_staged(self, station_id: str) -> bytes:
+        """Make the staged key the station's key. Returns the OLD key."""
+        new = self._staged.pop(station_id, None)
+        if new is None:
+            raise AuthError(f"no staged key for station {station_id!r}")
+        old = self._enrolled[station_id]
+        self.enrol(station_id, new)
+        return old
+
+    def discard_staged(self, station_id: str) -> None:
+        """Forget the staged key; the enrolled key is untouched."""
+        self._staged.pop(station_id, None)
 
     def public_key(self, station_id: str) -> bytes | None:
         """
@@ -172,6 +210,8 @@ class PQAuthenticator:
         station_id: str,
         response_signature: bytes,
         nonce: bytes | None = None,
+        *,
+        staged: bool = False,
     ) -> bool:
         """
         Check a station's signed response to its outstanding challenge.
@@ -214,9 +254,13 @@ class PQAuthenticator:
         if time.monotonic() - challenge.issued_at > self._ttl_s:
             raise AuthError(f"challenge for station {station_id!r} has expired")
 
-        return self._provider.verify(
-            self._enrolled[station_id], challenge.nonce, response_signature
-        )
+        key = self._enrolled[station_id]
+        if staged:
+            # B-F2: a rotation check is against the NEW (staged) key.
+            key = self._staged.get(station_id)
+            if key is None:
+                raise AuthError(f"no staged key for station {station_id!r}")
+        return self._provider.verify(key, challenge.nonce, response_signature)
 
 
 def sign_challenge(
