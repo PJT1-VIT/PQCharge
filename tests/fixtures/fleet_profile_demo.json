@@ -1,0 +1,25 @@
+{
+  "description": "Final demo fleet (Track B 2026-10-10): 49 simulated chargers + the Raspberry Pi. CP0000: the PHYSICAL charger (Raspberry Pi, GPIOPower), ML-DSA capable; its id sorts first, so with canary_count >= 1 the Pi is migrated in the canary. (A dashed id such as CP-PI01 cannot be used: the profile reads 'A-B' as a range.) CP0001-CP0045: Track C agents, ML-DSA capable. CP0046-CP0049: Track C agents declared LEGACY (skipped as incompatible - the heterogeneous fleet).",
+  "groups": [
+    {
+      "stations": "CP0000",
+      "supported_algorithms": [
+        "ECDSA-P256",
+        "ML-DSA-44"
+      ]
+    },
+    {
+      "stations": "CP0001-CP0045",
+      "supported_algorithms": [
+        "ECDSA-P256",
+        "ML-DSA-44"
+      ]
+    },
+    {
+      "stations": "CP0046-CP0049",
+      "supported_algorithms": [
+        "ECDSA-P256"
+      ]
+    }
+  ]
+}

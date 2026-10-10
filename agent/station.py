@@ -190,6 +190,11 @@ class ChargingStation(StationCommands):
         # Contract 5. Injectable so a test can pass a fake, and so the
         # Raspberry Pi's GPIOPower drops in later by changing one line
         # in main() rather than editing this class.
+        # B-F8: --power gpio builds the Raspberry Pi's GPIOPower (imported
+        # only then, so the simulated fleet never needs GPIO libraries).
+        if power is None and getattr(config, "power_backend", "sim") == "gpio":
+            from agent.gpio_power import build_power
+            power = build_power(config)
         self.power: PowerInterface = power or SimulatedPower(
             max_power_w=config.max_power_w
         )

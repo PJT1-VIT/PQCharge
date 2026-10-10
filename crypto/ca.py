@@ -27,6 +27,7 @@ path (see _signing_key docstring and docs/limitations.md) resolve it.
 from __future__ import annotations
 
 import datetime
+import ipaddress
 from dataclasses import dataclass
 
 from cryptography import x509
@@ -150,9 +151,23 @@ class CertificateAuthority:
         )
         if san_names:
             builder = builder.add_extension(
-                x509.SubjectAlternativeName([x509.DNSName(n) for n in san_names]),
+                x509.SubjectAlternativeName([_san_entry(n) for n in san_names]),
                 critical=False,
             )
+        # L06 (B-F3, 2026-10-10): Authority and Subject Key Identifiers.
+        # Strict X.509 verification (Python 3.13's ssl.create_default_context,
+        # OpenSSL's X509_STRICT) rejects a leaf without an AKI -- seen in the
+        # A+B+C session Step 1b. BasicConstraints marks the leaf as not a CA.
+        builder = (
+            builder
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+            .add_extension(x509.SubjectKeyIdentifier.from_public_key(public_key_obj), critical=False)
+            .add_extension(
+                x509.AuthorityKeyIdentifier.from_issuer_public_key(
+                    serialization.load_der_public_key(self._root_public_der)),
+                critical=False,
+            )
+        )
 
         certificate = builder.sign(self._signing_key(), hashes.SHA256())
 
@@ -175,6 +190,13 @@ class CertificateAuthority:
             .not_valid_before(now)
             .not_valid_after(now + datetime.timedelta(days=ROOT_VALIDITY_DAYS))
             .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+            # L06: a CA that strict verifiers accept needs keyCertSign and a
+            # Subject Key Identifier (which the leaves' AKI points at).
+            .add_extension(x509.KeyUsage(
+                digital_signature=True, content_commitment=False, key_encipherment=False,
+                data_encipherment=False, key_agreement=False, key_cert_sign=True,
+                crl_sign=True, encipher_only=False, decipher_only=False), critical=True)
+            .add_extension(x509.SubjectKeyIdentifier.from_public_key(public_key_obj), critical=False)
         )
         return builder.sign(self._signing_key(), hashes.SHA256())
 
@@ -192,3 +214,12 @@ class CertificateAuthority:
         PQC path. __init__ guards against reaching this in non-classical mode.
         """
         return serialization.load_der_private_key(self._root_private_der, password=None)
+
+
+def _san_entry(name: str) -> x509.GeneralName:
+    """A SAN entry: an IP address for an IP literal (the laptop's hotspot
+    address, used by the Raspberry Pi), a DNS name otherwise."""
+    try:
+        return x509.IPAddress(ipaddress.ip_address(name))
+    except ValueError:
+        return x509.DNSName(name)
