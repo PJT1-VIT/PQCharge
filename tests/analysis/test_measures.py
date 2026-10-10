@@ -196,5 +196,8 @@ def test_e4_measures_the_post_quantum_artifacts_and_the_wire_messages():
     rows = {(r["group"], r["label"]): r for r in e4_sizes.measure()["rows"]}
     assert rows[("post-quantum", "Signature")]["bytes"] == 2420      # ML-DSA-44
     assert rows[("post-quantum", "Public key")]["bytes"] == 1312
-    install = rows[("on the wire", "InstallPQAuth payload")]["bytes"]
-    assert install > 2560 * 4 // 3, "base64 of a 2560-byte key, inside JSON"
+    # C-F5: Contract 7's messages; InstallPQAuth (a server-made private key) is gone.
+    reply = rows[("on the wire", "RequestPQEnrolment reply (public key)")]["bytes"]
+    assert reply > 1312 * 4 // 3, "base64 of the 1312-byte public key, inside JSON"
+    assert ("on the wire", "InstallPQAuth payload") not in rows
+    assert rows[("on the wire", "RequestPQEnrolment payload")]["bytes"] < 100

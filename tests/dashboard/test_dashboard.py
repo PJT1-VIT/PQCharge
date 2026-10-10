@@ -117,6 +117,9 @@ def test_a_rotation_gives_every_migrated_charger_a_new_key_without_disconnecting
     assert len(done) == len(before)
     assert all(e["payload"]["old_key_id"] != e["payload"]["new_key_id"] for e in done)
     assert all(s["connection_state"] == "connected" for s in fleet.fleet()["stations"])
+    # Announced exactly like Track B's B-F2: migration_started with kind "rotation".
+    starts = [e for e in fleet.events_after(0, 2000)["events"] if e["event_type"] == "migration_started"]
+    assert [e["payload"].get("kind") for e in starts] == [None, "rotation"]
 
 
 def test_a_power_limit_dims_the_pi_and_the_fleet():

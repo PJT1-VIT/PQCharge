@@ -210,14 +210,15 @@
       return;
     }
     if (sid) return;                                   // per-charger traffic: too noisy for the ticker
+    var rotating = p.kind === "rotation";       // Track B B-F2: rotation runs reuse the migration lines
     var line = {
-      migration_started: ["info", "▶ Migration started → " + esc(p.target_mode || "") + " (" + esc(p.total) + " chargers)"],
-      rotation_started: ["rot", "↻ Key rotation started (" + esc(p.total) + " chargers)"],
+      migration_started: rotating
+        ? ["rot", "↻ Key rotation started (" + esc(p.total) + " chargers) — old keys stay valid until the new one is proven"]
+        : ["info", "▶ Migration started → " + esc(p.target_mode || "") + " (" + esc(p.total) + " chargers)"],
       wave_started: ["info", (p.is_canary ? "Canary" : "Wave " + esc(p.wave_id)) + " started (" + esc(p.size) + ")"],
       wave_completed: ["good", (p.wave_id === 0 ? "Canary" : "Wave " + esc(p.wave_id)) + " done · " + esc(p.migrated) + " ok, " + esc(p.failed || 0) + " failed"],
       wave_rolled_back: ["bad", "Wave " + esc(p.wave_id) + " ROLLED BACK" + (p.trigger === "manual" ? " (by operator)" : " — too many failures, migration halted")],
-      migration_completed: ["good", "■ Migration completed"],
-      rotation_completed: ["rot", "■ Key rotation completed"],
+      migration_completed: rotating ? ["rot", "■ Key rotation completed"] : ["good", "■ Migration completed"],
       migration_failed: ["bad", "Migration controller error: " + esc(p.error || "")],
       server_started: ["info", "Server started"],
       server_stopping: ["warn", "Server stopping"]
@@ -354,6 +355,12 @@
     ph.innerHTML = (rotation ? '<span class="kindRotation">ROTATION</span> · ' : "") + esc(phase.toUpperCase());
     $("phaseWords").textContent = (rotation ? ROT_WORDS[phase] : null) || PHASE_WORDS[phase] || "";
 
+    // In a rotation run (Track B B-F2) "migrated" counts rotated chargers and "rolled_back"
+    // counts failed rotations: those chargers keep their OLD key and stay upgraded.
+    function rotLabel(k) {
+      if (!rotation) return STATE_LABEL[k];
+      return { migrated: "rotated", rolled_back: "failed, old key kept", pending: "waiting" }[k] || STATE_LABEL[k];
+    }
     var total = m.total_stations || stations.length || 1;
     var segs = rotation
       ? [["migrated", "var(--rotation)"], ["rolled_back", "var(--st-rolled)"], ["pending", "var(--st-pending)"]]
@@ -361,11 +368,11 @@
          ["incompatible", "var(--st-incompat)"], ["pending", "var(--st-pending)"]];
     $("progress").innerHTML = segs.map(function (s) {
       var n = m[s[0]] || 0;
-      return n ? '<span title="' + esc((rotation && s[0] === "migrated" ? "rotated" : STATE_LABEL[s[0]]) + ": " + n) +
+      return n ? '<span title="' + esc(rotLabel(s[0]) + ": " + n) +
         '" style="flex:' + n + ";background:" + s[1] + '"></span>' : "";
     }).join("");
     $("progress").setAttribute("aria-label", "progress: " + segs.map(function (s) {
-      return (m[s[0]] || 0) + " " + (rotation && s[0] === "migrated" ? "rotated" : STATE_LABEL[s[0]]);
+      return (m[s[0]] || 0) + " " + rotLabel(s[0]);
     }).join(", ") + " of " + total);
 
     var waves = m.waves || [];

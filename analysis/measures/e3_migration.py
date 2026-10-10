@@ -61,6 +61,24 @@ PHASE C-P4 (Contract 7)
     - keys_at_start: the tester's chargers that started the
       run already holding a key saved by an earlier run. For them this
       migration is a rotation, not a first enrolment (see check.py).
+
+--------------------------------------------------------------------
+PHASE C-F5 (FINAL 2-DAY PLAN): HALT AND ROTATION
+
+    - halt (L09): a wave over the failure threshold is rolled back and the
+      migration STOPS. Shown when the run ended rolled back while chargers
+      were still waiting -- they were never attempted. When the failing wave
+      is the last one (Stage 6) the rollback is real but the halt is not
+      visible, and `halt.shown` says so.
+    - rotation (M5, Track B B-F2): migrated chargers get a NEW key while the
+      old one stays valid until the new one is proven. Track B announces a
+      rotation run with the ordinary migration_started / wave_* lines plus
+      payload kind "rotation", and writes one rotation_completed or
+      rotation_failed line per charger {station, old_key_id, new_key_id,
+      wave_id, detail}; its key checks carry trigger "rotation". They are
+      reported in `rotation` and never mixed into the migration's numbers.
+      A run that only rotates takes its "authenticated" verdict from the
+      rotation checks.
 """
 
 from __future__ import annotations
@@ -124,7 +142,10 @@ def measure(run: MatchedRun) -> dict[str, Any] | None:
         "wave_rolled_back", "migration_completed", "migration_failed",
     )
     # C-P4: migration checks only; boot checks are reported apart.
+    # C-F5: rotation checks (trigger "rotation") are reported apart too.
     checks = run.pq_checks("migration")
+    rotation_checks = run.pq_checks("rotation")
+    rotation_lines = run.migration("rotation_completed", "rotation_failed")
     boot_checks = run.pq_checks("boot")
     deferrals = run.migration("station_deferred")
     enrolled_lines = [
@@ -248,7 +269,17 @@ def measure(run: MatchedRun) -> dict[str, Any] | None:
             int((m.get("payload") or {}).get("migrated") or 0)
             for m in markers if m.get("event_type") == "wave_completed"
         )
-    if not migrated_count and not passed:
+    # C-F5: a run that only rotated keys (no migration of its own) is judged
+    # by its rotation checks.
+    rotation_only = bool(rotation_lines) and not checks and not enrolled_lines and all(
+        (m.get("payload") or {}).get("kind") == "rotation"
+        for m in markers if m.get("event_type") == "migration_started")
+    if rotation_only:
+        rot_done = {r.get("station_id") for r in rotation_lines if r.get("event_type") == "rotation_completed"}
+        rot_passed = {c.get("station_id") for c in rotation_checks if _result(c) == "success"}
+        verification = (VERIFIED if rot_done and rot_passed >= rot_done
+                        else PARTIAL if rot_done else NOTHING_MIGRATED)
+    elif not migrated_count and not passed:
         verification = NOTHING_MIGRATED
     elif not checks:
         verification = KEY_ONLY
@@ -276,6 +307,46 @@ def measure(run: MatchedRun) -> dict[str, Any] | None:
     )
     keys_at_start = run.harness.keys_at_start()
     started_with_keys = sorted(sid for sid, held in keys_at_start.items() if held)
+
+    # -- C-F5: halt (L09) -------------------------------------------------------
+    phase_now = str(status.get("phase") or "").lower()
+    rolled_waves = [w for w in waves if str(w.get("phase")).lower() == "rolled_back"]
+    left_waiting = (final_counts.get("pending", 0) if snapshots
+                    else int(status.get("pending") or 0))
+    halt = {
+        "rolled_back_wave": rolled_waves[-1]["wave_id"] if rolled_waves else None,
+        "never_attempted": left_waiting if phase_now == "rolled_back" else 0,
+        "shown": phase_now == "rolled_back" and left_waiting > 0,
+    }
+
+    # -- C-F5: rotation (M5, B-F2) -------------------------------------------------
+    rot_rows = []
+    for r in rotation_lines:
+        pl = r.get("payload") or {}
+        rot_rows.append({
+            "station_id": r.get("station_id"),
+            "ok": r.get("event_type") == "rotation_completed",
+            "old_key_id": pl.get("old_key_id"),
+            "new_key_id": pl.get("new_key_id"),
+            "wave_id": pl.get("wave_id"),
+            "detail": pl.get("detail"),
+            "at_s": round(r["_t"] - start, 3),
+        })
+    rot_passed_n = sum(1 for c in rotation_checks if _result(c) == "success")
+    rot_durations = [
+        float((c.get("payload") or {}).get("duration_ms"))
+        for c in rotation_checks if isinstance((c.get("payload") or {}).get("duration_ms"), (int, float))
+    ]
+    rotation = None
+    if rot_rows or rotation_checks:
+        rotation = {
+            "completed": sum(1 for r in rot_rows if r["ok"]),
+            "failed": sum(1 for r in rot_rows if not r["ok"]),
+            "checks": {"total": len(rotation_checks), "passed": rot_passed_n,
+                       "rejected": len(rotation_checks) - rot_passed_n,
+                       "round_trip_ms": stats.describe(rot_durations)},
+            "keys": rot_rows[:50],
+        }
 
     # -- C-P4: boot checks (hybrid), apart from the migration ----------------
     boot_passed = [c for c in boot_checks if _result(c) == "success"]
@@ -366,6 +437,10 @@ def measure(run: MatchedRun) -> dict[str, Any] | None:
             "later_ms": stats.describe(later_durations),
         },
         "deferred": {"count": len(deferred_ids), "station_ids": deferred_ids[:50]},
+        # C-F5
+        "kind": "rotation" if rotation_only else "migration",
+        "halt": halt,
+        "rotation": rotation,
         "boot_checks": {
             "total": len(boot_checks),
             "passed": len(boot_passed),
