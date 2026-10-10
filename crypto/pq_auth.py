@@ -42,6 +42,14 @@ CHALLENGE_BYTES = 32
 """Nonce length. 32 bytes = 256 bits of entropy, far beyond any birthday-bound
 concern for the number of authentications in a fleet's lifetime."""
 
+MAX_OUTSTANDING_PER_STATION = 8
+"""How many challenges one station may have outstanding at once (B-P2, L35).
+More than one is needed because two checks can overlap for the same station
+-- a boot check (Contract 7 section 7.5) while its migration check is still
+in flight, e.g. a charger that reboots during its wave. 8 is far above any
+real overlap; the cap only stops unbounded growth. When full, the OLDEST
+outstanding challenge is dropped."""
+
 DEFAULT_CHALLENGE_TTL_S = 30.0
 """How long an issued challenge remains valid. A station that cannot respond
 within this window must request a new challenge. Bounds how long a captured
@@ -69,8 +77,16 @@ class PQAuthenticator:
     Server-side post-quantum authentication for the CSMS.
 
     Holds outstanding challenges and each station's enrolled public key. One
-    instance per CSMS process. Not thread-safe in itself; the CSMS serialises
-    access per connection.
+    instance per CSMS process. Not thread-safe in itself; everything runs on
+    the CSMS's single asyncio event loop.
+
+    OVERLAPPING CHECKS (B-P2, added 2026-10-10, L35):
+    A station may have several challenges outstanding, each identified by
+    its nonce, so a boot check and a migration check for the same station do
+    not cancel each other. A caller that passes the nonce to verify_response
+    verifies exactly that challenge. A caller that does not pass it gets the
+    original behaviour: only the MOST RECENT challenge is accepted, and every
+    older one for that station is discarded.
     """
 
     def __init__(
@@ -81,7 +97,9 @@ class PQAuthenticator:
         self._provider = provider
         self._ttl_s = challenge_ttl_s
         self._enrolled: dict[str, bytes] = {}
-        self._outstanding: dict[str, Challenge] = {}
+        self._outstanding: dict[str, dict[bytes, Challenge]] = {}
+        """station_id -> {nonce: Challenge}, oldest first (dicts keep
+        insertion order)."""
 
     @property
     def algorithm(self) -> str:
@@ -109,6 +127,17 @@ class PQAuthenticator:
         self._enrolled.pop(station_id, None)
         self._outstanding.pop(station_id, None)
 
+    def public_key(self, station_id: str) -> bytes | None:
+        """
+        The station's enrolled public key, or None if it is not enrolled.
+
+        Read-only. Added for B-P2: the boot verifier derives the key_id it
+        names in the challenge (Contract 7 section 7.2) from this key, so
+        the station signs with the key the server actually holds -- its
+        current one, or its previous one if the server missed a rotation.
+        """
+        return self._enrolled.get(station_id)
+
     def is_enrolled(self, station_id: str) -> bool:
         return station_id in self._enrolled
 
@@ -116,20 +145,33 @@ class PQAuthenticator:
         """
         Produce a fresh challenge for a station and remember it as outstanding.
 
-        A previously outstanding challenge for the same station is replaced --
-        only the most recent challenge is ever accepted, so a station cannot
-        bank several and an old one cannot linger.
+        Earlier challenges for the same station stay outstanding (until they
+        are verified, expire, or are pushed out by the per-station cap), so
+        two overlapping checks each verify against their own nonce. Expired
+        challenges are dropped here, so nothing lingers past its TTL. See
+        the class docstring for callers that do not pass the nonce back.
         """
+        now = time.monotonic()
+        pending = self._outstanding.setdefault(station_id, {})
+        for old_nonce in [n for n, c in pending.items()
+                          if now - c.issued_at > self._ttl_s]:
+            del pending[old_nonce]
+        while len(pending) >= MAX_OUTSTANDING_PER_STATION:
+            del pending[next(iter(pending))]
+
         challenge = Challenge(
             station_id=station_id,
             nonce=secrets.token_bytes(CHALLENGE_BYTES),
-            issued_at=time.monotonic(),
+            issued_at=now,
         )
-        self._outstanding[station_id] = challenge
+        pending[challenge.nonce] = challenge
         return challenge.nonce
 
     def verify_response(
-        self, station_id: str, response_signature: bytes
+        self,
+        station_id: str,
+        response_signature: bytes,
+        nonce: bytes | None = None,
     ) -> bool:
         """
         Check a station's signed response to its outstanding challenge.
@@ -144,17 +186,30 @@ class PQAuthenticator:
         The challenge is consumed on any verdict: a nonce is single-use whether
         the response was valid or not, so a failed attempt cannot be retried
         against the same nonce.
+
+        nonce: which outstanding challenge this response answers (B-P2). Pass
+        it whenever two checks may overlap for one station; only that
+        challenge is consumed. Omitted: the most recent challenge is used and
+        all older ones for the station are discarded (the original
+        behaviour, kept for existing callers).
         """
         if station_id not in self._enrolled:
             raise AuthError(f"station {station_id!r} is not enrolled")
 
-        challenge = self._outstanding.get(station_id)
+        pending = self._outstanding.get(station_id) or {}
+        if nonce is None:
+            challenge = pending[next(reversed(pending))] if pending else None
+            # Consume it -- and, as before B-P2, every older one.
+            self._outstanding.pop(station_id, None)
+        else:
+            # Consume only this challenge, before verifying, so it is
+            # single-use on every path out of this method.
+            challenge = pending.pop(bytes(nonce), None)
+            if not pending:
+                self._outstanding.pop(station_id, None)
+
         if challenge is None:
             raise AuthError(f"no outstanding challenge for station {station_id!r}")
-
-        # Consume the challenge now, before verifying, so it is single-use on
-        # every path out of this method.
-        del self._outstanding[station_id]
 
         if time.monotonic() - challenge.issued_at > self._ttl_s:
             raise AuthError(f"challenge for station {station_id!r} has expired")

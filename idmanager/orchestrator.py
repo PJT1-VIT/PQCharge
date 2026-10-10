@@ -92,6 +92,7 @@ from typing import Awaitable, Callable, Protocol
 
 from crypto.identity import MigrationState
 from crypto.provider import CryptoMode
+from idmanager.pq_check import challenge_and_verify
 from idmanager.api import (
     MigrationController,
     MigrationPhase,
@@ -133,7 +134,8 @@ class AuthenticatorLike(Protocol):
     def enrol(self, station_id: str, public_key: bytes) -> None: ...
     def unenrol(self, station_id: str) -> None: ...
     def issue_challenge(self, station_id: str) -> bytes: ...
-    def verify_response(self, station_id: str, response_signature: bytes) -> bool: ...
+    def verify_response(self, station_id: str, response_signature: bytes,
+                        nonce: bytes | None = None) -> bool: ...
 
 
 class FleetLike(Protocol):
@@ -559,34 +561,20 @@ class MigrationOrchestrator(MigrationController):
         Returns (verified, detail, round_trip_ms). Never raises: a station
         that answers badly -- refuses, times out, sends garbage, or signs
         with the wrong key -- is a failed station, not a crashed wave.
+
+        Since B-P2 the check itself lives in idmanager/pq_check.py, shared
+        with the boot verifier, so both checks behave identically.
         """
-        nonce = self._auth.issue_challenge(station_id)
-        if key_id is None:
-            challenge = self._make_challenge_msg(nonce)
-        else:
-            challenge = self._make_challenge_msg(nonce, key_id=key_id)
-        result = await self._dispatch.send(
-            station_id, challenge, timeout_s=self._dispatch_timeout_s,
+        result = await challenge_and_verify(
+            dispatcher=self._dispatch,
+            authenticator=self._auth,
+            station_id=station_id,
+            make_challenge=self._make_challenge_msg,
+            parse_signature=self._parse_signature,
+            key_id=key_id,
+            timeout_s=self._dispatch_timeout_s,
         )
-        duration_ms = getattr(result, "duration_ms", None)
-
-        if not getattr(result, "ok", False):
-            return (False,
-                    f"challenge not answered (outcome={getattr(result, 'outcome', None)}, "
-                    f"status={getattr(result, 'status', None)})",
-                    duration_ms)
-        try:
-            signature = self._parse_signature(getattr(result, "response", None))
-        except Exception as exc:  # noqa: BLE001 - malformed answer = failed station
-            return False, f"unreadable signature: {type(exc).__name__}: {exc}", duration_ms
-        try:
-            verified = self._auth.verify_response(station_id, signature)
-        except Exception as exc:  # noqa: BLE001 - AuthError (expired / no challenge)
-            return False, f"verification refused: {type(exc).__name__}: {exc}", duration_ms
-
-        return (bool(verified),
-                "signature verified" if verified else "signature did not verify",
-                duration_ms)
+        return result.verified, result.detail, result.duration_ms
 
     def _fail_station(self, station_id: str, wave_id: int) -> MigrationState:
         """Un-enrol so the station is never left half-migrated."""
