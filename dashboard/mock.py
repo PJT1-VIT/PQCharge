@@ -276,9 +276,12 @@ class MockFleet:
             self._cursor = 0
             self._next_step = now + STEP_S
             self._start_wave(0)
-            self._emit("rotation_started" if kind == "rotation" else "migration_started", None,
-                       source="orchestrator", migration_id=mid, target_mode=self.mode,
-                       total=len(candidates), wave_size=wave_size, canary_count=canary_count)
+            # Same shape as Track B's B-F2: a rotation run is announced with the
+            # ordinary migration lines plus kind "rotation".
+            self._rotated: dict[int, list[tuple[str, str | None]]] = {}
+            self._emit("migration_started", None, source="orchestrator", migration_id=mid,
+                       target_mode=self.mode, total=len(candidates), wave_size=wave_size,
+                       canary_count=canary_count, **self._meta())
             self._recount()
             return 200, {"migration_id": mid}
 
@@ -361,6 +364,10 @@ class MockFleet:
             if st["connection_state"] == "connected":
                 st["last_seen_at"] = _iso(now)
 
+    def _meta(self) -> dict[str, Any]:
+        """Track B's _run_meta(): kind "rotation" on every line of a rotation run."""
+        return {"kind": "rotation"} if self.status.get("kind") == "rotation" else {}
+
     def _start_wave(self, w: int) -> None:
         wave = self.status["waves"][w]
         wave.update(phase="running", started_at=_iso(self.clock()))
@@ -368,7 +375,7 @@ class MockFleet:
         self.status["phase"] = "canary" if w == 0 else "running"
         self._cursor = 0
         self._emit("wave_started", None, source="orchestrator", wave_id=w,
-                   is_canary=w == 0, size=len(wave["station_ids"]))
+                   is_canary=w == 0, size=len(wave["station_ids"]), **self._meta())
 
     def _tick_waves(self, now: float) -> None:
         if self.status["phase"] not in ("canary", "running"):
@@ -401,6 +408,7 @@ class MockFleet:
                        old_key_id=old, new_key_id=new, wave_id=w)
             self._pq_check(sid, ok, "rotation", key_id=new, wave_id=w)
             if ok:
+                self._rotated.setdefault(w, []).append((sid, old))
                 self.keys[sid] = new
                 st["pq_key_id"] = new
                 wave["migrated_count"] += 1
@@ -439,18 +447,22 @@ class MockFleet:
             return
         wave["phase"] = "completed"
         self._emit("wave_completed", None, source="orchestrator", wave_id=w,
-                   migrated=wave["migrated_count"], failed=wave["failed_count"])
+                   migrated=wave["migrated_count"], failed=wave["failed_count"], **self._meta())
         if w + 1 < len(self.status["waves"]):
             self._start_wave(w + 1)
         else:
             self.status.update(phase="completed", completed_at=_iso(self.clock()), current_wave=None)
-            self._emit("rotation_completed" if self.status["kind"] == "rotation" else "migration_completed",
-                       None, source="orchestrator",
-                       migrated=sum(x["migrated_count"] for x in self.status["waves"]))
+            self._emit("migration_completed", None, source="orchestrator",
+                       migrated=sum(x["migrated_count"] for x in self.status["waves"]), **self._meta())
 
     def _rollback_wave(self, w: int, trigger: str) -> None:
         wave = self.status["waves"][w]
-        if self.status["kind"] != "rotation":
+        if self.status["kind"] == "rotation":
+            # Track B: a failed rotation wave puts the old keys back.
+            for sid, old in getattr(self, "_rotated", {}).get(w, []):
+                self.keys[sid] = old
+                self.stations[sid]["pq_key_id"] = old
+        else:
             for sid in wave["station_ids"]:
                 st = self.stations[sid]
                 if st["migration_state"] in ("in_progress", "migrated"):
@@ -459,7 +471,7 @@ class MockFleet:
                     self.keys.pop(sid, None)
         wave.update(phase="rolled_back", completed_at=wave["completed_at"] or _iso(self.clock()))
         self._emit("wave_rolled_back", None, source="orchestrator" if trigger != "manual" else "server",
-                   wave_id=w, trigger=trigger, failed=wave["failed_count"])
+                   wave_id=w, trigger=trigger, failed=wave["failed_count"], **self._meta())
         if trigger != "manual":
             self.status.update(phase="rolled_back", completed_at=_iso(self.clock()), current_wave=None)
 

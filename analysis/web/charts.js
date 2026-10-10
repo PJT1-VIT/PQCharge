@@ -16,8 +16,8 @@
 (function () {
   "use strict";
 
-  var MODE_LABEL = { classical: "Classical", hybrid: "Hybrid", pqc: "Post-quantum" };
-  var MODE_SHORT = { classical: "Classical", hybrid: "Hybrid", pqc: "PQC" };
+  var MODE_LABEL = { classical: "Classical", hybrid: "Hybrid", pqc: "Pure PQC (not built)" };
+  var MODE_SHORT = { classical: "Classical", hybrid: "Hybrid", pqc: "Pure PQC (not built)" };
   var STATE_LABEL = {
     pending: "Pending", in_progress: "Upgrading", migrated: "Upgraded",
     rolled_back: "Rolled back", incompatible: "Incompatible"
@@ -172,6 +172,89 @@
   });
 
   // ================================================================ sections
+
+  // ------------------------------------------------- headlines (C-F5, for the slides)
+
+  function renderHeadlines(root) {
+    var all = slots(), cmp = DATA.comparisons || {}, lines = [];
+    function trust(s) { return s && s.trust && s.trust.status !== "pass" ? " <span class='sub'>(trust: " + esc(s.trust.status) + ")</span>" : ""; }
+    function biggest(list, f) { return list.slice().sort(function (a, b) { return f(b) - f(a); })[0]; }
+    function add(id, text) { lines.push("<li><strong>" + id + "</strong> · " + text + "</li>"); }
+    function none(id, what) { lines.push('<li class="sub"><strong>' + id + "</strong> · " + what + " — not in these results yet</li>"); }
+
+    var s1 = all.filter(function (s) { return s.machine; });
+    if (s1.length) {
+      var t = biggest(s1, function (s) { return s.n_stations; }), m = t.machine;
+      add("S1", "One laptop ran <strong>" + int(t.n_stations) + " chargers</strong>: machine CPU p95 " + fmt(m.cpu_pct.p95, 0) +
+        " %, tester loop lag p95 " + ms(m.loop_lag_ms.p95) + " — " + (m.saturated ? "<strong>saturated</strong>" : "not saturated") + "." + trust(t));
+    } else none("S1", "scale test");
+
+    var ro = cmp.ready_overhead_vs_classical || [];
+    if (ro.length) {
+      var r = biggest(ro, function (x) { return x.n + (x.tls ? 0.5 : 0); });
+      add("E1", "Time until a charger may work, " + int(r.n) + " chargers" + (r.tls ? ", TLS" : "") + ": classical " +
+        ms(r.classical_median_ms) + " → " + esc(modeName(r.mode).toLowerCase()) + " " + ms(r.median_ms) +
+        " (<strong>+" + ms(r.added_median_ms) + "</strong>, ×" + fmt(r.median_ratio, 2) + ") for the post-quantum key check.");
+    } else none("E1", "classical vs hybrid time until ready");
+
+    var storms = all.filter(function (s) { return s.e2; });
+    if (storms.length) {
+      var top = Math.max.apply(null, storms.map(function (s) { return s.n_stations; }));
+      add("E2", "Server restarted under " + int(top) + " chargers; 95 % of the fleet recovered in " +
+        storms.filter(function (s) { return s.n_stations === top; }).map(function (s) {
+          return esc(modeName(s.crypto_mode).toLowerCase()) + " <strong>" + sec(s.e2.t95_s) + "</strong>" +
+            (s.e2.recovery_rule === "boot + key check" ? " (incl. key check)" : "") + trust(s);
+        }).join(" · ") + ".");
+    } else none("E2", "reconnection storm");
+
+    var migs = all.filter(function (s) { return s.e3 && s.e3.kind !== "rotation" && !(s.e3.halt || {}).shown; });
+    if (migs.length) {
+      var e3s = biggest(migs, function (s) { return s.e3.fleet_size; }), e = e3s.e3, fc = e.final_counts, q = e.pq_checks || {};
+      add("E3", int(e.fleet_size) + " chargers migrated while charging: <strong>" + int(fc.migrated) + " upgraded</strong>, " +
+        int(fc.incompatible) + " legacy skipped, " + int(fc.rolled_back) + " rolled back; " + int(q.passed) + "/" + int(q.total) +
+        " key checks passed; <strong>" + int(e.charging.sessions_disturbed) + "/" + int(e.charging.sessions_running_at_start) +
+        " sessions disturbed</strong>." + trust(e3s));
+    } else none("E3", "migration under load");
+    var halts = all.filter(function (s) { return s.e3 && (s.e3.halt || {}).shown; });
+    if (halts.length) {
+      var h = halts[0].e3.halt;
+      add("E3 halt", "A failing wave (" + esc(h.rolled_back_wave) + ") was rolled back and the migration <strong>stopped</strong>; " +
+        int(h.never_attempted) + " chargers were never attempted." + trust(halts[0]));
+    } else none("E3 halt", "rollback + halt");
+    var rots = all.filter(function (s) { return s.e3 && s.e3.rotation; });
+    if (rots.length) {
+      var rt = rots[0].e3;
+      add("E3 rotation", "<strong>" + int(rt.rotation.completed) + " keys rotated</strong>, " + int(rt.rotation.failed) +
+        " failed (old key kept); " + int(rt.charging.sessions_disturbed) + " sessions disturbed." + trust(rots[0]));
+    } else none("E3 rotation", "key rotation without disconnection");
+
+    var e4 = (DATA.e4 || { rows: [] }).rows, pqc = e4.filter(isPqCert);
+    if (pqc.length) {
+      add("E4", pqc.map(function (x) {
+        return esc(x.label) + " " + int(x.pem_bytes != null ? x.pem_bytes : x.bytes) + " B vs " + int(x.limit) + " — " +
+          (x.within_limit ? "fits" : "<strong>over the limit</strong>");
+      }).join(" · ") + ".");
+    } else if (e4.length) {
+      var ch = e4.filter(function (x) { return x.limit && x.group === "classical"; });
+      add("E4", "Classical certificates fit (largest " + int(Math.max.apply(null, ch.map(function (x) { return x.pem_bytes || x.bytes; }))) +
+        " B); the ML-DSA-44 signature (2,420 B) travels inside DataTransfer. ML-DSA certificate sizes not measured here.");
+    } else none("E4", "size limits");
+
+    var e5 = all.filter(function (s) { return s.e5; });
+    var cut = 0, bootRej = 0, idRej = 0;
+    e5.forEach(function (s) {
+      cut += s.e5.pq_cut_off || 0; idRej += s.e5.identity_rejected || 0;
+      bootRej += ((s.e5.pq_by_trigger || {}).boot || {}).rejected || 0;
+    });
+    if (cut || idRej || bootRej) {
+      add("E5", "Impostors refused: <strong>" + int(bootRej) + "</strong> failed the post-quantum key check at boot (" + int(cut) +
+        " connections closed, code 1008); " + int(idRej) + " refused by the certificate identity check.");
+    } else none("E5", "attack demonstration");
+
+    root.insertAdjacentHTML("beforeend", '<section id="headlines"><h2>Headlines</h2><p class="lede">One line per ' +
+      "experiment, taken from the runs below (largest fleet first). Trust status is shown where it is not a clean pass.</p>" +
+      '<div class="card"><ul class="headlines">' + lines.join("") + "</ul></div></section>");
+  }
 
   function renderRuns(root) {
     var list = slots();
@@ -381,7 +464,9 @@
     var list = e1Exp === "all" ? all : all.filter(function (s) { return s.experiment === e1Exp; });
     var html = '<section id="e1"><h2>E1 · Handshake cost</h2><p class="lede">How long a charger takes ' +
       "to connect securely — network connection, TLS encryption, certificate exchange and protocol " +
-      "upgrade — measured by the charger itself from dial to ready. The box shows where the middle " +
+      "upgrade — measured by the charger itself from dial to ready. Two modes are compared: <strong>classical</strong> " +
+      "and <strong>hybrid</strong> (classical TLS + a post-quantum ML-DSA key check at every boot). Pure post-quantum TLS " +
+      "was not built (future work, L17). The box shows where the middle " +
       "half of chargers fell; <strong>p95</strong> is the time 95 of every 100 chargers beat. " +
       "<strong>Ready</strong> (Contract 7) is measured from the same dial: a classical charger is ready when " +
       "the server accepts its boot; a hybrid charger only once it has also passed its post-quantum key check.</p>";
@@ -647,7 +732,7 @@
       root.insertAdjacentHTML("beforeend", html + empty(
         "No migration run yet. This fills in once the migration controller is wired into the server " +
         "(A+B+C session) and a run is started with <code>--watch-fleet</code> and a migration is " +
-        "triggered from the dashboard or <code>POST /api/migration/start</code>.") + "</section>");
+        "triggered from the dashboard or <code>GET /api/migration/start?target_mode=hybrid</code>.") + "</section>");
       return;
     }
     var s = list.filter(function (x) { return x.key === selectedSlot; })[0] || list[0];
@@ -668,7 +753,9 @@
           : e.verification === "partly authenticated"
             ? "Some upgraded chargers have no passed key check."
             : "No charger was upgraded in this run.") + "</div>" +
-      '<div class="tiles">' +
+      (e.kind === "rotation" ? '<p class="note">This run only rotated keys of chargers that were already upgraded: ' +
+        "see <strong>Key rotation</strong> below. The migration counts do not apply.</p>" : "") +
+      '<div class="tiles"' + (e.kind === "rotation" ? " hidden" : "") + ">" +
       tile("Upgraded", int(e.final_counts.migrated), "chargers on the new security") +
       tile("Key checks passed", int(q.passed) + " / " + int(q.total), int(q.rejected) + " rejected") +
       tile("Rolled back", int(e.final_counts.rolled_back), int(e.rollbacks) + " wave rollback(s)" +
@@ -716,6 +803,35 @@
     if (e.failures && e.failures.length) {
       html += '<div class="banner">' + badge("fail") + " The migration controller crashed: " +
         esc(e.failures.map(function (f) { return f.error || "no error text"; }).join("; ")) + "</div>";
+    }
+    // C-F5: the halt (L09) and the key rotation (M5).
+    var halt = e.halt || {};
+    if (halt.shown) {
+      html += '<div class="banner">' + badge("fail").replace("Not usable", "Halted") + " Wave " + esc(halt.rolled_back_wave) +
+        " failed its checks and was rolled back, and the migration <strong>stopped</strong>: " + int(halt.never_attempted) +
+        " charger(s) were never attempted. This is the safety behaviour working, not a fault.</div>";
+    } else if (halt.rolled_back_wave !== null && halt.rolled_back_wave !== undefined) {
+      html += '<p class="note">Wave ' + esc(halt.rolled_back_wave) + " was rolled back. It was the last wave, so the halt " +
+        "itself (later waves not run) is not visible in this run.</p>";
+    }
+    var rot = e.rotation;
+    if (rot) {
+      var rq = rot.checks || { total: 0, passed: 0, round_trip_ms: { n: 0 } };
+      html += '<div class="card" style="margin-top:16px"><h3>Key rotation (old key valid until the new one is proven)</h3>' +
+        '<div class="tiles">' +
+        tile("Rotated", int(rot.completed), "new key proven, old key dropped") +
+        tile("Failed", int(rot.failed), "old key kept, still a post-quantum charger") +
+        tile("Rotation key checks", int(rq.passed) + " / " + int(rq.total), "signed with the NEW key") +
+        tile("Check time (median)", rq.round_trip_ms && rq.round_trip_ms.n ? ms(rq.round_trip_ms.median) : "—", "server sends, charger signs, server verifies") +
+        tile("Sessions disturbed", int(c.sessions_disturbed) + " / " + int(c.sessions_running_at_start), "charging carried on") +
+        "</div>" + table(
+          [{ t: "Charger" }, { t: "Wave", num: true }, { t: "Old key" }, { t: "New key" }, { t: "Result" }, { t: "At", num: true }],
+          (rot.keys || []).map(function (k) {
+            return [esc(k.station_id), esc(k.wave_id), "<code>" + esc(k.old_key_id || "—") + "</code>",
+              "<code>" + esc(k.new_key_id || "—") + "</code>",
+              k.ok ? badge("pass").replace("Trusted", "Rotated") : badge("fail").replace("Not usable", "Kept old key") +
+                (k.detail ? " " + esc(k.detail) : ""), sec(k.at_s)];
+          })) + "</div>";
     }
     if (e.waves && e.waves.length) {
       html += '<div class="card" style="margin-top:16px"><h3>Waves</h3>' + table(
@@ -818,19 +934,27 @@
 
   // ---------------------------------------------------------------- E4
 
+  // C-F5: an ML-DSA certificate or chain row (Track B's crypto/pq_x509.py), checked against a limit.
+  function isPqCert(r) { return !!r.limit && /ML-DSA/i.test(String(r.algorithm || "") + " " + String(r.label || "")); }
+
   function renderE4(root) {
     var e = DATA.e4 || { rows: [], notes: [] };
     var html = '<section id="e4"><h2>E4 · Size limits</h2><p class="lede">Post-quantum keys and signatures ' +
       "are far larger than classical ones. OCPP caps a certificate at 5,500 characters and a certificate " +
-      "chain at 10,000. Every size below is measured from what our own code produces. Under Option B no " +
-      "post-quantum certificate exists, so the limits apply to the classical certificates; the post-quantum " +
-      "artifacts travel inside DataTransfer messages (shown for scale).</p>";
+      "chain at 10,000. Every size below is measured from what our own code produces. The fleet's own " +
+      "certificates are classical (Option B); the post-quantum keys and signatures travel inside DataTransfer " +
+      "messages (shown for scale)." + ((DATA.e4 || { rows: [] }).rows.some(isPqCert)
+        ? " The <strong>ML-DSA certificates</strong> are real X.509 certificates built only to answer: would " +
+          "post-quantum certificates fit OCPP's limits?" : "") + "</p>";
     if (!e.rows.length) {
       root.insertAdjacentHTML("beforeend", html + empty("Sizes could not be measured: " + esc((e.notes || []).join(" "))) + "</section>");
       return;
     }
     var rows = e.rows.slice().reverse();
-    var groupColor = function (p, g) { return g === "classical" ? p.mode.classical : g === "post-quantum" ? p.mode.pqc : p.muted; };
+    var groupColor = function (p, g) {
+      g = String(g || "");
+      return g === "classical" ? p.mode.classical : g === "on the wire" ? p.muted : p.mode.pqc;
+    };
     html += '<div class="card"><h3>Size of each security artifact</h3><p class="sub">PEM text size where OCPP carries PEM, raw bytes otherwise. Blue = classical, aqua = post-quantum, grey = on-the-wire message</p><div class="chart tall" id="cE4"></div></div>' +
       '<div class="card" style="margin-top:16px"><h3>Numbers</h3>' + table(
         [{ t: "Group" }, { t: "Artifact" }, { t: "Algorithm" }, { t: "Bytes (binary)", num: true },
@@ -850,10 +974,11 @@
         var r = rows[it.dataIndex];
         return "<strong>" + esc(r.label) + "</strong> (" + esc(r.group) + ")<br>" + bytes(it.value) + (r.algorithm ? "<br>" + esc(r.algorithm) : "");
       };
-      o.grid.left = 190;
+      o.grid.left = 260;
       o.grid.right = 40;
       o.yAxis = catAxis(p, rows.map(function (r) { return (r.group === "on the wire" ? "wire · " : r.group === "classical" ? "classical · " : "PQ · ") + r.label; }));
-      o.xAxis = valueAxis(p, "Bytes", { max: 11000 });
+      var biggest = Math.max.apply(null, rows.map(function (r) { return r.pem_bytes != null ? r.pem_bytes : r.bytes; }));
+      o.xAxis = valueAxis(p, "Bytes", { max: Math.max(11000, Math.ceil(biggest * 1.08 / 1000) * 1000) });
       o.series = [{
         type: "bar", barMaxWidth: 16,
         data: rows.map(function (r) {
@@ -974,6 +1099,7 @@
     disposeAll();
     var root = document.getElementById("root");
     root.innerHTML = "";
+    renderHeadlines(root);
     renderRuns(root);
     renderS1(root);
     renderE1(root);
