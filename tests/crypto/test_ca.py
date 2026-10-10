@@ -127,3 +127,25 @@ def test_server_certificate_private_key_returned():
     ca = CertificateAuthority(ClassicalProvider())
     issued = ca.issue_server_certificate()
     assert issued.private_key_der != b""
+
+# -- B-F3 (L06): key identifiers, and an IP address in the server SAN ------------
+
+
+def test_leaf_has_aki_matching_root_ski_and_root_is_a_proper_ca():
+    import ipaddress
+
+    ca = CertificateAuthority(ClassicalProvider())
+    root = x509.load_der_x509_certificate(ca.root_certificate_der)
+    leaf = x509.load_der_x509_certificate(
+        ca.issue_server_certificate("localhost", san_names=["localhost", "192.168.43.10"]).certificate_der)
+
+    root_ski = root.extensions.get_extension_for_class(x509.SubjectKeyIdentifier).value
+    leaf_aki = leaf.extensions.get_extension_for_class(x509.AuthorityKeyIdentifier).value
+    assert leaf_aki.key_identifier == root_ski.digest
+    assert leaf.extensions.get_extension_for_class(x509.SubjectKeyIdentifier)
+    assert root.extensions.get_extension_for_class(x509.KeyUsage).value.key_cert_sign
+    assert leaf.extensions.get_extension_for_class(x509.BasicConstraints).value.ca is False
+
+    san = leaf.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+    assert san.get_values_for_type(x509.DNSName) == ["localhost"]
+    assert san.get_values_for_type(x509.IPAddress) == [ipaddress.ip_address("192.168.43.10")]

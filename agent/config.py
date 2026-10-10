@@ -190,6 +190,16 @@ class AgentConfig:
     max_power_w: float = DEFAULT_LIMIT_W
     """Ceiling passed to SimulatedPower. 7.4 kW is a typical AC charger."""
 
+    power_backend: str = "sim"
+    """Contract 5 backend: "sim" (SimulatedPower) or "gpio" (the Raspberry
+    Pi's GPIOPower: LED on GPIO18 + INA219). B-F8, 2026-10-10."""
+
+    led_pin: int = 18
+    """BCM pin of the LED for --power gpio (GPIO18 = hardware PWM)."""
+
+    ina219_shunt_ohms: float = 0.1
+    """Shunt resistor of the INA219 board for --power gpio."""
+
     # -- protocol timing -------------------------------------------------
 
     response_timeout_s: float = 30.0
@@ -573,6 +583,17 @@ class AgentConfig:
             default=cls.max_power_w, help="watts",
         )
         parser.add_argument(
+            "--power", dest="power_backend", choices=("sim", "gpio"),
+            default=cls.power_backend,
+            help="power backend: sim (default) or gpio (Raspberry Pi: LED on "
+                 "--led-pin, INA219 sensor)",
+        )
+        parser.add_argument("--led-pin", dest="led_pin", type=int, default=cls.led_pin,
+                            help="BCM pin of the LED for --power gpio")
+        parser.add_argument("--ina219-shunt-ohms", dest="ina219_shunt_ohms", type=float,
+                            default=cls.ina219_shunt_ohms,
+                            help="INA219 shunt resistor for --power gpio")
+        parser.add_argument(
             "--response-timeout", dest="response_timeout_s", type=float,
             default=cls.response_timeout_s,
             help="seconds to wait for the CSMS to answer one message",
@@ -674,6 +695,9 @@ class AgentConfig:
             supported_algorithms=algorithms,
             pq_key_dir=_pq_key_dir_from(getattr(ns, "pq_key_dir", DEFAULT_PQ_KEY_DIR)),
             max_power_w=ns.max_power_w,
+            power_backend=getattr(ns, "power_backend", "sim"),
+            led_pin=getattr(ns, "led_pin", 18),
+            ina219_shunt_ohms=getattr(ns, "ina219_shunt_ohms", 0.1),
             response_timeout_s=ns.response_timeout_s,
             connect_timeout_s=getattr(ns, "connect_timeout_s", 5.0),
             cert_dir=getattr(ns, "cert_dir", "certs"),

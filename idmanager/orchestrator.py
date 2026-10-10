@@ -103,6 +103,10 @@ from idmanager.api import (
 
 LOGGER = logging.getLogger("idmanager.orchestrator")
 
+PQ_TARGET_MODES = ("hybrid", "pqc")
+"""Target modes that need the station to support the target algorithm
+(the capability gate). "hybrid" is the Contract 7 enrolment migration (L28)."""
+
 DEFAULT_FAILURE_THRESHOLD = 0.2
 """Fraction of a wave's eligible stations that may fail before the wave is
 rolled back. 0.2 = a wave is abandoned if more than a fifth of the stations
@@ -411,8 +415,11 @@ class MigrationOrchestrator(MigrationController):
         # Capability gate: a station whose firmware cannot do the target
         # algorithm is skipped, not failed. This models the heterogeneous
         # fleet and keeps it out of the failure-threshold denominator.
+        # B-F1 (L28, 2026-10-10): the ML-DSA enrolment migration targets
+        # "hybrid" (Contract 7 7.1); "pqc" is still gated the same way for
+        # callers that send the old label. Only "classical" skips the gate.
         supported = self._fleet.supported_algorithms(station_id)
-        if target_mode == "pqc" and self._target_algorithm not in supported:
+        if target_mode in PQ_TARGET_MODES and self._target_algorithm not in supported:
             self._fleet.set_state(station_id, MigrationState.INCOMPATIBLE, wave_id)
             return MigrationState.INCOMPATIBLE
 

@@ -1,0 +1,8 @@
+{
+  "description": "L09 halt run (B-F4, Track B 2026-10-10), N=50. CP0001-CP0020 and CP0026-CP0050: Track C agents, ML-DSA capable. CP0021-CP0025: Track A fake stations that CLAIM ML-DSA but refuse the enrolment (UnknownVendorId) - the injected failure, mid-fleet. With canary_count=5 and wave_size=10: wave 0 = CP0001-0005, wave 1 = CP0006-0015 (ok), wave 2 = CP0016-0025 (5 of 10 fail = 50% > 20%) -> wave 2 rolled back -> migration HALTS; CP0026-CP0050 stay pending. Expected final: phase rolled_back, migrated 15, rolled_back 10 (5 refusers + 5 un-enrolled by the wave rollback), incompatible 0, pending 25 = 50. Run: load_generator --n 20 (CP0001-0020) and --n 25 --start-index 26 (CP0026-0050); fake_station CP0021 ... CP0025.",
+  "groups": [
+    {"stations": "CP0001-CP0020", "supported_algorithms": ["ECDSA-P256", "ML-DSA-44"]},
+    {"stations": "CP0021-CP0025", "supported_algorithms": ["ECDSA-P256", "ML-DSA-44"]},
+    {"stations": "CP0026-CP0050", "supported_algorithms": ["ECDSA-P256", "ML-DSA-44"]}
+  ]
+}

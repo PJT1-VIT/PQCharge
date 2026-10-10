@@ -422,3 +422,17 @@ def test_legacy_mode_still_requires_keypair_and_install_factories(provider):
     with pytest.raises(ValueError, match="required"):
         MigrationOrchestrator(**_kw(provider, enrolment_request_factory=None,
                                     public_key_parser=None))
+
+# -- B-F1 (L28): "hybrid" is the migration target ---------------------------
+
+
+@pytest.mark.asyncio
+async def test_hybrid_target_migrates_capable_and_skips_legacy(provider):
+    orch, fleet, auth, chargers, events = _build(
+        provider, {"CP01": [ALG], "CP02": ["ECDSA-P256"], "CP03": [ALG]})
+    orch.start_migration(wave_size=2, canary_count=1, target_mode="hybrid")
+    st = await _run(orch)
+    assert st.phase == MigrationPhase.COMPLETED
+    assert st.target_mode == "hybrid"
+    assert st.migrated == 2 and st.incompatible == 1 and _counts_sum(st)
+    assert [sid for sid, _ in chargers.messages(pqc.MSG_REQUEST_ENROLMENT)] == ["CP01", "CP03"]
