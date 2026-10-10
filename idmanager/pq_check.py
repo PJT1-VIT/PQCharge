@@ -54,6 +54,7 @@ async def challenge_and_verify(
     parse_signature: Callable[[object], bytes],
     key_id: str | None = None,
     timeout_s: float | None = None,
+    staged: bool = False,
 ) -> CheckResult:
     """
     Run one challenge-response check against the station's enrolled key.
@@ -91,7 +92,11 @@ async def challenge_and_verify(
     except Exception as exc:  # noqa: BLE001 - malformed answer = failed check
         return CheckResult(False, f"unreadable signature: {type(exc).__name__}: {exc}", duration_ms)
     try:
-        verified = authenticator.verify_response(station_id, signature, nonce=nonce)
+        if staged:
+            # B-F2 rotation: verify against the NEW key held next to the old one.
+            verified = authenticator.verify_response(station_id, signature, nonce=nonce, staged=True)
+        else:
+            verified = authenticator.verify_response(station_id, signature, nonce=nonce)
     except Exception as exc:  # noqa: BLE001 - AuthError (expired / unenrolled)
         return CheckResult(False, f"verification refused: {type(exc).__name__}: {exc}", duration_ms)
 

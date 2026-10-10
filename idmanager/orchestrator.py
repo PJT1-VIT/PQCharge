@@ -215,6 +215,7 @@ class MigrationOrchestrator(MigrationController):
         skip_offline: bool = False,
         enrolment_request_factory: EnrolmentRequestFactory | None = None,
         public_key_parser: PublicKeyParser | None = None,
+        key_id_for: Callable[[bytes], str] | None = None,
     ) -> None:
         if (challenge_message_factory is None) != (signature_parser is None):
             raise ValueError(
@@ -261,6 +262,23 @@ class MigrationOrchestrator(MigrationController):
         """wave_id -> station_ids enrolled in that wave, for rollback."""
         self._rollback_requested: set[int] = set()
 
+        # B-F2: key rotation. key_id_for (agent.pqc_messages.key_id_for in
+        # the live CSMS) only labels the OLD key in rotation events; without
+        # it old_key_id is None and rotation still works.
+        self._key_id_for = key_id_for
+        self._kind = "migration"
+        self._step = self._transition_station
+        """The per-station coroutine of the current run: _transition_station
+        (migration) or _rotate_station (rotation). _do_wave calls it."""
+        self._rotated_this_run: dict[int, list[tuple[str, bytes]]] = {}
+        """wave_id -> (station_id, OLD public key) rotated in that wave, so a
+        wave rollback can put the old keys back."""
+
+    def _run_meta(self) -> dict:
+        """Extra fields on run-level events: only rotation runs are marked,
+        so migration events keep exactly their old shape."""
+        return {"kind": "rotation"} if self._kind == "rotation" else {}
+
     # -- Contract 4 surface (synchronous) -----------------------------
 
     def start_migration(
@@ -284,7 +302,10 @@ class MigrationOrchestrator(MigrationController):
             started_at=datetime.now(timezone.utc),
         )
         self._enrolled_this_run = {}
+        self._rotated_this_run = {}
         self._rollback_requested = set()
+        self._kind = "migration"
+        self._step = self._transition_station
 
         self._emit("migration_started", migration_id=migration_id,
                    target_mode=target_mode, total=len(candidates),
@@ -294,6 +315,56 @@ class MigrationOrchestrator(MigrationController):
             self._run(candidates, wave_size, canary_count, target_mode)
         )
         return migration_id
+
+    def start_rotation(self, wave_size: int, canary_count: int) -> str:
+        """
+        B-F2 (M5, L26): give every ENROLLED station a new ML-DSA key, in a
+        canary and waves, with an overlap window.
+
+        Per station (see _rotate_station): the station makes a new key pair
+        (RequestPQEnrolment; its old key becomes its "previous" key), the
+        server holds the new public key NEXT TO the old one, challenges the
+        station with the new key_id, and only when that verifies does the
+        new key replace the old. If anything fails, the new key is dropped
+        and the station keeps its old key -- it never loses its identity,
+        and its charging session is never touched. A wave over the failure
+        threshold puts the old keys of that whole wave back and halts.
+        """
+        if self._task is not None and not self._task.done():
+            raise RuntimeError("a migration or rotation is already in progress")
+        if self._make_enrolment_req is None or self._make_challenge_msg is None:
+            raise RuntimeError(
+                "rotation needs enrolment_request_factory, public_key_parser, "
+                "challenge_message_factory and signature_parser")
+        for needed in ("stage_key", "commit_staged", "discard_staged", "public_key"):
+            if not callable(getattr(self._auth, needed, None)):
+                raise RuntimeError(f"the authenticator cannot rotate (no {needed})")
+
+        run_id = uuid.uuid4().hex[:12]
+        candidates = [sid for sid in self._fleet.migration_candidate_ids()
+                      if self._auth.is_enrolled(sid)]
+        self._status = MigrationStatus(
+            migration_id=run_id,
+            target_mode="hybrid",
+            phase=MigrationPhase.CANARY,
+            total_stations=len(candidates),
+            pending=len(candidates),
+            started_at=datetime.now(timezone.utc),
+            kind="rotation",
+        )
+        self._enrolled_this_run = {}
+        self._rotated_this_run = {}
+        self._rollback_requested = set()
+        self._kind = "rotation"
+        self._step = self._rotate_station
+
+        self._emit("migration_started", migration_id=run_id, target_mode="hybrid",
+                   total=len(candidates), wave_size=wave_size,
+                   canary_count=canary_count, **self._run_meta())
+        self._task = asyncio.ensure_future(
+            self._run(candidates, wave_size, canary_count, "hybrid")
+        )
+        return run_id
 
     def rollback(self, wave_id: int) -> bool:
         if self._status is None:
@@ -357,11 +428,12 @@ class MigrationOrchestrator(MigrationController):
         self._status.current_wave = wave_id
         self._status.total_waves = len(self._status.waves)
         self._enrolled_this_run[wave_id] = []
+        self._rotated_this_run[wave_id] = []
         self._emit("wave_started", wave_id=wave_id, is_canary=is_canary,
-                   size=len(station_ids))
+                   size=len(station_ids), **self._run_meta())
 
         outcomes = await asyncio.gather(*(
-            self._transition_station(sid, wave_id, target_mode)
+            self._step(sid, wave_id, target_mode)
             for sid in station_ids
         ))
 
@@ -394,13 +466,13 @@ class MigrationOrchestrator(MigrationController):
             self._rollback_wave(wave_id)
             self._emit("wave_rolled_back", wave_id=wave_id,
                        migrated=migrated, failed=failed, eligible=eligible,
-                       deferred=deferred)
+                       deferred=deferred, **self._run_meta())
             return False
 
         wave.phase = WavePhase.COMPLETED
         self._emit("wave_completed", wave_id=wave_id,
                    migrated=migrated, failed=failed, incompatible=incompatible,
-                   deferred=deferred)
+                   deferred=deferred, **self._run_meta())
         return True
 
     async def _transition_station(self, station_id, wave_id, target_mode) -> MigrationState:
@@ -525,6 +597,98 @@ class MigrationOrchestrator(MigrationController):
         # Step 5: confirmed.
         return self._mark_migrated(station_id, wave_id)
 
+    def _label(self, public_key: bytes | None) -> str | None:
+        if public_key is None or self._key_id_for is None:
+            return None
+        try:
+            return self._key_id_for(public_key)
+        except Exception:  # noqa: BLE001 - a label must never fail a rotation
+            return None
+
+    async def _rotate_station(self, station_id, wave_id, target_mode) -> MigrationState:
+        """
+        B-F2: one station's key rotation, with the overlap window.
+
+            RequestPQEnrolment -> {algorithm, new public_key, key_id}
+            -> stage_key(new)          old key still valid (boot checks, etc.)
+            -> PQAuthChallenge {key_id: new} -> verify against the NEW key
+            -> commit_staged()         new key replaces old
+            failure anywhere: discard_staged(); the OLD key stays
+
+        Returns MIGRATED (rotated) or ROLLED_BACK (kept its old key -- counted
+        as a failure for the wave threshold). The station's migration_state
+        is never changed: it is migrated before, during and after. Offline
+        stations are deferred (PENDING), exactly as in a migration.
+        """
+        if self._skip_offline:
+            is_connected = getattr(self._fleet, "is_connected", None)
+            if callable(is_connected) and not is_connected(station_id):
+                self._emit("station_deferred", station=station_id,
+                           wave_id=wave_id, reason="not connected", kind="rotation")
+                return MigrationState.PENDING
+
+        old_key = self._auth.public_key(station_id)
+        old_key_id = self._label(old_key)
+        if old_key is None:   # un-enrolled since the run started
+            return self._rotation_failed(station_id, wave_id, old_key_id, None,
+                                         "station is no longer enrolled")
+
+        try:
+            request = self._make_enrolment_req(station_id, algorithm=self._target_algorithm)
+            result = await self._dispatch.send(
+                station_id, request, timeout_s=self._dispatch_timeout_s)
+        except Exception as exc:  # noqa: BLE001 - a fault = a failed rotation
+            return self._rotation_failed(station_id, wave_id, old_key_id, None,
+                                         f"request not sent: {type(exc).__name__}: {exc}")
+        if not getattr(result, "ok", False):
+            return self._rotation_failed(
+                station_id, wave_id, old_key_id, None,
+                f"RequestPQEnrolment not accepted (outcome={getattr(result, 'outcome', None)}, "
+                f"status={getattr(result, 'status', None)})")
+        try:
+            algorithm, new_key, new_key_id = self._parse_public_key(
+                getattr(result, "response", None))
+        except Exception as exc:  # noqa: BLE001
+            return self._rotation_failed(station_id, wave_id, old_key_id, None,
+                                         f"unreadable enrolment reply: {type(exc).__name__}: {exc}")
+        if algorithm != self._target_algorithm:
+            return self._rotation_failed(station_id, wave_id, old_key_id, new_key_id,
+                                         f"reply is {algorithm!r}, expected {self._target_algorithm!r}")
+
+        # Overlap window opens: new key held NEXT TO the old one.
+        self._auth.stage_key(station_id, new_key)
+        self._emit("rotation_started", station=station_id, wave_id=wave_id,
+                   old_key_id=old_key_id, new_key_id=new_key_id, algorithm=algorithm)
+
+        check = await challenge_and_verify(
+            dispatcher=self._dispatch, authenticator=self._auth, station_id=station_id,
+            make_challenge=self._make_challenge_msg, parse_signature=self._parse_signature,
+            key_id=new_key_id, timeout_s=self._dispatch_timeout_s, staged=True,
+        )
+        self._emit("connection_attempt", transition="pq_auth", station=station_id,
+                   wave_id=wave_id, result="success" if check.verified else "rejected",
+                   detail=check.detail, duration_ms=check.duration_ms,
+                   algorithm=self._target_algorithm, key_id=new_key_id, trigger="rotation")
+        if not check.verified:
+            self._auth.discard_staged(station_id)
+            return self._rotation_failed(station_id, wave_id, old_key_id, new_key_id, check.detail)
+
+        # Proven: the new key replaces the old one. Overlap window closes.
+        self._auth.commit_staged(station_id)
+        self._rotated_this_run[wave_id].append((station_id, old_key))
+        self._emit("rotation_completed", station=station_id, wave_id=wave_id,
+                   old_key_id=old_key_id, new_key_id=new_key_id,
+                   duration_ms=check.duration_ms)
+        self._fleet.mark_migrated_algorithm(station_id, self._target_algorithm)
+        return MigrationState.MIGRATED
+
+    def _rotation_failed(self, station_id, wave_id, old_key_id, new_key_id, detail) -> MigrationState:
+        """The station keeps its old key (nothing was replaced)."""
+        LOGGER.warning("%s: rotation failed, old key kept: %s", station_id, detail)
+        self._emit("rotation_failed", station=station_id, wave_id=wave_id,
+                   old_key_id=old_key_id, new_key_id=new_key_id, detail=detail)
+        return MigrationState.ROLLED_BACK
+
     async def _check_and_report(self, station_id: str, wave_id: int, *,
                                 key_id: str | None) -> bool:
         """
@@ -592,7 +756,19 @@ class MigrationOrchestrator(MigrationController):
         return MigrationState.ROLLED_BACK
 
     def _rollback_wave(self, wave_id: int) -> None:
-        """Un-enrol every station enrolled in a wave and mark it rolled back."""
+        """Un-enrol every station enrolled in a wave and mark it rolled back.
+        In a rotation run: put back the OLD key of every station rotated in
+        the wave (they stay migrated; the charger still holds that key as
+        its "previous" one, so its boot checks keep passing)."""
+        for station_id, old_key in self._rotated_this_run.get(wave_id, []):
+            self._auth.enrol(station_id, old_key)
+            self._emit("rotation_failed", station=station_id, wave_id=wave_id,
+                       old_key_id=self._label(old_key), new_key_id=None,
+                       detail="wave rolled back: old key restored")
+            self._status.rolled_back += 1
+            if self._status.migrated > 0:
+                self._status.migrated -= 1
+        self._rotated_this_run[wave_id] = []
         for station_id in self._enrolled_this_run.get(wave_id, []):
             self._unenrol(station_id)
             self._fleet.set_state(station_id, MigrationState.ROLLED_BACK, wave_id)
@@ -619,4 +795,4 @@ class MigrationOrchestrator(MigrationController):
         if phase == MigrationPhase.COMPLETED:
             self._emit("migration_completed",
                        migrated=self._status.migrated,
-                       incompatible=self._status.incompatible)
+                       incompatible=self._status.incompatible, **self._run_meta())
