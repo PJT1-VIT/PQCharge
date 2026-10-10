@@ -306,7 +306,7 @@ def _connect(registry, *station_ids):
 
 async def _run_migration(setup, *, wave_size=1, canary_count=1):
     setup.controller.start_migration(
-        wave_size=wave_size, canary_count=canary_count, target_mode="pqc"
+        wave_size=wave_size, canary_count=canary_count, target_mode="hybrid"
     )
     for _ in range(300):
         if setup.controller.get_migration_status().is_terminal:

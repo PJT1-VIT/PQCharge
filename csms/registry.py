@@ -33,6 +33,7 @@ called from elsewhere.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import inspect
 import logging
 import time
@@ -47,6 +48,14 @@ from csms.persistence import NullStore
 
 
 LOGGER = logging.getLogger("csms.registry")
+
+_BOOTED_SESSION: contextvars.ContextVar = contextvars.ContextVar(
+    "pqcharge_booted_session", default=None
+)
+"""The session whose boot a listener task is handling. Set by notify_boot()
+just before it creates each listener task; asyncio copies the current
+context into a new task, so the listener sees the connection that booted
+even if the charger reconnects before the task's first step runs (L36)."""
 
 
 def _now() -> datetime:
@@ -113,6 +122,12 @@ class StationSession:
     connection (Contract 7 section 7.7). Per-connection for the same
     reason as boot_accepted: a reconnected station has not proved its
     key again until it is challenged again."""
+
+    close_reason: str | None = None
+    """Why the SERVER is closing this connection, when it is (A-F1: a
+    failed boot key check -> "pq_auth_failed"). deregister() writes it
+    into the one connection_closed line, so a server-side close is logged
+    once, with its reason, not as two lines."""
 
     last_heartbeat_at: datetime | None = None
     """Per-connection: a heartbeat proves this socket is alive."""
@@ -484,15 +499,24 @@ class SessionRegistry(FleetView):
         # as no longer current and aggregate_power_w excludes it.
 
         if self._log is not None:
+            extra = {}
+            if session.close_reason is not None:
+                # A-F1 / Contract 7 section 7.5 (4): the server closed this
+                # connection on purpose; Track C's E5 counts these by reason.
+                extra["reason"] = session.close_reason
             self._log.emit(
                 EventType.CONNECTION_CLOSED,
                 station_id,
-                outcome=Outcome.SUCCESS,
+                outcome=(
+                    Outcome.REJECTED if session.close_reason is not None
+                    else Outcome.SUCCESS
+                ),
                 session_duration_ms=(
                     (time.monotonic_ns() - session.connected_monotonic_ns) / 1e6
                 ),
                 bytes_tx=session.bytes_tx,
                 bytes_rx=session.bytes_rx,
+                **extra,
             )
         return True
 
@@ -548,15 +572,31 @@ class SessionRegistry(FleetView):
         if not session.boot_accepted:
             return []
         tasks = []
-        for fn in list(self._boot_listeners):
-            task = asyncio.get_running_loop().create_task(
-                self._run_boot_listener(fn, station_id),
-                name=f"boot-listener:{station_id}",
-            )
-            self._listener_tasks.add(task)
-            task.add_done_callback(self._listener_tasks.discard)
-            tasks.append(task)
+        token = _BOOTED_SESSION.set(session)
+        try:
+            for fn in list(self._boot_listeners):
+                task = asyncio.get_running_loop().create_task(
+                    self._run_boot_listener(fn, station_id),
+                    name=f"boot-listener:{station_id}",
+                )
+                self._listener_tasks.add(task)
+                task.add_done_callback(self._listener_tasks.discard)
+                tasks.append(task)
+        finally:
+            _BOOTED_SESSION.reset(token)
         return tasks
+
+    def booted_session(self, station_id: str) -> StationSession | None:
+        """
+        Inside a boot listener: the connection whose boot is being handled
+        (L36). That is the session that was current when the boot was
+        announced -- NOT necessarily the current one now, if the charger
+        has reconnected since. Outside a listener: the current session.
+        """
+        booted = _BOOTED_SESSION.get()
+        if booted is not None and booted.station_id == station_id:
+            return booted
+        return self._sessions.get(station_id)
 
     @staticmethod
     async def _run_boot_listener(fn: Callable[[str], Any], station_id: str) -> None:
@@ -590,6 +630,22 @@ class SessionRegistry(FleetView):
         if session is not None and current is not session:
             return False
         current.pq_verified = True
+        return True
+
+    def mark_closing(
+        self, station_id: str, session: StationSession, reason: str
+    ) -> bool:
+        """
+        Record that the server is about to close `session` for `reason`.
+
+        Returns False -- and records nothing -- if `session` is no longer
+        the station's current connection (L36: a check that finished after
+        the charger reconnected must not touch the NEW connection). The
+        caller closes the connection only when this returns True.
+        """
+        if self._sessions.get(station_id) is not session:
+            return False
+        session.close_reason = reason
         return True
 
     def set_enrolment_lookup(self, is_enrolled: Callable[[str], bool] | None) -> None:

@@ -79,10 +79,12 @@ from csms.handlers import (
 from csms.migration import (
     DEFAULT_MIGRATION_MODE,
     MIGRATION_MODES,
+    PQC_NOT_BUILT,
     SUPPORTED_TARGET_MODES,
     DisabledController,
     apply_fleet_profile,
     build_migration,
+    install_boot_check,
     load_fleet_profile,
 )
 from csms.persistence import (
@@ -395,6 +397,20 @@ class CSMS:
         self.controller = self.migration.controller
         self.registry.attach_migration_controller(self.controller)
 
+        # A-F1 (A-P3, Contract 7 section 7.5): in hybrid mode every accepted
+        # boot of an enrolled charger is followed by an ML-DSA key check; a
+        # failure closes the connection (1008). Classical mode registers
+        # nothing. Hybrid without migration raises RuntimeError -> main()
+        # refuses to start, rather than run "hybrid" with no checks.
+        self.boot_verifier = None
+        if crypto_mode == "hybrid":
+            self.boot_verifier = install_boot_check(
+                self.migration,
+                registry=self.registry,
+                dispatcher=self.dispatcher,
+                event_log=self.log,
+            )
+
     # -- OCPP WebSocket side --------------------------------------------
 
     async def on_connect(self, websocket: Any) -> None:
@@ -569,6 +585,9 @@ class CSMS:
         if path == "/api/migration/rollback":
             return self._rollback(query)
 
+        if path == "/api/migration/rotate":
+            return self._start_rotation(query)
+
         return _json_response(HTTPStatus.NOT_FOUND, {"error": "no such endpoint"})
 
     # -- Contract 6 station commands (Day 8) -----------------------------
@@ -704,10 +723,15 @@ class CSMS:
                 {
                     "error": "wave_size, canary_count and target_mode required",
                     "example": "/api/migration/start"
-                               "?wave_size=10&canary_count=2&target_mode=pqc",
+                               "?wave_size=10&canary_count=2&target_mode=hybrid",
                 },
             )
 
+        if target_mode == "pqc":
+            # A-F2 (L28/L17): pure PQC (post-quantum TLS) is future work.
+            return _json_response(
+                HTTPStatus.BAD_REQUEST, {"error": PQC_NOT_BUILT, "got": target_mode}
+            )
         if target_mode not in SUPPORTED_TARGET_MODES:
             return _json_response(
                 HTTPStatus.BAD_REQUEST,
@@ -739,6 +763,44 @@ class CSMS:
         # record of a migration); logging it here too would double every
         # E3 marker.
         return _json_response(HTTPStatus.OK, {"migration_id": migration_id})
+
+    def _start_rotation(self, query: dict[str, list[str]]) -> Response:
+        """
+        A-F5 (A-P8): start a key rotation of the already-migrated chargers
+        (Track B's B-F2: new key held next to the old one until proven).
+
+        Same shape as /api/migration/start: GET with query parameters,
+        {migration_id} on success, 409 while a migration or rotation runs,
+        501 with the reason when migration is unavailable. Progress is read
+        from /api/migration (kind: "rotation"); the orchestrator writes the
+        rotation_* events itself.
+        """
+        try:
+            wave_size = int(query["wave_size"][0])
+            canary_count = int(query["canary_count"][0])
+        except (KeyError, IndexError, ValueError):
+            return _json_response(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "wave_size and canary_count required",
+                 "example": "/api/migration/rotate?wave_size=10&canary_count=2"},
+            )
+        if wave_size < 1 or canary_count < 0:
+            return _json_response(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "wave_size must be >= 1 and canary_count >= 0"},
+            )
+        try:
+            rotation_id = self.controller.start_rotation(
+                wave_size=wave_size, canary_count=canary_count
+            )
+        except NotImplementedError as exc:
+            return _json_response(
+                HTTPStatus.NOT_IMPLEMENTED, {"error": str(exc) or "rotation unavailable"}
+            )
+        except RuntimeError as exc:
+            # a migration or rotation is already running
+            return _json_response(HTTPStatus.CONFLICT, {"error": str(exc)})
+        return _json_response(HTTPStatus.OK, {"migration_id": rotation_id})
 
     def _rollback(self, query: dict[str, list[str]]) -> Response:
         try:
@@ -794,6 +856,7 @@ class CSMS:
             response_timeout_s=self.response_timeout_s,
             migration=self.migration.reason,
             migration_enabled=self.migration.enabled,
+            boot_check=self.boot_verifier is not None,
             migration_algorithm=self.migration.algorithm,
             migration_failure_threshold=self.migration.failure_threshold,
             pq_enrolments_restored=self.migration.restored_enrolments,
@@ -892,7 +955,9 @@ def main() -> None:
         "--mode",
         default="classical",
         choices=("classical", "hybrid", "pqc"),
-        help="crypto mode recorded on every event; no crypto runs until Day 7",
+        help="security mode (Contract 7). classical: TLS only. hybrid: also an "
+             "ML-DSA key check after every boot of an enrolled charger (needs "
+             "migration on). pqc: reserved, not built (L17)",
     )
     parser.add_argument("--log", default="logs/events.jsonl")
     parser.add_argument(
@@ -1064,27 +1129,31 @@ def main() -> None:
         else AuthorizationPolicy(mode=args.auth_mode)
     )
 
-    csms = CSMS(
-        host=args.host,
-        port=args.port,
-        crypto_mode=args.mode,
-        log_path=args.log,
-        heartbeat_interval_s=args.heartbeat_interval,
-        log_messages=args.log_messages,
-        ws_ping_interval=args.ws_ping_interval or None,
-        ws_ping_timeout=args.ws_ping_timeout or None,
-        auth_policy=auth_policy,
-        db_path=None if args.no_db else args.db,
-        db_flush_interval_s=args.db_flush_interval,
-        db_synchronous=args.db_synchronous,
-        ssl_context=ssl_context,
-        identity_check=args.tls_identity_check,
-        dispatch_timeout_s=args.dispatch_timeout,
-        migration_mode=args.migration,
-        fleet_profile=fleet_profile,
-        fleet_profile_path=args.fleet_profile,
-        failure_threshold=args.migration_failure_threshold,
-    )
+    try:
+        csms = CSMS(
+            host=args.host,
+            port=args.port,
+            crypto_mode=args.mode,
+            log_path=args.log,
+            heartbeat_interval_s=args.heartbeat_interval,
+            log_messages=args.log_messages,
+            ws_ping_interval=args.ws_ping_interval or None,
+            ws_ping_timeout=args.ws_ping_timeout or None,
+            auth_policy=auth_policy,
+            db_path=None if args.no_db else args.db,
+            db_flush_interval_s=args.db_flush_interval,
+            db_synchronous=args.db_synchronous,
+            ssl_context=ssl_context,
+            identity_check=args.tls_identity_check,
+            dispatch_timeout_s=args.dispatch_timeout,
+            migration_mode=args.migration,
+            fleet_profile=fleet_profile,
+            fleet_profile_path=args.fleet_profile,
+            failure_threshold=args.migration_failure_threshold,
+        )
+    except RuntimeError as exc:
+        # A-F1: e.g. --mode hybrid with migration off or unavailable.
+        parser.error(str(exc))
     try:
         asyncio.run(csms.run())
     except KeyboardInterrupt:
