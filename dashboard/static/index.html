@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PQCharge · Live fleet</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<!--
+  PQCharge live dashboard (Track C, C-F6). Reads only GET /api/... on the
+  server that serves this page: the CSMS itself (/dashboard/, Track A A-F4)
+  or `python -m dashboard.serve` (pass-through or --mock). No build step.
+-->
+<header class="top">
+  <div class="brand">
+    <span class="logo" aria-hidden="true">⚡</span>
+    <div>
+      <h1>PQCharge · live fleet</h1>
+      <p class="sub" id="serverLine">connecting…</p>
+    </div>
+    <span class="mockBadge" id="mockBadge" hidden>MOCK DATA · not a measurement</span>
+  </div>
+  <div class="chips" id="chips"></div>
+  <div class="counts" id="counts"></div>
+</header>
+
+<main class="layout">
+  <section class="panel fleet" aria-labelledby="hFleet">
+    <div class="panelHead">
+      <h2 id="hFleet">Fleet</h2>
+      <div class="legend" id="legend"></div>
+    </div>
+    <div class="grid" id="grid" role="list"></div>
+    <p class="hint">Click a charger for its security details. 🔒 = TLS on this connection · ✓ = post-quantum key verified on this connection.</p>
+  </section>
+
+  <aside class="side">
+    <section class="panel" aria-labelledby="hMig">
+      <div class="panelHead"><h2 id="hMig">Migration</h2><span class="phase" id="phase">—</span></div>
+      <p class="phaseWords" id="phaseWords"></p>
+      <div class="bar" id="progress" aria-label="migration progress"></div>
+      <div class="waves" id="waves"></div>
+    </section>
+
+    <section class="panel" aria-labelledby="hCtl">
+      <h2 id="hCtl">Controls</h2>
+      <div class="ctlRow">
+        <label>Canary <input id="inCanary" type="number" min="1" value="5"></label>
+        <label>Wave size <input id="inWave" type="number" min="1" value="10"></label>
+      </div>
+      <div class="ctlRow">
+        <button id="btnStart" class="primary">Start migration → hybrid</button>
+        <button id="btnRotate">Rotate keys</button>
+      </div>
+      <div class="ctlRow">
+        <label>Wave <select id="selWave"></select></label>
+        <button id="btnRollback" class="danger">Roll back wave</button>
+      </div>
+      <div class="ctlRow">
+        <label class="grow">Fleet power limit <span id="limitOut">7.4 kW</span>
+          <input id="inLimit" type="range" min="0" max="7400" step="100" value="7400"></label>
+      </div>
+      <div class="ctlRow">
+        <button id="btnLimit">Apply limit</button>
+        <button id="btnClear">Clear limit</button>
+      </div>
+      <div class="ctlRow mockOnly" hidden>
+        <button id="btnStorm">Mock: reconnect storm</button>
+        <button id="btnImpostor">Mock: impostor CP0003</button>
+      </div>
+      <p class="toast" id="toast" role="status" aria-live="polite"></p>
+    </section>
+
+    <section class="panel ticker" aria-labelledby="hTick">
+      <div class="panelHead"><h2 id="hTick">Live events</h2><span class="sub" id="tickSrc"></span></div>
+      <ol id="ticker"></ol>
+    </section>
+  </aside>
+
+  <section class="panel chartPanel" aria-labelledby="hPower">
+    <h2 id="hPower">Fleet power</h2>
+    <p class="sub">Sum of the chargers' latest readings (kW). A curtailment shows as a step down.</p>
+    <div class="chart" id="cPower"></div>
+  </section>
+  <section class="panel chartPanel" aria-labelledby="hLat">
+    <h2 id="hLat">Post-quantum key checks</h2>
+    <p class="sub" id="latSub">Round-trip time of each ML-DSA-44 check seen since this page opened.</p>
+    <div class="chart" id="cLat"></div>
+  </section>
+</main>
+
+<div class="drawer" id="drawer" hidden role="dialog" aria-modal="true" aria-labelledby="dTitle">
+  <div class="drawerCard">
+    <button class="close" id="drawerClose" aria-label="Close">×</button>
+    <h2 id="dTitle">Charger</h2>
+    <div id="drawerBody"></div>
+  </div>
+</div>
+
+<script src="vendor/echarts.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
