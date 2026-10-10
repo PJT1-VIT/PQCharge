@@ -175,14 +175,17 @@ def test_migration_off_never_loads_post_quantum_code():
 
 class _FakeDispatcher:
     """
-    Answers the way Track C's agent answers, without a network.
+    Answers the way Track C's agent answers (Contract 7), without a network.
+    Each station is a REAL agent.pq_identity.PQIdentity (memory only):
 
-      InstallPQAuth    keeps the private key it was sent; Accepted
-                       (Rejected for a station listed in `refuse`)
-      PQAuthChallenge  signs the nonce with that key using Track B's real
-                       sign_challenge, and returns the signature in
-                       DataTransfer.data packed by Track C's real
-                       pack_signature
+      RequestPQEnrolment  the station makes its own ML-DSA key pair and
+                          answers with the public key only, packed by
+                          Track C's real pack_enrolment_reply
+                          (Rejected for a station listed in `refuse`)
+      PQAuthChallenge     signs the nonce with the key named by key_id,
+                          packed by Track C's real pack_signature
+      InstallPQAuth       (deprecated) never expected since A-P4; if it
+                          arrives the test fails on `sent`
 
     Returns Track A's real DispatchResult, built with the real dispatcher's
     own status and outcome rules, so the orchestrator reads exactly the
@@ -195,34 +198,49 @@ class _FakeDispatcher:
         from crypto.pq import PQProvider
 
         self.refuse = set(refuse)
-        self.sent = []      # (station_id, message_id), in send order
-        self.keys = {}      # station_id -> the private key it was given
+        self.sent = []          # (station_id, message_id), in send order
+        self.requests = []      # (station_id, request), every message sent
+        self.identities = {}    # station_id -> the station's PQIdentity
         self._provider = PQProvider()
+
+    def identity(self, station_id):
+        from agent.pq_identity import PQIdentity
+
+        if station_id not in self.identities:
+            self.identities[station_id] = PQIdentity(station_id, provider=self._provider)
+        return self.identities[station_id]
 
     async def send(self, station_id, request, *, timeout_s=None):
         from agent.pqc_messages import (
             MSG_CHALLENGE,
-            MSG_INSTALL,
+            MSG_REQUEST_ENROLMENT,
             STATUS_ACCEPTED,
             STATUS_REJECTED,
             STATUS_UNKNOWN_MESSAGE,
+            challenge_key_id,
+            pack_enrolment_reply,
             pack_signature,
             parse_challenge_data,
-            parse_install_data,
+            parse_enrolment_request,
         )
-        from crypto.pq_auth import sign_challenge
 
         self.sent.append((station_id, request.message_id))
+        self.requests.append((station_id, request))
         await asyncio.sleep(0)
 
         if station_id in self.refuse:
             response = call_result.DataTransfer(status=STATUS_REJECTED)
-        elif request.message_id == MSG_INSTALL:
-            _algorithm, self.keys[station_id] = parse_install_data(request.data)
-            response = call_result.DataTransfer(status=STATUS_ACCEPTED)
+        elif request.message_id == MSG_REQUEST_ENROLMENT:
+            algorithm = parse_enrolment_request(request.data)
+            public_key, _key_id = self.identity(station_id).enrol(algorithm)
+            response = call_result.DataTransfer(
+                status=STATUS_ACCEPTED, data=pack_enrolment_reply(algorithm, public_key)
+            )
         elif request.message_id == MSG_CHALLENGE:
-            nonce, _payload = parse_challenge_data(request.data)
-            signature = sign_challenge(self._provider, self.keys[station_id], nonce)
+            nonce, payload = parse_challenge_data(request.data)
+            signature = self.identity(station_id).answer_challenge(
+                nonce, challenge_key_id(payload)
+            )
             response = call_result.DataTransfer(
                 status=STATUS_ACCEPTED, data=pack_signature(signature)
             )
@@ -347,10 +365,13 @@ def test_real_orchestrator_through_the_wiring(tmp_path):
         "CP0002": MigrationState.MIGRATED,
         "CP0003": MigrationState.INCOMPATIBLE,
     }
-    # each capable station: key installed, THEN challenged; the legacy one got nothing
+    # A-P4: each capable station is ASKED to make its key, THEN challenged;
+    # InstallPQAuth is never sent; the legacy one got nothing
     for sid in ("CP0001", "CP0002"):
-        assert [m for s, m in dispatcher.sent if s == sid] == ["InstallPQAuth", "PQAuthChallenge"]
+        assert [m for s, m in dispatcher.sent if s == sid] == ["RequestPQEnrolment", "PQAuthChallenge"]
     assert "CP0003" not in {s for s, _ in dispatcher.sent}
+    # L01: no message the server sent carries a private key
+    assert not any("private_key" in str(getattr(r, "data", "")) for _s, r in dispatcher.requests)
     # "migrated" now means AUTHENTICATED: one verified challenge per station,
     # id in payload.station, result in payload.result, round-trip time kept (S2)
     checks = _pq_auth_lines(log)
@@ -358,10 +379,22 @@ def test_real_orchestrator_through_the_wiring(tmp_path):
     assert {p["result"] for p in checks} == {"success"}
     assert all(p.get("duration_ms") is not None for p in checks)
     assert all(p["source"] == "orchestrator" for p in checks)
+    # Contract 7 section 7.6: the challenge names the station's own key
+    for p in checks:
+        assert p["trigger"] == "migration"
+        assert p["key_id"] == dispatcher.identities[p["station"]].key_id
+    enrolled = [p for (t, _sid, p) in log.events
+                if t == "certificate_installed" and p.get("transition") == "pq_enrolled"]
+    assert sorted(p["station"] for p in enrolled) == ["CP0001", "CP0002"]
+    # L34: the passed migration check verified each station's connection
+    assert registry.get_session("CP0001").pq_verified
+    assert registry.get_session("CP0002").pq_verified
+    assert not registry.get_session("CP0003").pq_verified
     # exactly ONE migration_started -- the server does not add its own
     assert [e[0] for e in log.events].count("migration_started") == 1
-    # the server's startup line says the challenge is on
-    assert "challenge after install" in setup.reason
+    # the server's startup line says stations make their keys and are challenged
+    assert "station-made keys" in setup.reason
+    assert "challenge after enrolment" in setup.reason
     # keys reached the database
     store.flush()
     assert set(store.load_enrolments()) == {"CP0001", "CP0002"}

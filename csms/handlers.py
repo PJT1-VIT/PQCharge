@@ -48,7 +48,7 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 
-from ocpp.routing import on
+from ocpp.routing import after, on
 from ocpp.v201 import ChargePoint as CpBase
 from ocpp.v201 import call_result
 from ocpp.v201.enums import RegistrationStatusEnumType
@@ -348,6 +348,21 @@ class CSMSHandlers(CpBase):
             interval=self.heartbeat_interval_s,
             status=RegistrationStatusEnumType.accepted,
         )
+
+    @after("BootNotification")
+    def after_boot_notification(self, charging_station, reason, **kwargs):
+        """
+        Contract 7 section 7.5 (1): announce the boot to the registry's boot
+        listeners (Track B's boot verifier, from A-P3).
+
+        The ocpp library calls @after handlers only AFTER the
+        BootNotification reply has been sent (checked in ocpp 2.0.0 and
+        2.1.0, ChargePoint._handle_call). This method is deliberately
+        synchronous and only starts tasks: everything a listener does --
+        including sending the station a command -- runs on its own task,
+        never on this connection's receive loop.
+        """
+        self.registry.notify_boot(self.id, self)
 
     # -- Heartbeat -------------------------------------------------------
 
