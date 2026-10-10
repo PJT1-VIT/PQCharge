@@ -15,8 +15,9 @@ The handlers do three things each, in this order:
   2. update the session registry, so the fleet view stays true
   3. emit to the Contract 3 event log, so the run stays measurable
 
-Nothing here reaches for cryptography. Stage 1 is plain ws:// and
-crypto/stub.py raises on every call until Day 7.
+Nothing here reaches for cryptography. Transport security (TLS) is
+csms/transport.py's job and post-quantum identity is the migration's
+(csms/migration.py); the crypto stubs of Stage 1 were deleted in PR #23.
 
 --------------------------------------------------------------------
 ON OCPP FIELD NAMES

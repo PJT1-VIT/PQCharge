@@ -8,8 +8,8 @@ Contract 6 HTTP surface.
 WHAT THIS IS AT STAGE 1
 
 Plain ws://. No TLS, no certificates, no cryptography of any kind --
-that is Day 7, jointly with Track B, and crypto/stub.py raises on every
-call until then. Stage 1's job is to prove the protocol layer is
+that arrived on Day 7, jointly with Track B (the crypto stubs it
+replaced were deleted in PR #23). Stage 1's job is to prove the protocol layer is
 correct before anything cryptographic can hide a bug inside it.
 
 Message handlers live in csms/handlers.py. As of Phase A2 that covers
@@ -69,6 +69,7 @@ from websockets.asyncio.server import serve
 from csms.authorization import AUTH_MODES, AuthorizationPolicy
 from csms.dispatch import DEFAULT_DISPATCH_TIMEOUT_S, CommandDispatcher
 from csms.events import EventLog, EventType, Outcome
+from csms.log_redaction import install_private_key_redaction
 from csms.handlers import (
     DEFAULT_HEARTBEAT_INTERVAL_S,
     HAS_ROUTE_MESSAGE,
@@ -319,7 +320,7 @@ class CSMS:
         """Contract 4. Replaced below, once the registry and dispatcher it
         depends on exist, by Track B's real orchestrator -- or by a
         DisabledController carrying the reason migration is unavailable.
-        Track A no longer imports idmanager/stub.py."""
+        (idmanager/stub.py, which this once was, was deleted in PR #23.)"""
 
         self.store = open_store(
             db_path,
@@ -1039,6 +1040,10 @@ def main() -> None:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
     )
+    # L04 / A-P5: blank any private_key value before a line is written.
+    # The ocpp library logs every sent and received frame at INFO, so this
+    # must be on whether or not --verbose is given.
+    install_private_key_redaction()
 
     ssl_context = None
     if args.tls:

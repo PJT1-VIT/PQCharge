@@ -42,11 +42,13 @@ from a wiring mistake:
 
     off      do not look
     warn     log a mismatch, allow the connection   (Day 7 default)
-    enforce  refuse the connection                  (target before E5)
+    enforce  refuse the connection                  (DEFAULT since L07)
 
 Track B issues station certificates with common_name = station_id, so
-warn is expected to be silent. Once a run confirms that, move to
-enforce and record the change.
+the check is silent for honest stations. The A+B+C session (2026-10-02,
+Step 1b) ran Track C's agents under enforce with 0 mismatches, so the
+default moved from warn to enforce (L07). Pass --tls-identity-check warn
+to get the old behaviour, e.g. for a demonstration of the attack.
 
 --------------------------------------------------------------------
 CONSEQUENCE FOR THE CONTRACT 6 HTTP SURFACE -- read before enabling TLS
@@ -97,7 +99,7 @@ DEFAULT_CLIENT_CERT_MODE = "required"
 deviation, not a configuration preference."""
 
 IDENTITY_CHECK_MODES = ("off", "warn", "enforce")
-DEFAULT_IDENTITY_CHECK = "warn"
+DEFAULT_IDENTITY_CHECK = "enforce"
 
 _VERIFY_MODES = {
     "required": ssl.CERT_REQUIRED,

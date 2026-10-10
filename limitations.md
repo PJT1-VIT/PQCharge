@@ -35,10 +35,9 @@ Old numbers (F1, F13, F14, R11, …) differed between the dev plans; F14 meant t
 
 | No. | Finding | Status | Action | Owner |
 |---|---|---|---|---|
-| L04 | **Private keys appear in the server log.** The `ocpp` library logs every `InstallPQAuth` message at INFO, key included. GitGuardian flagged the copies once committed in `evidence/`. *(old: A-F14)* | **Agreed (A, B, C)** | 1. Track A adds a log filter that blanks `private_key` values. 2. Never commit `*.log`. 3. Koshambi closes the GitGuardian incident as a test credential. 4. No git-history rewrite (throwaway test keys). **Root fix: Contract 7 removes `InstallPQAuth` (§7.8).** | A (filter), C (incident) |
-| L05 | **Coarse timers on Windows before Python 3.13.** `time.monotonic()` moves in ~15.6 ms steps. The agent is fixed (PR #26); Track A's timers (`monotonic_ns`: server handshake time, key-check round trip) are not. | **Agreed (A, B, C)** | **All tracks move to Python 3.13+.** Remove this item once all three confirm they are on 3.13. | A, B, C |
+| L04 | **Private keys appear in the server log.** The `ocpp` library logs every `InstallPQAuth` message at INFO, key included. GitGuardian flagged the copies once committed in `evidence/`. *(old: A-F14)* | **Agreed (A, B, C)** | 1. Track A adds a log filter that blanks `private_key` values. 2. Never commit `*.log`. 3. Koshambi closes the GitGuardian incident as a test credential. 4. No git-history rewrite (throwaway test keys). **Root fix: Contract 7 removes `InstallPQAuth` (§7.8).** **Step 1 done (Track A, 2026-10-10):** `csms/log_redaction.py` blanks every `private_key` value in the server's output log, including the escaped form inside `DataTransfer.data` and tracebacks; checked live (3 `InstallPQAuth` sends logged, 3 values `[REDACTED]`). Item stays open until `InstallPQAuth` is removed (A-P6 / B-P5). | A (filter ✔), C (incident) |
+| L05 | **Coarse timers on Windows before Python 3.13.** `time.monotonic()` moves in ~15.6 ms steps. The agent is fixed (PR #26); Track A's timers (`monotonic_ns`: server handshake time, key-check round trip) are not. | **Agreed (A, B, C)** | **All tracks move to Python 3.13+.** Remove this item once all three confirm they are on 3.13. **Track A: on 3.13 (Mac, 3.13.16, 2026-10-10; full suite passes).** | A, B, C |
 | L06 | **Certificates lack the AKI/SKI extensions.** Strict TLS software rejects them; Python 3.13's default context did in session Step 1b. *(old: integration-plan F14)* | Agreed | Add both extensions in `crypto/ca.py`, then regenerate all certificates. | B |
-| L07 | **The identity check only warns by default.** | Agreed | Default `--tls-identity-check` to `enforce`. The agent already passed under `enforce` in session Step 1b. | A |
 | L09 | **E3 showed the rollback but not the halt.** The failing chargers were in the last wave. | Agreed | One extra E3 run with the refusers mid-fleet (for example CP0021–25): a new fleet profile, plus the load generator run twice with `--start-index`. | C runs; B (profile contents), A (fixture) |
 | L11 | **Session runs were stopped with Ctrl-C,** so they are marked "incomplete". | Agreed | Every run ends on its own. `--charge-for` follows the rule in Track C's plan (ramp + action + 30 s observation + 30 s margin). | C |
 
@@ -46,7 +45,6 @@ Old numbers (F1, F13, F14, R11, …) differed between the dev plans; F14 meant t
 
 | No. | Finding | Status | Action | Owner |
 |---|---|---|---|---|
-| L14 | **Contract 3 lacks `station_deferred` and `migration_failed`.** The orchestrator already emits both; Track C's analysis already reads them. *(old: integration-plan F7, A-6)* | Planned | Add both to `EventType` in `csms/events.py` (a frozen contract: tell B and C in the PR). | A |
 | L15 | **The event log fsyncs every event,** which may slow the server at fleet scale and distort E2 timings. | Planned | fsync experiment at N=50/100 before E2 (Track A plan §8). | A |
 | L16 | **E6 over `wss://` is not yet shown.** | Planned | `bootstrap_pki --also E6-SAP-01`, then re-run E6 over TLS. | A + B |
 
@@ -104,5 +102,7 @@ Old numbers (F1, F13, F14, R11, …) differed between the dev plans; F14 meant t
 | L03 (meaning of the three modes) | Contract 7 §7.1, frozen 2026-10-08 |
 | L18 (Contract 7 approval) | approved by A, B, C, 2026-10-08 |
 | L10 (first key check ~10× slower) | C-P2: the provider is built once at load-generator start, and at charger start when a key file exists (Contract 7 §7.3) |
+| L07 (identity check only warned by default) | Track A PR 1 (2026-10-10): `--tls-identity-check` defaults to `enforce`; `warn` still available explicitly |
+| L14 (Contract 3 lacked two event types) | Track A PR 1 (2026-10-10): `EventType.STATION_DEFERRED`, `EventType.MIGRATION_FAILED` (same strings as before) |
 
 **Note:** `docs/limitations.md` R4 ("certificates carry no SAN") is out of date: the SAN mechanism was merged (Track B R2). Track B should update it.

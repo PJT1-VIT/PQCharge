@@ -71,6 +71,13 @@ class EventType(str, Enum):
     WAVE_COMPLETED = "wave_completed"
     WAVE_ROLLED_BACK = "wave_rolled_back"
     MIGRATION_COMPLETED = "migration_completed"
+    MIGRATION_FAILED = "migration_failed"
+    """The orchestrator could not proceed (Contract 4 MigrationPhase.FAILED).
+    Added 2026-10-10 (L14): Track B's orchestrator already wrote this
+    string and Track C's analysis already read it."""
+    STATION_DEFERRED = "station_deferred"
+    """A station was offline when its wave ran and was skipped, not
+    failed (skip_offline). Added 2026-10-10 (L14), same reason."""
 
     # -- server lifecycle: the anchor points for E2 --
     SERVER_STARTED = "server_started"
