@@ -99,11 +99,25 @@ DEFAULT_MIGRATION_MODE = "auto"
 otherwise run with migration disabled and say why. off: always disabled --
 for classical baseline runs where nothing post-quantum should even load."""
 
-SUPPORTED_TARGET_MODES = ("pqc",)
-"""What /api/migration/start accepts today. The orchestrator enrols ML-DSA
-keys whatever target it is given, so passing "classical" or "hybrid" would
-record a run labelled with a mode it did not perform. Widen this when
-Track B implements another target."""
+SUPPORTED_TARGET_MODES = ("hybrid",)
+"""What /api/migration/start accepts (A-F2, L28). The migration enrols an
+ML-DSA key made by each charger and switches on the key check at every boot:
+that is Contract 7's "hybrid" mode (classical TLS + ML-DSA). Track B's
+capability gate (B-F1) treats "hybrid" as the ML-DSA target."""
+
+PQC_NOT_BUILT = (
+    "pure PQC not built (L17): post-quantum TLS is future work; "
+    "use target_mode=hybrid"
+)
+"""The answer to target_mode=pqc. "pqc" is Contract 7's third mode
+(post-quantum TLS), which the FINAL 2-DAY PLAN cut as future work."""
+
+BOOT_CHECK_FAILED = "pq_auth_failed"
+"""payload.reason on the connection_closed line of a charger cut off by a
+failed boot key check (Contract 7 section 7.5 (4)); Track C's E5 counts it."""
+
+POLICY_VIOLATION = 1008
+"""WebSocket close code for a failed boot check (Contract 7 section 7.5)."""
 
 
 # =====================================================================
@@ -434,6 +448,7 @@ def build_migration(
             build_challenge_message,
             build_enrolment_request,
             build_install_message,
+            key_id_for,
             parse_enrolment_reply,
             parse_signature,
         )
@@ -474,6 +489,9 @@ def build_migration(
         # match the key; the orchestrator fails that one station for it.
         enrolment_request_factory=build_enrolment_request,
         public_key_parser=lambda response: parse_enrolment_reply(response.data),
+        # A-F5 / B-F2: key rotation names the station's old and new keys by
+        # key_id; one definition of key_id for every track (Contract 7 7.2).
+        key_id_for=key_id_for,
         # Deprecated InstallPQAuth path: unused while the two above are
         # given. Kept only so A-P4 can be undone by deleting two lines if
         # the A+B+C re-test fails; removed in A-P6 (closes L04).
@@ -538,3 +556,96 @@ def build_migration(
         restored_enrolments=restored,
         failure_threshold=failure_threshold,
     )
+
+
+# =====================================================================
+# BOOT CHECK (A-F1 = A-P3, Contract 7 section 7.5)
+# =====================================================================
+
+
+def install_boot_check(
+    setup: MigrationSetup,
+    *,
+    registry: Any,
+    dispatcher: Any,
+    event_log: Any,
+) -> Any:
+    """
+    Switch on the post-quantum key check after every accepted boot
+    (`--mode hybrid` only; the server decides). Returns the BootVerifier.
+
+    What happens on each boot (Contract 7 section 7.5):
+
+      1. registry's boot hook (A-P1) calls the listener on its own task,
+         after the BootNotification reply was sent.
+      2. The listener notes WHICH connection booted (L36), then asks
+         Track B's BootVerifier. Not enrolled -> True with no check (the
+         charger is still classical). Enrolled -> PQAuthChallenge with the
+         enrolled key_id, ML-DSA verify, one pq_auth event
+         (trigger "boot", source "boot_verifier").
+      3. True  -> mark THAT connection pq_verified (if it is still the
+                  current one).
+         False -> if it is still the current connection: record the reason
+                  and close it with 1008; the registry writes ONE
+                  connection_closed line with reason "pq_auth_failed".
+                  If the charger has reconnected meanwhile, do nothing:
+                  the new connection gets its own boot check.
+
+    The verifier's emitter is built WITHOUT on_pq_auth_success: a boot
+    check's success must only mark the connection it checked, which the
+    listener does with the session guard (L36). The migration's emitter
+    keeps its hook (L34).
+
+    Raises RuntimeError if migration is not enabled: hybrid needs the key
+    store, and a "hybrid" server that checked nothing would make E1/E2/E5
+    measure classical behaviour under a hybrid label.
+    """
+    if not setup.enabled or setup.authenticator is None:
+        raise RuntimeError(
+            "--mode hybrid needs post-quantum migration (it holds the "
+            f"enrolled keys the boot check uses), but migration is off: "
+            f"{setup.reason}"
+        )
+
+    from agent.pqc_messages import build_challenge_message, key_id_for, parse_signature
+    from idmanager.boot_verifier import BootVerifier
+
+    verifier = BootVerifier(
+        dispatcher=dispatcher,
+        authenticator=setup.authenticator,
+        challenge_message_factory=build_challenge_message,
+        signature_parser=lambda response: parse_signature(response.data),
+        key_id_for=key_id_for,
+        event_emitter=orchestrator_emitter(event_log, source="boot_verifier"),
+        dispatch_timeout_s=dispatcher.timeout_s,
+    )
+
+    async def check_after_boot(station_id: str) -> None:
+        # L36: the connection that booted, fixed when the boot was announced
+        session = registry.booted_session(station_id)
+        if session is None:
+            return
+        verified = await verifier.verify_on_boot(station_id)
+        if verified:
+            # True also for a charger that is not enrolled; marking it is
+            # harmless (pq_check_required is False for it).
+            registry.mark_pq_verified(station_id, session=session)
+            return
+        if not registry.mark_closing(station_id, session, BOOT_CHECK_FAILED):
+            LOGGER.info(
+                "boot check failed for %s, but it has reconnected since; "
+                "the new connection gets its own check", station_id,
+            )
+            return
+        LOGGER.warning(
+            "boot key check FAILED for %s: closing the connection (1008, %s)",
+            station_id, BOOT_CHECK_FAILED,
+        )
+        websocket = getattr(session.connection, "_connection", None)
+        if websocket is not None:
+            await websocket.close(code=POLICY_VIOLATION, reason=BOOT_CHECK_FAILED)
+
+    registry.add_boot_listener(check_after_boot)
+    LOGGER.info("boot check active: every accepted boot of an enrolled charger "
+                "is challenged (ML-DSA, %s)", setup.algorithm)
+    return verifier
