@@ -209,6 +209,11 @@ def summary(results: dict[str, Any]) -> str:
             mig = (f"  migration: {fc['migrated']} migrated / {fc['rolled_back']} rolled back / "
                    f"{fc['incompatible']} incompatible / {fc['pending']} pending"
                    f" -- {e3['verification']}, {e3['pq_checks']['passed']} key check(s) passed")
+            if (e3.get("halt") or {}).get("shown"):
+                mig += f"; HALTED after wave {e3['halt']['rolled_back_wave']}"
+            if e3.get("rotation"):
+                mig += (f"; rotation: {e3['rotation']['completed']} rotated / "
+                        f"{e3['rotation']['failed']} failed (old key kept)")
         m = s.get("machine")
         mach = ""
         if m:

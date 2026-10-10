@@ -18,18 +18,28 @@ our system ACTUALLY produces, with the project's own code:
                 (the text form OCPP carries), plus an ECDSA key and signature
     post-quantum  ML-DSA-44 keys and signature, ML-KEM-768 key and
                 ciphertext, from Track B's crypto/pq.py
-    on the wire the three Option B messages exactly as the agent and the
-                orchestrator exchange them (agent/pqc_messages.py): key
-                install, challenge, signed answer
+    on the wire the Contract 7 messages exactly as the agent and the
+                orchestrator exchange them (agent/pqc_messages.py): the
+                enrolment request, the enrolment reply (public key + key_id),
+                the challenge and the signed answer
+    ML-DSA certificates  (C-F5, from Track B) real ML-DSA-44 X.509
+                certificates built by crypto/pq_x509.py, when the installed
+                `cryptography` can make them (version 50+). They are built
+                for E4 only: the fleet itself still uses classical TLS
+                certificates (Option B).
 
 Nothing here depends on a run: sizes are properties of the algorithms and
 of our encoding, identical on a laptop or the Raspberry Pi.
 
-A NEGATIVE RESULT IS A VALID RESULT (design doc §13.1): under Option B no
-ML-DSA certificate exists, so the certificate limits apply to the classical
-certificates only; the post-quantum artifacts travel inside DataTransfer.
-The table reports what exists, and marks which limit each row is checked
-against -- nothing is invented to have something to exceed.
+A NEGATIVE RESULT IS A VALID RESULT (design doc §13.1): the fleet's own
+certificates are classical (Option B); the post-quantum artifacts travel
+inside DataTransfer. The ML-DSA certificate rows answer "what WOULD the
+OCPP limits do to post-quantum certificates" -- each row marks which limit
+it is checked against, and nothing is invented to have something to exceed.
+
+C-F5: the old "InstallPQAuth payload" row is gone. That message carried a
+server-made PRIVATE key and is being removed (Contract 7 section 7.8,
+A-F3 / B-F1b); the rows now show the messages actually used.
 
 Missing post-quantum library -> those rows are skipped with a note, and the
 classical rows still appear.
@@ -110,11 +120,13 @@ def measure() -> dict[str, Any]:
         # -- the Option B messages, exactly as they cross the wire ---------
         from agent import pqc_messages as pqcm
 
-        install = pqcm.build_install_message("CP0001", priv)
-        challenge = pqcm.build_challenge_message(b"\x00" * 32)
+        request = pqcm.build_enrolment_request("CP0001")
+        reply = pqcm.pack_enrolment_reply("ML-DSA-44", pub)
+        challenge = pqcm.build_challenge_message(b"\x00" * 32, key_id=pqcm.key_id_for(pub))
         answer = pqcm.pack_signature(sig)
         for label, text in (
-            ("InstallPQAuth payload", install.data),
+            ("RequestPQEnrolment payload", request.data),
+            ("RequestPQEnrolment reply (public key)", reply),
             ("PQAuthChallenge payload", challenge.data),
             ("Signed answer payload", answer),
         ):
@@ -125,6 +137,19 @@ def measure() -> dict[str, Any]:
             f"post-quantum sizes unavailable ({type(exc).__name__}: {exc}); "
             "install quantcrypt from requirements.txt to include them"
         )
+
+    # -- ML-DSA certificates (C-F5; Track B's crypto/pq_x509.py) ------------
+    # Rows come in this table's own format (_row). Any failure -- the module
+    # not on this branch yet, or an older `cryptography` -- is a note, never
+    # a crash, and the other rows still appear.
+    try:
+        from crypto.pq_x509 import available, size_rows
+        if available():
+            rows.extend(size_rows())
+        else:
+            notes.append("ML-DSA certificate rows need cryptography 50+")
+    except Exception as exc:  # noqa: BLE001
+        notes.append(f"ML-DSA certificate rows unavailable: {type(exc).__name__}: {exc}")
 
     return {
         "limits": {"certificate": CERT_LIMIT, "chain": CHAIN_LIMIT},

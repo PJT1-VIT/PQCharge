@@ -155,6 +155,9 @@
   .banner { border-radius: 10px; padding: 10px 14px; margin: 0 0 16px; border: 1px solid var(--border); background: var(--surface); }
   footer { max-width: 1280px; margin: 0 auto; padding: 16px; color: var(--muted); font-size: 12px; }
   @media print { header.top { position: static; } .card { break-inside: avoid; } }
+  [hidden] { display: none !important; }
+  .headlines { margin: 0; padding-left: 20px; line-height: 1.6; }
+  .headlines li { margin: 4px 0; }
 </style>
 <script>
   // Remembered theme choice: a per-viewer convenience only, and optional.
@@ -169,6 +172,7 @@
   <div class="bar">
     <div class="brand">PQCharge<small>Results</small></div>
     <nav class="sections" aria-label="Sections">
+      <a href="#headlines">Headlines</a>
       <a href="#runs">Runs</a>
       <a href="#s1">S1 Scale</a>
       <a href="#e1">E1 Handshake</a>
