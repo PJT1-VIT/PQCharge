@@ -8,9 +8,12 @@ IN PLAIN WORDS
 
 The dashboard reads the CSMS's `/api`. Until Track A's dashboard API (A-F4)
 is on `main`, and whenever you want to rehearse without starting 50
-chargers, this file plays the server: a fleet of 49 simulated chargers plus
-the Raspberry Pi (CP-PI01), all charging, answering the same GET endpoints
-with the same JSON shapes:
+chargers, this file plays the server: the demo fleet of Track B's
+tests/fixtures/fleet_profile_demo.json -- the Raspberry Pi (CP0000, first,
+so it is in the canary), CP0001-CP0045 ML-DSA capable, CP0046-CP0049 legacy
+-- all charging (with halt=True: Track B's L09 halt fleet instead, CP0001-
+CP0050 with CP0021-25 refusing), answering the same GET endpoints with the
+same JSON shapes:
 
     /api/health                    + "mock": true, so the page shows MOCK
     /api/fleet                     Contract 6 FleetSnapshot (+ the A-F4 fields)
@@ -22,6 +25,7 @@ with the same JSON shapes:
     /api/fleet/limit, clear-limit  fleet power limit (the Pi's "LED" dims)
     /api/mock/storm                every charger reconnects and re-proves its key
     /api/mock/impostor             a stolen certificate without the ML-DSA key
+                                   (CP0045: the demo victim, experiments/e5_attack.md)
 
 NOTHING HERE IS A RESULT. Times and key ids are invented. The page shows a
 large "MOCK" badge whenever /api/health says mock, so a screenshot of it can
@@ -32,8 +36,12 @@ SHAPES (kept identical to the real server, so the page needs no mock mode)
 
     station    csms/fleet.py StationView.to_dict(), plus the fields A-F4 adds:
                tls_cipher, identity_ok, pq_key_id, last_pq_check
-               {at, result, trigger, duration_ms}; the Pi adds measured_mw
-               (NOT yet sent by the real Pi -- see limitations.md L37).
+               {at, result, trigger, duration_ms}. Nothing else: the Pi's
+               row is an ordinary row, as on the real server today. Only
+               with pi_mw=True (serve --mock-pi-mw) does it add measured_mw
+               and power_source "scaled", to rehearse L37 (NOT yet sent by
+               the real server; Track A's test_pr4_dashboard_api checks the
+               default mock has no field the server lacks).
     events     Contract 3 Event dicts (timestamp, event_type, station_id,
                outcome, payload, ...) plus `seq`. Track B's lines keep the
                charger in payload.station, exactly as on the real server.
@@ -53,7 +61,9 @@ from typing import Any, Callable
 
 ALGORITHM = "ML-DSA-44"
 MAX_POWER_W = 7400.0
-PI_ID = "CP-PI01"
+PI_ID = "CP0000"              # Track A/B: the Pi's id (a dashed id breaks fleet profiles)
+LEGACY_IDS = range(46, 50)    # CP0046-CP0049, as in fleet_profile_demo.json
+VICTIM_ID = "CP0045"          # E5 victim in the demo fleet (experiments/e5_attack.md)
 PI_MAX_MW = 25.0              # what the LED circuit draws at full brightness (made up)
 STEP_S = 0.25                 # one charger handled per step during a wave
 FAILURE_THRESHOLD = 0.2
@@ -72,7 +82,7 @@ class MockFleet:
     """The whole pretend server. Thread-safe: every public method locks."""
 
     def __init__(self, *, n: int = 49, mode: str = "hybrid", tls: bool = True,
-                 halt: bool = False, seed: int = 7,
+                 halt: bool = False, seed: int = 7, pi_mw: bool = False,
                  clock: Callable[[], float] = time.time) -> None:
         self.clock = clock
         self.mode = mode
@@ -82,12 +92,23 @@ class MockFleet:
         self.run_id = "mock" + _key_id(str(seed))[:8]
         self.started = clock()
         self.limit_w: float | None = None
+        self.pi_mw = pi_mw
 
         self.events: deque[dict[str, Any]] = deque(maxlen=EVENT_BUFFER)
         self.seq = 0
 
-        ids = [f"CP{i:04d}" for i in range(1, n + 1)] + [PI_ID]
-        self.legacy = {f"CP{i:04d}" for i in range(41, 46)}
+        if halt:
+            # Track B's L09 halt run (tests/fixtures/fleet_profile_halt_n50.json):
+            # CP0001-CP0050, no Pi, no legacy, CP0021-25 refuse. With canary 5
+            # and waves of 10, wave 2 (CP0016-0025) fails 5/10 and the
+            # migration halts: 15 migrated, 10 rolled back, 25 pending.
+            ids = [f"CP{i:04d}" for i in range(1, n + 2)]
+            self.legacy: set[str] = set()
+        else:
+            # The demo fleet (fleet_profile_demo.json). The Pi first: its id
+            # sorts first, so the real orchestrator puts it in the canary.
+            ids = [PI_ID] + [f"CP{i:04d}" for i in range(1, n + 1)]
+            self.legacy = {f"CP{i:04d}" for i in LEGACY_IDS}
         self.refusers = {f"CP{i:04d}" for i in range(21, 26)} if halt else set()
         self.stations: dict[str, dict[str, Any]] = {}
         for k, sid in enumerate(ids):
@@ -147,7 +168,7 @@ class MockFleet:
             "pq_key_id": None,
             "last_pq_check": None,
         }
-        if sid == PI_ID:
+        if sid == PI_ID and self.pi_mw:
             st["measured_mw"] = PI_MAX_MW
             st["power_source"] = "scaled"
         return st
@@ -208,6 +229,7 @@ class MockFleet:
             return {"ok": True, "mock": True, "run_id": self.run_id, "crypto_mode": self.mode,
                     "tls": self.tls, "identity_check": "enforce" if self.tls else "off",
                     "pq_algorithm": ALGORITHM,
+                    "boot_check": self.mode == "hybrid",
                     "migration": f"MOCK orchestrator ({ALGORITHM}, made-up timings)"}
 
     def fleet(self) -> dict[str, Any]:
@@ -323,11 +345,13 @@ class MockFleet:
             self._storm_until = max(self._storm_back.values())
             return 200, {"ok": True, "reconnecting": len(ids)}
 
-    def impostor(self, station_id: str = "CP0003", for_s: float = 15.0) -> tuple[int, dict[str, Any]]:
+    def impostor(self, station_id: str = VICTIM_ID, for_s: float = 15.0) -> tuple[int, dict[str, Any]]:
         """A stolen classical certificate, no ML-DSA key: refused at every boot."""
         with self.lock:
             st = self.stations.get(station_id)
-            if st is None or st["migration_state"] != "migrated":
+            if st is None:
+                return 404, {"error": f"{station_id} is not in this mock fleet"}
+            if st["migration_state"] != "migrated":
                 return 409, {"error": f"{station_id} must be migrated first (run a migration)"}
             self._impostor_sid = station_id
             self._impostor_until = self.clock() + for_s
@@ -351,7 +375,7 @@ class MockFleet:
         cap = MAX_POWER_W if self.limit_w is None else min(MAX_POWER_W, self.limit_w)
         charging = st["connection_state"] == "connected" and st["charging_state"] == "Charging"
         st["power_w"] = cap if charging else 0.0
-        if st["station_id"] == PI_ID:
+        if st["station_id"] == PI_ID and self.pi_mw:
             st["measured_mw"] = round(PI_MAX_MW * (st["power_w"] / MAX_POWER_W), 1) if charging else 0.0
 
     def _tick_energy(self, now: float) -> None:
@@ -516,4 +540,6 @@ class MockFleet:
         self._pq_check(sid, False, "boot", key_id=self.keys.get(sid),
                        detail="Rejected: station holds no key with this key_id")
         st.update(connection_state="disconnected", boot_accepted=False)
-        self._emit("connection_closed", sid, outcome="failure", reason="pq_auth_failed", code=1008)
+        # As the real registry writes it (Track A PR 3): outcome "rejected",
+        # payload.reason; the 1008 is the WebSocket close code, not a field.
+        self._emit("connection_closed", sid, outcome="rejected", reason="pq_auth_failed")

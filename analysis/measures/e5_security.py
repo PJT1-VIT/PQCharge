@@ -23,6 +23,20 @@ This module reports the SECURITY FACTS of a run:
 The POWER picture that goes with it is the fleet power timeline in the
 run overview -- the same timeline, so the spike (or its absence) is read
 off one chart.
+
+C-F5 (after Track A's A-F7, experiments/e5_attack.md + e5_check.py):
+    - identity refusals, 1008 cut-offs and curtailment commands are counted
+      for EVERY charger in the run's window, not only the tester's: the
+      victim (CP0003 small run, CP0045 demo) runs in its own window, outside
+      the load generator. `outside_ids` names those chargers.
+    - `verdicts` gives the same three answers as
+      `python -m experiments.e5_check`, by the same rules:
+        stolen_certificate  "stopped"   boot checks rejected > 0 and
+                                        1008 cut-offs == boot rejections
+                            "check"     both seen, numbers differ
+                            "not_seen"  no rejected boot check
+        wrong_identity      "stopped"   any identity_check refused, else "not_seen"
+        curtailment         "done"      any Set/ClearChargingProfile sent, else "not_seen"
 """
 
 from __future__ import annotations
@@ -33,9 +47,13 @@ from typing import Any
 from analysis.match import MatchedRun
 
 
+CURTAILMENT_ACTIONS = ("SetChargingProfile", "ClearChargingProfile")
+
+
 def measure(run: MatchedRun) -> dict[str, Any]:
+    ours = set(run.stations)
     checks = [
-        e for e in run.events("connection_attempt")
+        e for e in run.fleet_events("connection_attempt")
         if (e.get("payload") or {}).get("transition") == "identity_check"
     ]
     rejected = [e for e in checks if e.get("outcome") == "rejected"]
@@ -61,9 +79,36 @@ def measure(run: MatchedRun) -> dict[str, Any]:
         return {"checks": len(rows), "passed": ok, "rejected": len(rows) - ok}
 
     cut_off = [
-        e for e in run.events("connection_closed")
+        e for e in run.fleet_events("connection_closed")
         if (e.get("payload") or {}).get("reason") == "pq_auth_failed"
     ]
+
+    # (c) curtailment: the server's own record of the commands it sent
+    # (dispatcher message_sent lines), as e5_check counts them.
+    curtail: Counter[tuple[str, str]] = Counter(
+        (str((e.get("payload") or {}).get("action")), str(e.get("outcome") or "unknown"))
+        for e in run.fleet_events("message_sent")
+        if (e.get("payload") or {}).get("dispatched")
+        and (e.get("payload") or {}).get("action") in CURTAILMENT_ACTIONS
+    )
+    curtailment = {
+        action: {outcome: n for (a, outcome), n in sorted(curtail.items()) if a == action}
+        for action in CURTAILMENT_ACTIONS
+    }
+
+    boot = split("boot")
+    if not boot["rejected"]:
+        stolen = "not_seen"
+    elif cut_off and len(cut_off) == boot["rejected"]:
+        stolen = "stopped"
+    else:
+        stolen = "check"
+    outside = sorted({
+        sid for sid in (
+            [e.get("station_id") for e in checks + cut_off]
+            + [(e.get("payload") or {}).get("station") for e in pq]
+        ) if sid and sid not in ours
+    })
 
     failures: Counter[str] = Counter(
         str((e.get("payload") or {}).get("reason") or "unknown")
@@ -98,10 +143,18 @@ def measure(run: MatchedRun) -> dict[str, Any]:
             }
             for e in pq_rejected[:50]
         ],
-        "pq_by_trigger": {"migration": split("migration"), "boot": split("boot")},
+        "pq_by_trigger": {"migration": split("migration"), "boot": boot,
+                          "rotation": split("rotation")},
         "pq_cut_off": len(cut_off),
         "pq_cut_off_ids": sorted({e.get("station_id") for e in cut_off if e.get("station_id")})[:50],
         "connection_failures": dict(failures),
         "callerrors": float(sum((r.get("callerrors") or 0) for r in rows)),
         "commands_received": float(sum((r.get("commands_received") or 0) for r in rows)),
+        "curtailment": curtailment,
+        "outside_ids": outside[:50],
+        "verdicts": {
+            "stolen_certificate": stolen,
+            "wrong_identity": "stopped" if rejected else "not_seen",
+            "curtailment": "done" if curtail else "not_seen",
+        },
     }

@@ -27,6 +27,21 @@ It stops by itself once it has watched a migration finish (completed,
 rolled back or failed) and prints a final summary. Ctrl-C stops it at any
 time, cleanly.
 
+KEY ROTATION (C-F7, Track B's B-F2 + Track A's A-F5). /api/migration/rotate
+gives every migrated charger a NEW ML-DSA key; the old key stays valid until
+the new one is proven. The server reports it with the same status, plus
+kind "rotation", and never changes a charger's migration_state. So for a
+rotation this view switches its words and its grid:
+
+    N   new key proven (last key check: trigger "rotation", passed)
+    o   still on its old key (not reached yet)
+    !   rotation failed: the old key was KEPT (the charger keeps working)
+    -   offline        _   not part of the rotation (never migrated)
+
+and lists key changes as "CP0007 key 3f2a91c0 -> key 8be10d44 (new key,
+no disconnect)". It reads pq_key_id and last_pq_check, Track A's A-F4
+fields of /api/fleet; on a server without them the grid shows "o".
+
 --------------------------------------------------------------------
 WHERE THE NUMBERS COME FROM (nothing is computed twice)
 
@@ -39,7 +54,8 @@ The counts and waves are the orchestrator's own (Track B); this file only
 formats them. The "latest changes" are found by comparing one poll with the
 previous one: a charger going in progress -> upgraded has passed its key
 check (Track B marks it migrated only then); -> rolled back means it failed.
-/api does not expose key_id or check times; the results page (C6) has those.
+Key ids and the last key check come from A-F4's pq_key_id / last_pq_check;
+check timings and the full picture are on the results page (C-F5).
 
 --------------------------------------------------------------------
 START AND STOP
@@ -102,6 +118,15 @@ PHASE_WORDS = {
     "rolled_back": "a wave failed and was rolled back; migration stopped",
     "failed": "the migration controller stopped with an error",
 }
+ROTATION_PHASE_WORDS = {
+    "idle": "no rotation running",
+    "canary": "trying the new keys on the canary group first",
+    "running": "rotating keys in waves (old key valid until the new one is proven)",
+    "completed": "finished: every reachable charger has a new key",
+    "rolled_back": "a wave failed: its chargers KEEP THEIR OLD KEYS; rotation stopped",
+    "failed": "the rotation stopped with an error; chargers keep the keys they have",
+}
+ROT_NEW, ROT_OLD, ROT_FAILED, ROT_OUT = "N", "o", "!", "_"
 TERMINAL = frozenset({"completed", "rolled_back", "failed"})
 BAR_WIDTH = 40
 GRID_PER_GROUP = 10
@@ -168,6 +193,10 @@ class Tracker:
     """The migration this view has seen running."""
     first_poll_done: bool = False
     finished: bool = False
+    keys: dict[str, str] = field(default_factory=dict)
+    """station -> pq_key_id at the previous poll (A-F4)."""
+    keys_at_start: dict[str, str] = field(default_factory=dict)
+    """station -> pq_key_id when the watched migration/rotation was first seen."""
 
     def update(self, poll: Poll, now: float | None = None) -> None:
         now = time.monotonic() if now is None else now
@@ -188,6 +217,11 @@ class Tracker:
             self.watching_id = mid or "?"
             self.states = {}          # start the change list fresh
             self.changes.clear()
+            self.keys_at_start = {
+                st["station_id"]: st["pq_key_id"]
+                for st in (poll.fleet or {}).get("stations", []) or []
+                if st.get("station_id") and st.get("pq_key_id")
+            }
 
         for st in (poll.fleet or {}).get("stations", []) or []:
             sid = st.get("station_id")
@@ -198,6 +232,18 @@ class Tracker:
             if old is not None and old != new and self.watching_id is not None:
                 self.changes.append((now - self.started, sid, old, new))
             self.states[sid] = new
+
+            # C-F7: a key replaced on a charger that HAD a key = a rotation
+            # (or a rotation wave putting the old key back). A first key
+            # (None -> key) is the migration's own change, listed above.
+            kid = st.get("pq_key_id")
+            was = self.keys.get(sid)
+            if kid and was and kid != was and self.watching_id is not None:
+                self.changes.append((now - self.started, sid, f"key {_short(was)}", f"key {_short(kid)}"))
+            if kid:
+                self.keys[sid] = kid
+            else:
+                self.keys.pop(sid, None)
 
         if self.watching_id is not None and phase in TERMINAL:
             self.finished = True
@@ -239,11 +285,38 @@ def _int(v: Any) -> int:
     return int(v) if isinstance(v, (int, float)) else 0
 
 
+def _short(key_id: Any) -> str:
+    return str(key_id)[:8] if key_id else "-"
+
+
+def _is_rotation(mig: dict[str, Any]) -> bool:
+    return str(mig.get("kind") or "migration").lower() == "rotation"
+
+
 def _letter(station: dict[str, Any]) -> str:
     state = str(station.get("migration_state") or "pending")
     if state == "pending" and station.get("connection_state") != "connected":
         return OFFLINE_LETTER
     return STATE_LETTER.get(state, "?")
+
+
+def _rotation_letter(station: dict[str, Any], mig: dict[str, Any], tracker: "Tracker") -> str:
+    """C-F7: where one charger is in a key rotation (see the module notes)."""
+    if str(station.get("migration_state") or "") != "migrated":
+        return ROT_OUT
+    if station.get("connection_state") != "connected":
+        return OFFLINE_LETTER
+    started = _iso(mig.get("started_at"))
+    check = station.get("last_pq_check") or {}
+    checked_at = _iso(check.get("at"))
+    if (check.get("trigger") == "rotation" and checked_at is not None
+            and (started is None or checked_at >= started)):
+        return ROT_NEW if check.get("result") == "success" else ROT_FAILED
+    sid, kid = station.get("station_id"), station.get("pq_key_id")
+    before = tracker.keys_at_start.get(sid)
+    if kid and before and kid != before:
+        return ROT_NEW        # e.g. a boot check has since replaced last_pq_check
+    return ROT_OLD
 
 
 def render(poll: Poll, tracker: Tracker, *, url: str = "",
@@ -253,17 +326,20 @@ def render(poll: Poll, tracker: Tracker, *, url: str = "",
     mig = poll.migration or {}
     fleet = poll.fleet or {}
     phase = str(mig.get("phase") or "idle").lower()
+    rotation = _is_rotation(mig)
+    words = ROTATION_PHASE_WORDS if rotation else PHASE_WORDS
     lines: list[str] = []
 
     started = _iso(mig.get("started_at"))
     ended = _iso(mig.get("completed_at"))
     clock = _secs(started, ended or now_utc) if started else "-"
-    lines.append(f"PQCharge  -  fleet migration          target: {mig.get('target_mode') or '-'}"
+    title = "key rotation   " if rotation else "fleet migration"
+    lines.append(f"PQCharge  -  {title}          target: {mig.get('target_mode') or '-'}"
                  f"    time: {clock}")
     if poll.error and not poll.migration:
         lines.append("Phase: -  (no answer from the server yet)")
     else:
-        lines.append(f"Phase: {phase.upper()}  -  {PHASE_WORDS.get(phase, phase)}")
+        lines.append(f"Phase: {phase.upper()}  -  {words.get(phase, phase)}")
     if poll.error:
         lines.append(f"!! server not reachable at {url} (retrying): {poll.error}")
     elif tracker.waiting_for_new:
@@ -288,8 +364,12 @@ def render(poll: Poll, tracker: Tracker, *, url: str = "",
     done = up + back + incompat
     filled = round(BAR_WIDTH * done / total) if total else 0
     lines.append(f"Progress [{'#' * filled}{'.' * (BAR_WIDTH - filled)}] {done}/{total} decided")
-    lines.append(f"   upgraded {up}   in progress {prog}   waiting {wait}"
-                 f"   rolled back {back}   incompatible {incompat}")
+    if rotation:
+        lines.append(f"   new key {up}   in progress {prog}   waiting {wait}"
+                     f"   kept old key {back}   skipped {incompat}")
+    else:
+        lines.append(f"   upgraded {up}   in progress {prog}   waiting {wait}"
+                     f"   rolled back {back}   incompatible {incompat}")
     lines.append("")
 
     waves = mig.get("waves") or []
@@ -302,19 +382,24 @@ def render(poll: Poll, tracker: Tracker, *, url: str = "",
             took = _secs(ws, we) if (ws and we) else ""
             lines.append(
                 f"  {name} {_id_range(ids):<15} {len(ids):>3} chargers"
-                f"   upgraded {_int(w.get('migrated_count')):>3}"
+                f"   {'new key ' if rotation else 'upgraded'} {_int(w.get('migrated_count')):>3}"
                 f"   failed {_int(w.get('failed_count')):>3}"
                 f"   {str(w.get('phase') or '-'):<11} {took}")
         lines.append("")
 
     if stations:
-        lines.append("Chargers  (U upgraded  * in progress  . waiting  - waiting, offline"
-                     "  R rolled back  x incompatible)")
+        if rotation:
+            lines.append("Chargers  (N new key  o old key, not yet  ! failed, old key kept"
+                         "  - offline  _ not in the rotation)")
+        else:
+            lines.append("Chargers  (U upgraded  * in progress  . waiting  - waiting, offline"
+                         "  R rolled back  x incompatible)")
         per_row = GRID_PER_GROUP * GRID_GROUPS_PER_ROW
         rows = [stations[i:i + per_row] for i in range(0, len(stations), per_row)]
         for row in rows[:GRID_MAX_ROWS]:
             groups = [row[i:i + GRID_PER_GROUP] for i in range(0, len(row), GRID_PER_GROUP)]
-            text = " ".join("".join(_letter(s) for s in g) for g in groups)
+            text = " ".join("".join(_rotation_letter(s, mig, tracker) if rotation else _letter(s)
+                                    for s in g) for g in groups)
             lines.append(f"  {str(row[0].get('station_id')):<8} {text}")
         if len(rows) > GRID_MAX_ROWS:
             lines.append(f"  ... {len(stations) - GRID_MAX_ROWS * per_row} more chargers not shown")
@@ -324,6 +409,9 @@ def render(poll: Poll, tracker: Tracker, *, url: str = "",
         lines.append("Latest changes")
         for t, sid, old, new in list(tracker.changes)[::-1]:
             note = CHANGE_NOTE.get((old, new), "")
+            if old.startswith("key "):
+                put_back = tracker.keys_at_start.get(sid, "")[:8] == new[4:]
+                note = "old key put back" if put_back else "new key, no disconnect"
             lines.append(f"  {t:7.1f} s  {sid:<8} {STATE_WORDS.get(old, old)} -> "
                          f"{STATE_WORDS.get(new, new)}" + (f"  ({note})" if note else ""))
         lines.append("")
@@ -338,6 +426,15 @@ def summary(poll: Poll) -> str:
     phase = str(mig.get("phase") or "?").lower()
     waves = mig.get("waves") or []
     rolled = [w for w in waves if str(w.get("phase")).lower() == "rolled_back"]
+    if _is_rotation(mig):
+        return "\n".join([
+            f"Key rotation {mig.get('migration_id') or ''} ended: {phase.upper()} - "
+            f"{ROTATION_PHASE_WORDS.get(phase, phase)}.",
+            f"  {_int(mig.get('migrated'))} new keys, {_int(mig.get('rolled_back'))} kept their old key, "
+            f"{_int(mig.get('pending'))} not reached, of {_int(mig.get('total_stations'))}; "
+            f"{len(waves)} wave(s)" + (f", {len(rolled)} rolled back" if rolled else "") + ".",
+            "  Full results (each charger's old and new key_id, check times): analysis\\output\\report.html",
+        ])
     parts = [
         f"Migration {mig.get('migration_id') or ''} ended: {phase.upper()} - "
         f"{PHASE_WORDS.get(phase, phase)}.",

@@ -996,12 +996,34 @@
 
   // ---------------------------------------------------------------- E5
 
+  function e5Verdicts(e) {
+    var v = e.verdicts;
+    if (!v) return "";
+    var word = { stopped: "STOPPED", done: "DONE", not_seen: "not in this run", check: "CHECK: numbers differ" };
+    var cls = { stopped: "ok", done: "ok", not_seen: "", check: "bad" };
+    var boot = (e.pq_by_trigger || {}).boot || {};
+    var c = e.curtailment || {};
+    function n(a) { var o = c[a] || {}; return Object.keys(o).map(function (k) { return int(o[k]) + " " + esc(k); }).join(", ") || "0"; }
+    var rows = [
+      ["(a) Stolen certificate, no ML-DSA key", v.stolen_certificate,
+        int(boot.rejected || 0) + " boot key checks rejected, " + int(e.pq_cut_off) + " connections closed 1008"],
+      ["(b) Wrong identity", v.wrong_identity, int(e.identity_rejected) + " refused by the identity check"],
+      ["(c) Curtailment", v.curtailment, "SetChargingProfile " + n("SetChargingProfile") + "; ClearChargingProfile " + n("ClearChargingProfile")]
+    ];
+    var out = (e.outside_ids || []).length
+      ? '<p class="sub">Includes chargers started outside the load generator (the victim): ' + esc(e.outside_ids.join(", ")) + "</p>" : "";
+    return '<div class="card" style="margin:16px 0"><h3>Attack verdicts</h3>' + out + table(
+      [{ t: "Attack" }, { t: "Verdict" }, { t: "Evidence (server log)" }],
+      rows.map(function (r) { return [r[0], '<span class="verdict ' + cls[r[1]] + '"><b>' + (word[r[1]] || esc(r[1])) + "</b></span>", r[2]]; })) + "</div>";
+  }
+
   function renderE5(root) {
     var list = slots();
-    var html = '<section id="e5"><h2>E5 · Security</h2><p class="lede">Were impostors kept out? A charger ' +
-      "whose certificate names a different charger is rejected at connection time. In the attack demonstration " +
-      "a forged command on a classical fleet shows up as a spike in fleet power; on a migrated fleet the fake " +
-      "identity fails the post-quantum check and nothing moves.</p>";
+    var html = '<section id="e5"><h2>E5 · Security</h2><p class="lede">Three attacks on a hybrid server over ' +
+      "mutual TLS (Track A, experiments/e5_attack.md): (a) a <b>stolen certificate</b> without the charger's " +
+      "ML-DSA key gets through TLS but fails the key check after boot and is cut off (code 1008); (b) a " +
+      "<b>wrong identity</b> (another charger's certificate) is refused at connection time; (c) <b>curtailment</b>: " +
+      "one operator command changes every charger's power. Same rules as <code>python -m experiments.e5_check</code>.</p>";
     if (!list.length) {
       root.insertAdjacentHTML("beforeend", html + empty("No runs yet.") + "</section>");
       return;
@@ -1021,8 +1043,8 @@
       tile("Connection failures", int(failures.reduce(function (a, k) { return a + e.connection_failures[k]; }, 0)), failures.join(", ") || "none") +
       tile("Protocol errors", int(e.callerrors), "CALLErrors reported by chargers") +
       tile("Commands received", int(e.commands_received), "e.g. power limits, remote stop") +
-      "</div>" +
-      '<div class="card"><h3>Fleet power, with rejected identities marked</h3><p class="sub">A forged "full power" command appears as a step up across the fleet</p><div class="chart" id="cE5"></div></div>';
+      "</div>" + e5Verdicts(e) +
+      '<div class="card"><h3>Fleet power, with rejected identities marked</h3><p class="sub">Attack (c): a curtailment shows as a step down across the fleet, and back up when cleared</p><div class="chart" id="cE5"></div></div>';
     if (e.identity_rejections && e.identity_rejections.length) {
       html += '<div class="card" style="margin-top:16px"><h3>Rejected identities</h3>' + table(
         [{ t: "Charger id" }, { t: "Certificate name" }, { t: "At", num: true }],

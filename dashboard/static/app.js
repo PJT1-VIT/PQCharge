@@ -73,8 +73,12 @@
       });
     });
   }
+  var PI_ID = "CP0000";   // the Raspberry Pi (Track A/B; tests/fixtures/fleet_profile_demo.json)
   function isPi(st) {
-    return /PI/i.test(st.station_id) || st.measured_mw !== undefined || st.power_source === "scaled";
+    // measured_mw must be a NUMBER: if the server adds the field to every
+    // charger as null (L37 still open), the other tiles must not turn into Pis.
+    return st.station_id === PI_ID || typeof st.measured_mw === "number" ||
+      st.power_source === "scaled";
   }
   function recovered(st) {
     // Track A's StationView.is_recovered (Contract 7 section 7.7), restated for display only.
@@ -268,7 +272,10 @@
       chip("mode-" + mode, "Mode", esc(mode)) +
       chip(tlsOn ? "ok" : "", "TLS", tlsOn ? "🔒 " + esc(tlsVer || "on") : "off") +
       chip(idc === "enforce" ? "ok" : idc === "off" ? "bad" : "", "Identity check", esc(idc || "—")) +
-      chip("", "Post-quantum", esc(h.pq_algorithm || "—"));
+      chip("", "Post-quantum", esc(h.pq_algorithm || "—")) +
+      // A-F4: /api/health boot_check = every boot of an enrolled charger is key-checked (hybrid only)
+      chip(h.boot_check === true ? "ok" : "", "Boot key check",
+        h.boot_check === true ? "on" : h.boot_check === false ? "off" : "—");
     var connected = stations.filter(function (s) { return s.connection_state === "connected"; }).length;
     var rec = stations.filter(recovered).length;
     $("counts").innerHTML = [
@@ -539,7 +546,7 @@
       control("/api/fleet/clear-limit", function () { return "Limit cleared."; });
     });
     $("btnStorm").addEventListener("click", function () { control("/api/mock/storm", function () { return "Mock storm: every charger reconnects."; }); });
-    $("btnImpostor").addEventListener("click", function () { control("/api/mock/impostor", function () { return "Mock impostor on CP0003 for 15 s."; }); });
+    $("btnImpostor").addEventListener("click", function () { control("/api/mock/impostor", function () { return "Mock impostor on CP0045 (the demo victim) for 15 s."; }); });
     $("drawerClose").addEventListener("click", closeInspector);
     $("drawer").addEventListener("click", function (e) { if (e.target === $("drawer")) closeInspector(); });
     document.addEventListener("keydown", function (e) { if (e.key === "Escape") closeInspector(); });
