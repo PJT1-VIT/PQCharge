@@ -57,7 +57,25 @@ class MatchedRun:
     migration_failed) and the server's own manual-rollback line.
     """
 
+    outside_events: list[dict[str, Any]] = field(default_factory=list)
+    """
+    C-F5 (E5). Server lines inside the window about chargers this tester run
+    did NOT start. Track A's E5 procedure (experiments/e5_attack.md) runs the
+    victim in its own window -- CP0003 in the small run, CP0045 in the demo
+    fleet -- so its identity refusals and 1008 cut-offs land here. Only E5
+    reads this list (through fleet_events); every other measure keeps using
+    station_events, so nothing else changes.
+    """
+
     window: tuple[float, float] | None = None
+
+    def fleet_events(self, *event_types: str) -> list[dict[str, Any]]:
+        """Per-charger lines of these types for EVERY charger in the window
+        (this run's and outside ones), in time order."""
+        wanted = set(event_types)
+        rows = [e for e in self.station_events + self.outside_events
+                if not wanted or e.get("event_type") in wanted]
+        return sorted(rows, key=lambda e: e["_t"])
 
     @property
     def server_run_ids(self) -> list[str]:
@@ -170,8 +188,11 @@ def match_run(run: HarnessRun, diary: ServerDiary) -> MatchedRun:
             matched.server_events.append(ev)
         elif sid in ours:
             matched.station_events.append(ev)
+        else:
+            matched.outside_events.append(ev)
 
     matched.station_events.sort(key=lambda e: e["_t"])
     matched.server_events.sort(key=lambda e: e["_t"])
     matched.migration_events.sort(key=lambda e: e["_t"])
+    matched.outside_events.sort(key=lambda e: e["_t"])
     return matched

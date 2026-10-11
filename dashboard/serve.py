@@ -44,7 +44,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from dashboard.mock import MockFleet
+from dashboard.mock import VICTIM_ID, MockFleet
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 CONTENT_TYPES = {
@@ -111,7 +111,7 @@ def mock_api(mock: MockFleet, path: str, query: dict[str, list[str]]) -> tuple[i
     if path == "/api/mock/storm":
         return mock.storm(_q(query, "outage_s", 3.0, float))
     if path == "/api/mock/impostor":
-        return mock.impostor(_q(query, "station_id", "CP0003", str))
+        return mock.impostor(_q(query, "station_id", VICTIM_ID, str))
     return 404, {"error": "unknown path", "path": path}
 
 
@@ -195,11 +195,13 @@ def build_parser() -> argparse.ArgumentParser:
     src.add_argument("--api", help="the CSMS base address, e.g. http://localhost:9000")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8080)
-    p.add_argument("--mock-n", type=int, default=49, help="simulated chargers (plus CP-PI01)")
+    p.add_argument("--mock-n", type=int, default=49, help="simulated chargers (plus the Pi, CP0000)")
     p.add_argument("--mock-mode", choices=["classical", "hybrid"], default="hybrid")
     p.add_argument("--mock-no-tls", action="store_true")
     p.add_argument("--mock-halt", action="store_true",
                    help="CP0021-CP0025 refuse their key: the wave rolls back and the migration halts")
+    p.add_argument("--mock-pi-mw", action="store_true",
+                   help="the Pi also reports measured_mw (L37 rehearsal; the real server does not send it yet)")
     p.add_argument("--cert-dir", default="certs", help="TLS --api only")
     p.add_argument("--cert-station", default="CP0001", help="TLS --api only (L08 stand-in)")
     return p
@@ -210,7 +212,7 @@ def main(argv: list[str] | None = None) -> int:
     mock = None
     if args.mock:
         mock = MockFleet(n=args.mock_n, mode=args.mock_mode, tls=not args.mock_no_tls,
-                         halt=args.mock_halt)
+                         halt=args.mock_halt, pi_mw=args.mock_pi_mw)
     ssl_context = None if args.mock else _ssl_for(args.api, args.cert_dir, args.cert_station)
     handler = make_handler(mock=mock, api=args.api, ssl_context=ssl_context)
     httpd = ThreadingHTTPServer((args.host, args.port), handler)

@@ -57,7 +57,7 @@ def pq_lines(fleet: MockFleet, trigger: str | None = None) -> list[dict]:
 
 
 def test_the_mock_starts_with_a_charging_fleet_and_the_pi():
-    fleet = MockFleet(clock=Clock())
+    fleet = MockFleet(clock=Clock(), pi_mw=True)
     snap = fleet.fleet()
     assert snap["total_stations"] == 50 and snap["connected_count"] == 50
     assert snap["aggregate_power_w"] == pytest.approx(50 * MAX_POWER_W)
@@ -73,12 +73,14 @@ def test_a_migration_runs_canary_then_waves_and_skips_legacy_chargers():
     assert code == 200 and body["migration_id"]
     status = run_to_end(fleet, clock)
     assert status["phase"] == "completed"
-    assert (status["migrated"], status["incompatible"], status["pending"]) == (45, 5, 0)
+    # The demo fleet (fleet_profile_demo.json): Pi + CP0001-45 capable, CP0046-49 legacy.
+    assert (status["migrated"], status["incompatible"], status["pending"]) == (46, 4, 0)
     assert status["waves"][0]["is_canary"] and len(status["waves"][0]["station_ids"]) == 5
+    assert status["waves"][0]["station_ids"][0] == PI_ID == "CP0000"   # the Pi is in the canary
     enrolled = [e for e in fleet.events_after(0, 2000)["events"]
                 if e["payload"].get("transition") == "pq_enrolled"]
     checks = pq_lines(fleet, "migration")
-    assert len(enrolled) == len(checks) == 45
+    assert len(enrolled) == len(checks) == 46
     # The key checked is the key the charger enrolled.
     assert {e["payload"]["key_id"] for e in enrolled} == {c["payload"]["key_id"] for c in checks}
     assert all(c["payload"]["algorithm"] == ALGORITHM for c in checks)
@@ -100,6 +102,8 @@ def test_refusers_mid_fleet_roll_the_wave_back_and_halt():
     assert len(rolled) == 1 and {"CP0021", "CP0025"} <= set(rolled[0]["station_ids"])
     assert any(w["phase"] == "queued" for w in status["waves"])  # later waves never ran: halt
     assert status["pending"] > 0
+    # Track B's expected L09 numbers (fleet_profile_halt_n50.json).
+    assert (status["migrated"], status["rolled_back"], status["pending"]) == (15, 10, 25)
 
 
 def test_a_rotation_gives_every_migrated_charger_a_new_key_without_disconnecting():
@@ -123,7 +127,7 @@ def test_a_rotation_gives_every_migrated_charger_a_new_key_without_disconnecting
 
 
 def test_a_power_limit_dims_the_pi_and_the_fleet():
-    fleet = MockFleet(n=4, clock=Clock())
+    fleet = MockFleet(n=4, clock=Clock(), pi_mw=True)
     fleet.set_limit(MAX_POWER_W / 2)
     snap = fleet.fleet()
     pi = next(s for s in snap["stations"] if s["station_id"] == PI_ID)
@@ -158,7 +162,8 @@ def test_an_impostor_is_cut_off_with_1008():
     fleet.fleet()
     closed = [e for e in fleet.events_after(0, 2000)["events"]
               if e["event_type"] == "connection_closed" and e["payload"].get("reason") == "pq_auth_failed"]
-    assert closed and closed[0]["station_id"] == "CP0003" and closed[0]["payload"]["code"] == 1008
+    # As the real registry writes it (Track A PR 3): outcome rejected, reason in the payload.
+    assert closed and closed[0]["station_id"] == "CP0003" and closed[0]["outcome"] == "rejected"
     assert [c["payload"]["result"] for c in pq_lines(fleet, "boot")] == ["rejected"]
 
 
