@@ -60,6 +60,30 @@ PHASE C6.1 (A+B+C integration) — three additions
    and the line is marked `_normalised: True`. The diary file is never
    changed. If Track A later copies these up themselves, nothing here
    changes: a filled top-level field is always left as it is.
+
+--------------------------------------------------------------------
+C-F5 PART 2 (L38) — ONE RUN STARTED AS TWO LOAD GENERATORS
+
+Some runs need two load generators at once because a gap in the charger
+ids is filled by someone else: the L09 halt run (`--n 20` + `--n 25
+--start-index 26`, with Track A's refusers CP0021-25 in between) and the
+demo fleet (`--n 44` + `--n 4 --start-index 46`, the E5 victim CP0045 in
+between). Each load generator writes its own diary, so the analysis used
+to see TWO runs -- the same halt twice, as N = 20 and N = 25.
+
+join_split_runs() puts such parts back together as ONE run. Two tester
+runs are parts of one run when ALL of these hold:
+
+    same security mode and same TLS setting;
+    their time windows overlap (start to finish, or to the last line);
+    they started no charger in common;
+    their experiment names match, or one is the other plus "_<suffix>"
+        (e.g. "demo" and "demo_legacy").
+
+The joined run has N = the sum, the charger lists of both, every line of
+both in time order, starts when the first part started and is complete
+only if EVERY part finished. Its `parts` lists the original runs. Nothing
+is joined that was not started together, so an ordinary run is untouched.
 """
 
 from __future__ import annotations
@@ -242,9 +266,15 @@ class HarnessRun:
     crypto_mode: str = ""
     tls: bool = False
     rows: list[dict[str, Any]] = field(default_factory=list)
+    parts: list["HarnessRun"] = field(default_factory=list)
+    """C-F5 part 2 (L38): the tester runs this run was joined from (empty for
+    an ordinary run, which is the only kind a diary file holds)."""
 
     @property
     def started_at(self) -> float | None:
+        if self.parts:
+            starts = [p.started_at for p in self.parts if p.started_at is not None]
+            return min(starts) if starts else None
         for r in self.rows:
             if r.get("event_type") == "run_started":
                 return r.get("_t")
@@ -252,6 +282,9 @@ class HarnessRun:
 
     @property
     def finished_at(self) -> float | None:
+        if self.parts:
+            ends = [p.finished_at for p in self.parts]
+            return None if any(e is None for e in ends) else max(ends)   # every part finished
         for r in reversed(self.rows):
             if r.get("event_type") == "run_finished":
                 return r.get("_t")
@@ -501,3 +534,80 @@ def find_server_diaries(log_dir: str | Path) -> list[Path]:
 
 def all_harness_runs(files: Iterable[HarnessFile]) -> list[HarnessRun]:
     return [run for hf in files for run in hf.runs]
+
+
+# =====================================================================
+# C-F5 PART 2 (L38): ONE RUN STARTED AS TWO LOAD GENERATORS
+# =====================================================================
+
+
+def _window(run: HarnessRun) -> tuple[float, float] | None:
+    start, end = run.started_at, run.finished_at or run.last_seen_at
+    return (start, end) if start is not None and end is not None else None
+
+
+def _names_match(a: str, b: str) -> bool:
+    """Same experiment, or one is the other plus "_<suffix>" (demo / demo_legacy)."""
+    short, long_ = sorted((a, b), key=len)
+    return a == b or (bool(short) and long_.startswith(short + "_"))
+
+
+def _are_parts_of_one_run(a: HarnessRun, b: HarnessRun) -> bool:
+    if (a.crypto_mode, a.tls) != (b.crypto_mode, b.tls):
+        return False
+    if not _names_match(a.experiment, b.experiment):
+        return False
+    wa, wb = _window(a), _window(b)
+    if wa is None or wb is None or wa[0] > wb[1] or wb[0] > wa[1]:
+        return False                                   # not running at the same time
+    ids_a, ids_b = set(a.station_ids), set(b.station_ids)
+    return bool(ids_a) and bool(ids_b) and not (ids_a & ids_b)
+
+
+def join_split_runs(runs: list[HarnessRun]) -> list[HarnessRun]:
+    """
+    Join tester runs that are parts of ONE run (see the module notes, L38).
+    Runs that are not parts of anything come back unchanged, in their
+    original order; a joined run takes the place of its first part.
+    """
+    group_of = list(range(len(runs)))
+
+    def root(i: int) -> int:
+        while group_of[i] != i:
+            group_of[i] = group_of[group_of[i]]
+            i = group_of[i]
+        return i
+
+    for i in range(len(runs)):
+        for j in range(i + 1, len(runs)):
+            if _are_parts_of_one_run(runs[i], runs[j]):
+                group_of[root(j)] = root(i)
+
+    groups: dict[int, list[int]] = {}
+    for i in range(len(runs)):
+        groups.setdefault(root(i), []).append(i)
+
+    out: list[HarnessRun] = []
+    for i, run in enumerate(runs):
+        members = groups[root(i)]
+        if len(members) == 1:
+            out.append(run)
+        elif i == members[0]:
+            out.append(_joined([runs[k] for k in members]))
+    return out
+
+
+def _joined(parts: list[HarnessRun]) -> HarnessRun:
+    parts = sorted(parts, key=lambda p: (p.started_at or 0.0, p.run_id))
+    rows = sorted((r for p in parts for r in p.rows),
+                  key=lambda r: (r.get("_t") is None, r.get("_t") or 0.0))
+    return HarnessRun(
+        path=" + ".join(p.path for p in parts),
+        run_id="+".join(p.run_id for p in parts),
+        experiment=min((p.experiment for p in parts), key=len),
+        n_stations=sum(p.n_stations for p in parts),
+        crypto_mode=parts[0].crypto_mode,
+        tls=parts[0].tls,
+        rows=rows,
+        parts=parts,
+    )

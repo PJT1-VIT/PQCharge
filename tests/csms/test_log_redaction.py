@@ -8,7 +8,6 @@ import logging
 
 import pytest
 
-from agent.pqc_messages import build_install_message
 from csms import server
 from csms.log_redaction import (
     REDACTED,
@@ -23,12 +22,13 @@ FAKE_KEY_B64 = base64.b64encode(FAKE_KEY).decode("ascii")
 
 
 def _ocpp_send_frame() -> str:
-    """The exact text the ocpp library logs for an InstallPQAuth send:
-    "<id>: send [2, <uid>, "DataTransfer", {...}]", where DataTransfer.data
-    is itself a JSON string -- so the key's quotes appear escaped."""
-    request = build_install_message("CP0001", FAKE_KEY)
-    payload = {"vendorId": request.vendor_id, "messageId": request.message_id,
-               "data": request.data}
+    """The exact text the ocpp library logged for the old InstallPQAuth send
+    (removed from every track on 2026-10-12, L42; the filter stays as a
+    safety net): "<id>: send [2, <uid>, "DataTransfer", {...}]", where
+    DataTransfer.data is itself a JSON string -- so the key's quotes appear
+    escaped. Built by hand, in that message's exact shape."""
+    data = json.dumps({"algorithm": "ML-DSA-44", "private_key": FAKE_KEY_B64})
+    payload = {"vendorId": "pqcharge.pqc", "messageId": "InstallPQAuth", "data": data}
     return json.dumps([2, "uid-1", "DataTransfer", payload],
                       separators=(",", ":"))
 

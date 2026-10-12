@@ -7,15 +7,17 @@ Track A (csms). A-P5 of the Contract 7 priority list.
 WHY THIS EXISTS
 
 The ocpp library logs every message it sends and receives at INFO level
-("<id>: send [2, ...]"). While the deprecated InstallPQAuth path still
-exists (Contract 7 section 7.8), a message carrying a station's ML-DSA
-PRIVATE key can pass through that logger, and the key then lands in the
-server's output log in clear text. GitGuardian flagged such copies once
-they were committed under evidence/ (L04).
+("<id>: send [2, ...]"). The old InstallPQAuth message carried a station's
+ML-DSA PRIVATE key, which then landed in the server's output log in clear
+text; GitGuardian flagged such copies once they were committed under
+evidence/ (L04).
 
-The root fix is removing InstallPQAuth (A-P6 / B-P5). Until then -- and
-as a safety net afterwards -- every log record is passed through
-PrivateKeyRedactingFilter before it is written.
+The root fix -- removing InstallPQAuth from all three tracks (Contract 7
+section 7.8) -- was made on 2026-10-12 (A-F3 / B-F1b / C-F9, L42): no
+message the server sends or receives carries a private key any more.
+This filter stays as a SAFETY NET: every log record still passes through
+PrivateKeyRedactingFilter, so a private_key field can never reach the
+log again, whatever a future message or traceback contains.
 
 --------------------------------------------------------------------
 WHAT IT MATCHES

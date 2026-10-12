@@ -75,8 +75,8 @@
   }
   var PI_ID = "CP0000";   // the Raspberry Pi (Track A/B; tests/fixtures/fleet_profile_demo.json)
   function isPi(st) {
-    // measured_mw must be a NUMBER: if the server adds the field to every
-    // charger as null (L37 still open), the other tiles must not turn into Pis.
+    // measured_mw must be a NUMBER: the server sends measured_mw: null for
+    // every simulated charger (A-F10, L37), and those must not turn into Pis.
     return st.station_id === PI_ID || typeof st.measured_mw === "number" ||
       st.power_source === "scaled";
   }

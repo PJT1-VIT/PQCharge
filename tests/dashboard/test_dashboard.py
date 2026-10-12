@@ -57,7 +57,7 @@ def pq_lines(fleet: MockFleet, trigger: str | None = None) -> list[dict]:
 
 
 def test_the_mock_starts_with_a_charging_fleet_and_the_pi():
-    fleet = MockFleet(clock=Clock(), pi_mw=True)
+    fleet = MockFleet(clock=Clock())
     snap = fleet.fleet()
     assert snap["total_stations"] == 50 and snap["connected_count"] == 50
     assert snap["aggregate_power_w"] == pytest.approx(50 * MAX_POWER_W)
@@ -127,7 +127,7 @@ def test_a_rotation_gives_every_migrated_charger_a_new_key_without_disconnecting
 
 
 def test_a_power_limit_dims_the_pi_and_the_fleet():
-    fleet = MockFleet(n=4, clock=Clock(), pi_mw=True)
+    fleet = MockFleet(n=4, clock=Clock())
     fleet.set_limit(MAX_POWER_W / 2)
     snap = fleet.fleet()
     pi = next(s for s in snap["stations"] if s["station_id"] == PI_ID)

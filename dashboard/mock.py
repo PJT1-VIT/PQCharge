@@ -36,12 +36,12 @@ SHAPES (kept identical to the real server, so the page needs no mock mode)
 
     station    csms/fleet.py StationView.to_dict(), plus the fields A-F4 adds:
                tls_cipher, identity_ok, pq_key_id, last_pq_check
-               {at, result, trigger, duration_ms}. Nothing else: the Pi's
-               row is an ordinary row, as on the real server today. Only
-               with pi_mw=True (serve --mock-pi-mw) does it add measured_mw
-               and power_source "scaled", to rehearse L37 (NOT yet sent by
-               the real server; Track A's test_pr4_dashboard_api checks the
-               default mock has no field the server lacks).
+               {at, result, trigger, duration_ms}, and A-F10's measured_mw /
+               power_source (L37): null on every simulated charger, the
+               INA219 milliwatts and "scaled" on the Pi (CP0000) -- exactly
+               what the real server shows once the Pi runs with --power
+               gpio. (Track A's test_pr4_dashboard_api checks the mock has
+               no field the real server lacks.)
     events     Contract 3 Event dicts (timestamp, event_type, station_id,
                outcome, payload, ...) plus `seq`. Track B's lines keep the
                charger in payload.station, exactly as on the real server.
@@ -82,7 +82,7 @@ class MockFleet:
     """The whole pretend server. Thread-safe: every public method locks."""
 
     def __init__(self, *, n: int = 49, mode: str = "hybrid", tls: bool = True,
-                 halt: bool = False, seed: int = 7, pi_mw: bool = False,
+                 halt: bool = False, seed: int = 7,
                  clock: Callable[[], float] = time.time) -> None:
         self.clock = clock
         self.mode = mode
@@ -92,7 +92,6 @@ class MockFleet:
         self.run_id = "mock" + _key_id(str(seed))[:8]
         self.started = clock()
         self.limit_w: float | None = None
-        self.pi_mw = pi_mw
 
         self.events: deque[dict[str, Any]] = deque(maxlen=EVENT_BUFFER)
         self.seq = 0
@@ -168,9 +167,9 @@ class MockFleet:
             "pq_key_id": None,
             "last_pq_check": None,
         }
-        if sid == PI_ID and self.pi_mw:
-            st["measured_mw"] = PI_MAX_MW
-            st["power_source"] = "scaled"
+        # A-F10 (L37): null for a simulated charger, the INA219 reading for the Pi.
+        st["measured_mw"] = PI_MAX_MW if sid == PI_ID else None
+        st["power_source"] = "scaled" if sid == PI_ID else None
         return st
 
     def _idle_status(self, kind: str = "migration") -> dict[str, Any]:
@@ -375,7 +374,7 @@ class MockFleet:
         cap = MAX_POWER_W if self.limit_w is None else min(MAX_POWER_W, self.limit_w)
         charging = st["connection_state"] == "connected" and st["charging_state"] == "Charging"
         st["power_w"] = cap if charging else 0.0
-        if st["station_id"] == PI_ID and self.pi_mw:
+        if st["station_id"] == PI_ID:
             st["measured_mw"] = round(PI_MAX_MW * (st["power_w"] / MAX_POWER_W), 1) if charging else 0.0
 
     def _tick_energy(self, now: float) -> None:

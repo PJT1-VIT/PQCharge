@@ -289,7 +289,10 @@
             issues.map(function (i) { return "<li>" + esc(i.message) + "</li>"; }).join("") +
             "</ul></details>" : "");
         return [
-          esc(s.experiment), int(s.n_stations), modeCell(s.crypto_mode), s.tls ? "On" : "Off",
+          esc(s.experiment) + ((s.joined_from || []).length
+            ? ' <span class="sub">(' + s.joined_from.length + " load generators: " +
+              s.joined_from.map(function (p) { return int(p.n_stations); }).join(" + ") + ")</span>" : ""),
+          int(s.n_stations), modeCell(s.crypto_mode), s.tls ? "On" : "Off",
           esc((s.started_at || "").replace("T", " ").slice(0, 19)), sec(s.wall_s),
           int(ov.sessions && ov.sessions.stations_with_completed_session) + " / " + int(ov.stations && ov.stations.spawned),
           isNum(ov.sessions && ov.sessions.energy_wh_total) ? fmt(ov.sessions.energy_wh_total / 1000, 3) + " kWh" : "—",

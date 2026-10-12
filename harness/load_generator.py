@@ -187,12 +187,12 @@ class StationOutcome:
     but which holds no key is flagged."""
     pq_algorithm: str | None = None
     pq_installs: int = 0
-    """Keys received (more than 1 = rotated)."""
+    """Keys this station made on the server's request (RequestPQEnrolment);
+    more than 1 = rotated. The field name is kept so old diaries still read."""
     pq_challenges_signed: int = 0
     """Post-quantum key checks this station answered with a signature."""
     pq_key_id: str | None = None
-    """PHASE C-P3. key_id of the key held at the end (None: no key, or a key
-    from the deprecated InstallPQAuth)."""
+    """PHASE C-P3. key_id of the key held at the end (None: no key)."""
     pq_key_held_at_start: bool = False
     """PHASE C-P3. Whether the station started the run already holding a key
     (loaded from certs/pq/, saved by an earlier run). The analysis warns when

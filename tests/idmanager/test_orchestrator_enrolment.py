@@ -213,7 +213,7 @@ async def test_no_private_key_ever_leaves_the_server_side(provider):
 
     sent_kinds = {m for _, m, _ in chargers.sent}
     assert sent_kinds == {pqc.MSG_REQUEST_ENROLMENT, pqc.MSG_CHALLENGE}
-    assert pqc.MSG_INSTALL not in sent_kinds
+    assert "InstallPQAuth" not in sent_kinds          # removed from every track (L42)
     for _, _, data in chargers.sent:
         assert "private_key" not in data
     for _, payload in events:
@@ -402,7 +402,7 @@ def _kw(provider, **over):
     return kw
 
 
-def test_enrolment_mode_needs_no_keypair_or_install_factory(provider):
+def test_the_contract_7_options_alone_build_an_orchestrator(provider):
     MigrationOrchestrator(**_kw(provider))
 
 
@@ -418,7 +418,7 @@ def test_enrolment_mode_requires_proof_of_possession(provider):
                                     signature_parser=None))
 
 
-def test_legacy_mode_still_requires_keypair_and_install_factories(provider):
+def test_the_enrolment_pair_is_required(provider):
     with pytest.raises(ValueError, match="required"):
         MigrationOrchestrator(**_kw(provider, enrolment_request_factory=None,
                                     public_key_parser=None))

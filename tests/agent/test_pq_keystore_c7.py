@@ -165,13 +165,6 @@ def test_rotation_keeps_one_previous_key_and_challenges_pick_by_key_id(tmp_path)
         pq.answer_challenge(nonce, k1)
 
 
-def test_the_deprecated_install_still_works_and_is_not_saved(tmp_path):
-    pq, _ = ident(tmp_path)
-    pq.install(os.urandom(64), "ML-DSA-44")
-    assert pq.is_migrated and pq.key_id is None
-    assert not (tmp_path / "CP0001.json").exists()
-
-
 # -- the file itself ----------------------------------------------------------------------
 
 

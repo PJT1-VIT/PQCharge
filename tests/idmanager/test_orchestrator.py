@@ -408,13 +408,15 @@ def test_the_enrolment_options_are_now_required():
                               fleet=_Adapter(_FakeFleet({})), **opts)
 
 
-def test_old_keyword_arguments_are_accepted_and_ignored_until_track_a_drops_them():
-    """csms/migration.py still passes keypair_factory / install_message_factory
-    until Track A's A-F3; they must not break the server in the meantime."""
+def test_the_removed_install_path_keywords_are_refused():
+    """L42: A-F3 stopped passing keypair_factory / install_message_factory
+    (2026-10-12), so the orchestrator no longer accepts them at all -- the
+    server-made-key path cannot come back by accident."""
     provider = PQProvider()
-    MigrationOrchestrator(dispatcher=_Stations(provider),
-                          authenticator=PQAuthenticator(provider),
-                          fleet=_Adapter(_FakeFleet({})),
-                          keypair_factory=provider.generate_keypair,
-                          install_message_factory=lambda sid, priv: None,
-                          **_contract7_options())
+    with pytest.raises(TypeError):
+        MigrationOrchestrator(dispatcher=_Stations(provider),
+                              authenticator=PQAuthenticator(provider),
+                              fleet=_Adapter(_FakeFleet({})),
+                              keypair_factory=provider.generate_keypair,
+                              install_message_factory=lambda sid, priv: None,
+                              **_contract7_options())

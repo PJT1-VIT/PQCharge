@@ -49,10 +49,11 @@ when challenged, and the challenge is sent only after enrolment.
 enrolment_request_factory, public_key_parser, challenge_message_factory and
 signature_parser are all required. The old InstallPQAuth flow (the server
 made the private key and sent it) was removed in B-F1b, after the A+B+C
-re-test (Contract 7 section 7.8, closes L04 with A-F3 and C-F9).
+re-test (Contract 7 section 7.8); Track A's wiring (A-F3) and the charger
+(C-F9) dropped it the same day, closing L04 and L42.
 
 OFFLINE STATIONS (added Day 12):
-By default a station that is not connected fails its install and counts
+By default a station that is not connected fails its enrolment and counts
 against the wave's failure threshold. Built with skip_offline=True (and a
 fleet that answers is_connected), an offline station is DEFERRED instead:
 left PENDING, excluded from the threshold, and migratable by a later run.
@@ -145,20 +146,9 @@ class FleetLike(Protocol):
     def mark_migrated_algorithm(self, station_id: str, algorithm: str) -> None: ...
 
 
-# The station-side install message is provided by a factory so the orchestrator
-# does not hard-code an OCPP message type Track A/C own. In enrolment mode this
-# builds the message that tells a station to begin PQC challenge-response; the
-# harness passes a stub. Returns any object dispatch.send() will accept.
-InstallMessageFactory = Callable[[str, bytes], object]
-
-# Produces a fresh (private, public) ML-DSA keypair for a station being
-# enrolled. In production this is provider.generate_keypair; the harness may
-# pass a deterministic fake.
-KeypairFactory = Callable[[], tuple[bytes, bytes]]
-
 # Builds the OCPP call that carries a challenge nonce to a station. In the
 # live CSMS this is agent.pqc_messages.build_challenge_message -- injected,
-# like the install factory, so idmanager/ never imports agent/.
+# like the enrolment factory, so idmanager/ never imports agent/.
 ChallengeMessageFactory = Callable[[bytes], object]
 
 # Pulls the station's signature bytes out of the dispatcher's response
@@ -185,8 +175,8 @@ class MigrationOrchestrator(MigrationController):
     Implements Contract 4. One instance per CSMS process.
 
     Constructed with the collaborators it drives. Everything it needs from
-    Track A (dispatch, fleet) and from Track B's own crypto (authenticator,
-    keypair factory) is injected, so the orchestrator is testable in full
+    Track A (dispatch, fleet) and from Track B's own crypto (authenticator)
+    is injected, along with Track C's message factories and parsers, so the orchestrator is testable in full
     isolation against fakes -- the rotation harness does exactly that.
     """
 
@@ -196,8 +186,6 @@ class MigrationOrchestrator(MigrationController):
         dispatcher: DispatchLike,
         authenticator: AuthenticatorLike,
         fleet: FleetLike,
-        keypair_factory: KeypairFactory | None = None,
-        install_message_factory: InstallMessageFactory | None = None,
         event_emitter: Callable[..., object] | None = None,
         failure_threshold: float = DEFAULT_FAILURE_THRESHOLD,
         dispatch_timeout_s: float | None = None,
@@ -234,10 +222,6 @@ class MigrationOrchestrator(MigrationController):
                 "and signature_parser: a public key alone does not prove "
                 "the station holds the private half"
             )
-        # keypair_factory / install_message_factory: still ACCEPTED and
-        # IGNORED, only so csms/migration.py (Track A) keeps starting until
-        # A-F3 stops passing them. Remove both parameters after that.
-        del keypair_factory, install_message_factory
         self._make_enrolment_req = enrolment_request_factory
         self._parse_public_key = public_key_parser
         self._make_challenge_msg = challenge_message_factory
@@ -476,8 +460,8 @@ class MigrationOrchestrator(MigrationController):
         overlap-safety invariant.
 
         This is the generalized transition point. Enrolment is the instance
-        built now; rotation reuses this coroutine with a different install
-        message and a key it supplies rather than generates.
+        built now; rotation (B-F2) reuses the same per-station steps with
+        the key staged next to the old one until it is proven.
         """
         # Capability gate: a station whose firmware cannot do the target
         # algorithm is skipped, not failed. This models the heterogeneous

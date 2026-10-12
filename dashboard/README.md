@@ -29,8 +29,9 @@ below 1100 px wide.
 
 Fields the inspector uses from A-F4: `tls_cipher`, `identity_ok`, `pq_key_id`,
 `last_pq_check`. The Pi is **CP0000** (its tile spans three columns); it uses
-`measured_mw` when the server has it (limitations.md **L37**: not sent yet;
-rehearse it with `python -m dashboard.serve --mock --mock-pi-mw`).
+`measured_mw` (the INA219 reading, L37: sent by the Pi as OCPP customData,
+B-F10, and shown on the station row by the server, A-F10). If the Pi runs
+without its sensor, the tile says "measured: on the Pi's console".
 
 The mock is the demo fleet (`tests/fixtures/fleet_profile_demo.json`): CP0000
 the Pi, CP0001–CP0045 capable, CP0046–CP0049 legacy. Its impostor button

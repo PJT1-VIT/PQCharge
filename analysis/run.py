@@ -77,6 +77,9 @@ def analyse_run(matched: match.MatchedRun) -> dict[str, Any]:
         "tls": h.tls,
         "harness_run_id": h.run_id,
         "harness_log": h.path,
+        # C-F5 part 2 (L38): the tester runs this run was joined from.
+        "joined_from": [{"run_id": p.run_id, "harness_log": p.path, "experiment": p.experiment,
+                         "n_stations": p.n_stations} for p in h.parts],
         "server_run_ids": matched.server_run_ids,
         "started_at": _iso(h.started_at),
         "started_at_epoch": h.started_at,
@@ -122,6 +125,9 @@ def build(
     paths = [Path(p) for p in harness_paths] if harness_paths else collect.find_harness_files(log_dir)
     files = [collect.read_harness_file(p) for p in paths]
     runs = collect.all_harness_runs(files)
+    tester_runs = len(runs)
+    # C-F5 part 2 (L38): a run started as two load generators is one run.
+    runs = collect.join_split_runs(runs)
 
     slots = [analyse_run(match.match_run(r, diary)) for r in runs if r.station_ids]
     kept = store.latest_per_slot(slots)
@@ -142,6 +148,8 @@ def build(
                  "unreadable": hf.lines_unreadable}
                 for hf in files
             ],
+            "tester_runs": tester_runs,
+            "runs_joined": tester_runs - len(runs),
             "runs_found": len(slots),
             "runs_kept": len(kept),
         },
@@ -191,8 +199,10 @@ def summary(results: dict[str, Any]) -> str:
         lines.append(f"  - {d}")
     for i in results["diary_check"]["issues"]:
         lines.append(f"  [{i['level']}] {i['message']}")
+    joined = results["sources"].get("runs_joined") or 0
     lines.append(f"runs: {results['sources']['runs_found']} found, "
-                 f"{results['sources']['runs_kept']} kept (newest per slot)")
+                 f"{results['sources']['runs_kept']} kept (newest per slot)"
+                 + (f"; {joined} tester run(s) joined into the run they belong to (L38)" if joined else ""))
     for key in results["slot_order"]:
         s = results["slots"][key]
         e1 = (s.get("e1") or {}).get("station_connect_ms") or {}
@@ -220,7 +230,9 @@ def summary(results: dict[str, Any]) -> str:
             mach = (f"  machine: CPU p95 {m['cpu_pct'].get('p95') or 0:.0f}%, loop lag p95 "
                     f"{m['loop_lag_ms'].get('p95') or 0:.1f} ms"
                     + (" -- SATURATED" if m.get("saturated") else ""))
-        lines.append(f"  {key:<32} trust={s['trust']['status']:<5} connect median={med}{storm}{mig}{mach}")
+        parts = s.get("joined_from") or []
+        joined_note = f"  [{len(parts)} load generators joined]" if parts else ""
+        lines.append(f"  {key:<32} trust={s['trust']['status']:<5} connect median={med}{storm}{mig}{mach}{joined_note}")
     if results["external_nodes"]:
         lines.append("chargers not started by the tester: "
                      + ", ".join(n["station_id"] for n in results["external_nodes"]))

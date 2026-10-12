@@ -43,9 +43,10 @@ CONTRACT 7 (C-P2): THE STATION MAKES ITS OWN KEY
                               challenge does not pay the ~300 ms library
                               load (L10). A station with no key file stays
                               lazy and never imports quantcrypt.
-    install(private_key, alg) DEPRECATED InstallPQAuth path (Contract 7
-                              section 7.8). Unchanged: memory only, no
-                              key_id (the public key is unknown here).
+
+(The old install(private_key) path -- the server's InstallPQAuth handing the
+station a key it had made -- was removed on 2026-10-12, Contract 7 section
+7.8, L42. A key now only ever comes from enrol() or the key file.)
 
 --------------------------------------------------------------------
 *** quantcrypt IS IMPORTED LAZILY, ON FIRST SIGN, NEVER AT IMPORT ***
@@ -109,7 +110,7 @@ class PQIdentity:
             provider_factory: overrides how the lazy provider is built.
                 Defaults to constructing crypto.pq.PQProvider on first use.
             key_store: where enrolled keys are kept (Contract 7 section
-                7.3). None = memory only (tests, and InstallPQAuth).
+                7.3). None = memory only (tests, and `--pq-key-dir none`).
             supported_algorithms: the station's capability list
                 (AgentConfig.supported_algorithms). If non-empty, an
                 enrolment for an algorithm not on it is refused -- a
@@ -127,14 +128,14 @@ class PQIdentity:
         self._supported = list(supported_algorithms or [])
         self._current: StoredKey | None = None
         self._previous: StoredKey | None = None
-        """Contract 7 keys, made on this station. When set, _private_key
-        mirrors _current.private_key so the deprecated path and the new
-        one share is_migrated and answer_challenge."""
+        """Contract 7 keys, made on this station. _private_key mirrors
+        _current.private_key (the key a challenge without a key_id uses)."""
 
         self.installs = 0
-        """How many keys this station has been given (1 = migrated once;
-        more = rotated). Phase C6.1: reported in the tester diary so the
-        analysis can compare the station's own view with the server's."""
+        """How many keys this station has made with enrol() (1 = migrated
+        once; more = rotated). Phase C6.1: reported in the tester diary
+        (pq_installs) so the analysis can compare the station's own view
+        with the server's."""
 
         self.challenges_signed = 0
         """For the end-of-run summary and the latency measurement Track B
@@ -145,7 +146,8 @@ class PQIdentity:
 
     @property
     def is_migrated(self) -> bool:
-        """Whether a post-quantum key has been installed on this station."""
+        """Whether this station holds a post-quantum key (enrolled, or loaded
+        from its key file)."""
         return self._private_key is not None
 
     @property
@@ -154,8 +156,7 @@ class PQIdentity:
 
     @property
     def key_id(self) -> str | None:
-        """key_id of the current key; None if there is none, or if it came
-        through the deprecated InstallPQAuth (public key unknown)."""
+        """key_id of the current key; None if there is none."""
         return self._current.key_id if self._current is not None else None
 
     @property
@@ -243,47 +244,6 @@ class PQIdentity:
             if key is not None and key.key_id == key_id:
                 return key.private_key
         raise LookupError(f"this station holds no key with key_id {key_id!r}")
-
-    # -- the orchestrator installs a key -----------------------------------
-
-    def install(self, private_key: bytes, algorithm: str) -> None:
-        """
-        Store the ML-DSA private key the orchestrator sent.
-
-        This is the whole of what InstallPQAuth does on the station side.
-        It touches no physical state -- no contactor, no meter, no state
-        machine -- so it is safe to call in the middle of a charging
-        transaction, which is exactly when a fleet migration will find
-        most stations. That transaction-safety is not an accident to be
-        preserved carefully; it is inherent, because installing a key is
-        just storing bytes.
-
-        Re-installing replaces the key. That is rotation: Track B's
-        orchestrator rotates a station by enrolling a fresh key and
-        sending a new InstallPQAuth, and the station simply holds the
-        newest one. The station id (its identity) never changes -- only
-        the key does -- which is the impersonation invariant from Track
-        A's finding (a rotation changes the key, never the CN).
-        """
-        if not private_key:
-            raise ValueError("refusing to install an empty private key")
-
-        rotating = self._private_key is not None
-        self._private_key = bytes(private_key)
-        self._algorithm = algorithm
-        # A server-made key replaces any station-made one; its public key
-        # (and so its key_id) is unknown here. Not saved to disk: this path
-        # is deprecated and disappears with InstallPQAuth (section 7.8).
-        self._current = None
-        self._previous = None
-        self.installs += 1
-
-        self.log.info(
-            "%s ML-DSA key installed (%s, %d bytes) -- station is now migrated",
-            "rotated" if rotating else "first",
-            algorithm,
-            len(self._private_key),
-        )
 
     # -- the server challenges ---------------------------------------------
 

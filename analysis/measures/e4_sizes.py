@@ -37,9 +37,10 @@ inside DataTransfer. The ML-DSA certificate rows answer "what WOULD the
 OCPP limits do to post-quantum certificates" -- each row marks which limit
 it is checked against, and nothing is invented to have something to exceed.
 
-C-F5: the old "InstallPQAuth payload" row is gone. That message carried a
-server-made PRIVATE key and is being removed (Contract 7 section 7.8,
-A-F3 / B-F1b); the rows now show the messages actually used.
+C-F5: there is no "InstallPQAuth payload" row. That message carried a
+server-made PRIVATE key and was removed from all three tracks on
+2026-10-12 (Contract 7 section 7.8, L42); the rows show the messages
+actually used.
 
 Missing post-quantum library -> those rows are skipped with a note, and the
 classical rows still appear.

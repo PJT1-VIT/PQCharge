@@ -108,7 +108,9 @@ power (LED duty x 7.4 kW) as its OCPP power value, and sends the real
 INA219 reading alongside it as OCPP customData (`pqcharge.hw`), so the
 scaling is visible and checkable. A second power sample in mW was
 rejected: the server takes the last power sample and would read the mW
-number as watts.
+number as watts. **Server half (Track A, A-F10, PR #51):** the CSMS reads
+that customData and shows it as `measured_mw` on the Pi's station row
+(null for simulated chargers); the dashboard's Pi tile shows the number.
 
 ### I5 — The server made each charger's private key (L01)
 Before Contract 7 the orchestrator generated each charger's ML-DSA key
@@ -117,3 +119,29 @@ pair and sent the private key over the network (InstallPQAuth).
 **Corrective action (Contract 7; Track B B-P1 and B-F1b, PR #32, #49).**
 The charger makes its own key and sends only the public key
 (RequestPQEnrolment); the orchestrator no longer has the old path.
+**2026-10-12, after the A+B+C re-test passed (L42):** the old path was
+removed from the other two tracks as well -- the server wiring no longer
+passes the old factories (A-F3), the orchestrator no longer accepts them,
+and the charger no longer understands InstallPQAuth (C-F9; an
+InstallPQAuth that arrives is answered UnknownMessageId). No code in the
+project can put a private key on the wire.
+
+### I6 — Private keys appeared in the server's output log (L04)
+The ocpp library logs every message at INFO; InstallPQAuth carried a
+private key, so keys landed in `*_server.log` and, once, in committed
+evidence (flagged by GitGuardian).
+
+**Corrective action.** Track A's log filter (`csms/log_redaction.py`,
+A-P5) blanks every `private_key` value; `*.log` is never committed; the
+root cause, InstallPQAuth itself, was removed from all three tracks on
+2026-10-12 (I5). The filter stays as a safety net.
+
+### I7 — A migration key check did not count as "verified" (L34)
+Contract 7 §7.7 set `pq_verified` only from the boot check, so a charger
+migrated on its current connection showed as not recovered until it
+reconnected.
+
+**Corrective action (Track A PR 2; agreed by A, B and C, 2026-10-12).** A
+passed migration key check (a fresh nonce signed with the enrolled key, on
+the same connection) also marks that connection `pq_verified` -- the same
+evidence as a boot check. One sentence to be added to Contract 7 §7.7.
