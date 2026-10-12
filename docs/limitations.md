@@ -42,12 +42,19 @@ decision point at Stage 4.
 
 
 
-### R4 — Certificates carry no Subject Alternative Name
-crypto/ca.py issues certificates with Common Name only. Verified that
-Python's ssl module accepts this via OpenSSL's CN-fallback (mutual TLS
-handshake tested end to end, Day 6). Not yet tested against a
-third-party TLS stack for E6 interoperability -- some implementations
-enforce SAN strictly. Revisit if E6 fails on certificate verification.
+### R4 — Certificates carried no Subject Alternative Name
+crypto/ca.py first issued certificates with Common Name only. Python's
+ssl module accepted this via OpenSSL's CN-fallback (mutual TLS handshake
+tested end to end, Day 6), but strict TLS stacks require a SAN, and the
+Raspberry Pi dials the laptop by IP address, which a CN cannot match.
+
+**Corrective action (Track B, R2 and B-F3, 2026-10-10).** The server
+certificate carries a SAN: "localhost" plus every name or IP given to
+`bootstrap_pki --server-san` (IP addresses are written as IPAddress
+entries, names as DNSName). Every certificate also gained Authority and
+Subject Key Identifiers and BasicConstraints (L06), which Python 3.13's
+strict verification requires. Station certificates keep the station id
+as Common Name, which is what the server's identity check compares.
 
 ### R5 — Windows-specific socket teardown race in test harnesses
 A TLS test client closing its socket immediately after reading the
@@ -62,3 +69,51 @@ closes, rather than relying on timing.
 ## Limitations encountered during implementation
 
 _(Add entries here as they arise, Days 3 onward.)_
+
+### I1 — Two challenges for one charger cancelled each other (L35)
+The authenticator held one outstanding challenge per station, so a boot
+check and a migration check for the same charger overwrote each other
+and both failed.
+
+**Corrective action (Track B, B-P2, 2026-10-10).** Up to 8 outstanding
+challenges per station, each verified by its own nonce.
+
+### I2 — Key rotation had no overlap window (L26)
+Replacing a charger's key in one step meant a failed rotation left it
+with no valid key.
+
+**Corrective action (Track B, B-F2, 2026-10-10).** The new key is staged
+next to the old one, proven with a challenge naming the new key id, and
+only then committed; on failure the old key stays, and a wave over the
+failure threshold restores every old key of that wave. Checked live:
+3 chargers rotated while charging, no session closed.
+
+### I3 — ML-DSA certificate sizes could not be measured (L43)
+The installed `cryptography` could not build ML-DSA X.509 certificates,
+so E4 had no post-quantum certificate rows.
+
+**Corrective action (Track B, B-F5, 2026-10-12).** With `cryptography`
+50+ the rows come from real ML-DSA certificates verified against the
+root; otherwise they are computed from FIPS 204 sizes plus measured
+X.509 overhead and labelled "(computed)" (within 8 bytes of the real
+sizes, tested). Result: an ML-DSA-44 certificate fits OCPP's 5,500-
+character limit; the station + root chain does not fit 10,000.
+
+### I4 — The Pi's sensor reads milliwatts, not kilowatts (L32, L37)
+The INA219 measures the LED circuit (tens of mW), which is invisible next
+to simulated 7.4 kW chargers.
+
+**Corrective action (Track B, B-F8 + B-F10).** The Pi reports scaled
+power (LED duty x 7.4 kW) as its OCPP power value, and sends the real
+INA219 reading alongside it as OCPP customData (`pqcharge.hw`), so the
+scaling is visible and checkable. A second power sample in mW was
+rejected: the server takes the last power sample and would read the mW
+number as watts.
+
+### I5 — The server made each charger's private key (L01)
+Before Contract 7 the orchestrator generated each charger's ML-DSA key
+pair and sent the private key over the network (InstallPQAuth).
+
+**Corrective action (Contract 7; Track B B-P1 and B-F1b, PR #32, #49).**
+The charger makes its own key and sends only the public key
+(RequestPQEnrolment); the orchestrator no longer has the old path.
