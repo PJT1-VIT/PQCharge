@@ -540,9 +540,13 @@ class StationClient(CpBase):
         token: str | None = None,
         offline: bool = False,
         timestamp: str | None = None,
+        power_custom_data: dict[str, Any] | None = None,
     ) -> None:
         """
         Report a charging session starting, progressing or ending.
+
+        power_custom_data (L37, B-F10): passed through to msg.meter_value;
+        only the Raspberry Pi sends it (its INA219 reading).
 
         This carries the numbers. Meter values arrive at the server
         here, and they are what make aggregate_power_w non-zero -- the
@@ -606,7 +610,8 @@ class StationClient(CpBase):
             "seq_no": seq_no,
             "transaction_info": msg.transaction_info(transaction_id, charging_state),
             "evse": msg.evse(),
-            "meter_value": [msg.meter_value(power_w, energy_wh, timestamp=when)],
+            "meter_value": [msg.meter_value(power_w, energy_wh, timestamp=when,
+                                            power_custom_data=power_custom_data)],
         }
 
         # Only Started carries the driver's token, matching what a real

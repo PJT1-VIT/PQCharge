@@ -166,6 +166,27 @@ class GPIOPower(SimulatedPower):
                          self.duty * 100, watts, raw["mw"], raw["ma"], raw["v"])
         return watts
 
+    def meter_custom_data(self) -> dict[str, Any] | None:
+        """
+        L37 (B-F10): the physical reading for the server, sent as OCPP
+        customData on the power sample of every live meter value. Keys are
+        snake_case; the ocpp library sends them as camelCase (vendorId,
+        measuredMw, ...). None when the sensor gives no reading.
+        """
+        raw = self.raw_reading()
+        if raw["mw"] is None:
+            return None
+        data = {
+            "vendor_id": "pqcharge.hw",
+            "measured_mw": round(raw["mw"], 2),
+            "measured_ma": round(raw["ma"], 3) if raw["ma"] is not None else None,
+            "measured_v": round(raw["v"], 3) if raw["v"] is not None else None,
+            "led_duty": round(self.duty, 3),
+            "power_basis": "scaled",
+            "sensor": "INA219",
+        }
+        return {k: v for k, v in data.items() if v is not None}
+
     def close(self) -> None:
         """Switch the LED off (end of run)."""
         try:
