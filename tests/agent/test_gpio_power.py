@@ -68,3 +68,33 @@ def test_off_the_pi_it_says_so():
     except ImportError:
         with pytest.raises(GPIOPowerUnavailable, match="--power sim"):
             GPIOPower(7400.0, sensor_factory=lambda s, a: _INA219())
+
+
+# -- B-F10 (L37): the real reading travels as customData on the power sample --
+
+
+def test_meter_custom_data_carries_the_ina219_reading():
+    p = _gpio()
+    p.close_contactor()
+    p.set_power_limit(3700)
+    d = p.meter_custom_data()
+    assert d["vendor_id"] == "pqcharge.hw" and d["measured_mw"] == 23.4
+    assert d["led_duty"] == 0.5 and d["power_basis"] == "scaled"
+
+
+def test_no_sensor_means_no_custom_data():
+    p = GPIOPower(7400.0, led_factory=_LED, sensor_factory=lambda s, a: (_ for _ in ()).throw(OSError("x")))
+    assert p.meter_custom_data() is None
+
+
+def test_meter_value_puts_custom_data_on_the_power_sample_only():
+    from agent import messages as msg
+    from csms.metering import parse_meter_values
+
+    mv = msg.meter_value(3700.0, 12.0, power_custom_data={"vendor_id": "pqcharge.hw", "measured_mw": 23.4})
+    power, energy = mv["sampled_value"]
+    assert power["custom_data"]["measured_mw"] == 23.4 and "custom_data" not in energy
+    # The server's current metering reads exactly the same numbers as before.
+    reading = parse_meter_values([mv])
+    assert reading.power_w == 3700.0 and reading.energy_wh == 12.0 and reading.unrecognised == []
+    assert "custom_data" not in msg.meter_value(1.0, 2.0)["sampled_value"][0]

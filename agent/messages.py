@@ -284,6 +284,7 @@ def meter_value(
     energy_measurand: str = MEASURAND_ENERGY,
     power_unit: str = UNIT_WATT,
     energy_unit: str = UNIT_WATT_HOUR,
+    power_custom_data: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
     One OCPP MeterValue carrying instantaneous power and cumulative energy.
@@ -309,11 +310,21 @@ def meter_value(
             a real meter never runs backwards, and Track A's registry
             rejects readings older than the last applied one.
         timestamp: ISO-8601; generated if omitted.
+        power_custom_data: L37 (Track B, B-F10, 2026-10-12). OCPP 2.0.1
+            customData attached to the POWER sample -- the Raspberry Pi's
+            real INA219 reading, e.g. {"vendor_id": "pqcharge.hw",
+            "measured_mw": 23.4, ...}. The power value itself is untouched,
+            so a server that does not read customData sees exactly the
+            same reading as before. None (every simulated charger) = no
+            customData at all.
     """
+    power_sample = sampled_value(power_w, power_measurand, power_unit)
+    if power_custom_data:
+        power_sample["custom_data"] = dict(power_custom_data)
     return {
         "timestamp": timestamp or now_iso(),
         "sampled_value": [
-            sampled_value(power_w, power_measurand, power_unit),
+            power_sample,
             sampled_value(energy_wh, energy_measurand, energy_unit),
         ],
     }

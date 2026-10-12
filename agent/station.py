@@ -1025,6 +1025,7 @@ class ChargingStation(StationCommands):
                 self._next_seq(),
                 self.power.read_power(),
                 self.power.read_energy(),
+                power_custom_data=self._power_custom_data(),
                 trigger_reason=msg.TRIGGER_AUTHORIZED,
                 charging_state=self.state.charging_state
                 or msg.CHARGING_STATE_CHARGING,
@@ -1279,12 +1280,29 @@ class ChargingStation(StationCommands):
             self._next_seq(),
             self.power.read_power(),
             self.power.read_energy(),
+            power_custom_data=self._power_custom_data(),
             trigger_reason=trigger_reason,
             charging_state=charging_state,
         )
 
         self._last_charging_state_sent = charging_state
         self._limit_changed = False
+
+    def _power_custom_data(self) -> dict | None:
+        """
+        L37 (Track B, B-F10): the Raspberry Pi's real INA219 reading, sent as
+        OCPP customData on the power sample of each live meter value. Only
+        GPIOPower has meter_custom_data(); every simulated charger returns
+        None and sends exactly what it sent before. Never raises.
+        """
+        hook = getattr(self.power, "meter_custom_data", None)
+        if not callable(hook):
+            return None
+        try:
+            return hook()
+        except Exception:  # noqa: BLE001 - a sensor fault never stops metering
+            self.log.warning("meter_custom_data failed", exc_info=True)
+            return None
 
     async def _end_transaction(
         self, client: StationClient, trigger_reason: str
@@ -1313,6 +1331,7 @@ class ChargingStation(StationCommands):
             self._next_seq(),
             self.power.read_power(),
             self.power.read_energy(),
+            power_custom_data=self._power_custom_data(),
             trigger_reason=trigger_reason,
             charging_state=msg.CHARGING_STATE_IDLE,
         )

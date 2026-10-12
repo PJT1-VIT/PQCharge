@@ -1,0 +1,142 @@
+{
+  "experiment": "E4",
+  "what": "ML-DSA X.509 certificates vs OCPP 2.0.1 size limits",
+  "method": "real certificates",
+  "generated_at": "2026-10-12T04:55:54.109456+00:00",
+  "generated_with": {
+    "python": "3.10.11",
+    "cryptography": "50.0.1",
+    "openssl": "OpenSSL 4.0.2 25 Aug 2026"
+  },
+  "limits": {
+    "certificate": 5500,
+    "chain": 10000
+  },
+  "rows": [
+    {
+      "group": "post-quantum X.509 (not used on the wire; pure-PQC future work)",
+      "label": "Station certificate",
+      "algorithm": "ML-DSA-44",
+      "bytes": 3982,
+      "pem_bytes": 5449,
+      "limit": 5500,
+      "within_limit": true,
+      "headroom": 51
+    },
+    {
+      "group": "post-quantum X.509 (not used on the wire; pure-PQC future work)",
+      "label": "Server certificate",
+      "algorithm": "ML-DSA-44",
+      "bytes": 4007,
+      "pem_bytes": 5482,
+      "limit": 5500,
+      "within_limit": true,
+      "headroom": 18
+    },
+    {
+      "group": "post-quantum X.509 (not used on the wire; pure-PQC future work)",
+      "label": "Root CA certificate",
+      "algorithm": "ML-DSA-44",
+      "bytes": 3962,
+      "pem_bytes": 5421,
+      "limit": 5500,
+      "within_limit": true,
+      "headroom": 79
+    },
+    {
+      "group": "post-quantum X.509 (not used on the wire; pure-PQC future work)",
+      "label": "Chain (station + root)",
+      "algorithm": "ML-DSA-44",
+      "bytes": 7944,
+      "pem_bytes": 10870,
+      "limit": 10000,
+      "within_limit": false,
+      "headroom": -870
+    },
+    {
+      "group": "post-quantum X.509 (not used on the wire; pure-PQC future work)",
+      "label": "Station certificate",
+      "algorithm": "ML-DSA-65",
+      "bytes": 5511,
+      "pem_bytes": 7517,
+      "limit": 5500,
+      "within_limit": false,
+      "headroom": -2017
+    },
+    {
+      "group": "post-quantum X.509 (not used on the wire; pure-PQC future work)",
+      "label": "Server certificate",
+      "algorithm": "ML-DSA-65",
+      "bytes": 5536,
+      "pem_bytes": 7554,
+      "limit": 5500,
+      "within_limit": false,
+      "headroom": -2054
+    },
+    {
+      "group": "post-quantum X.509 (not used on the wire; pure-PQC future work)",
+      "label": "Root CA certificate",
+      "algorithm": "ML-DSA-65",
+      "bytes": 5491,
+      "pem_bytes": 7493,
+      "limit": 5500,
+      "within_limit": false,
+      "headroom": -1993
+    },
+    {
+      "group": "post-quantum X.509 (not used on the wire; pure-PQC future work)",
+      "label": "Chain (station + root)",
+      "algorithm": "ML-DSA-65",
+      "bytes": 11002,
+      "pem_bytes": 15010,
+      "limit": 10000,
+      "within_limit": false,
+      "headroom": -5010
+    },
+    {
+      "group": "post-quantum X.509 (not used on the wire; pure-PQC future work)",
+      "label": "Station certificate",
+      "algorithm": "ML-DSA-87",
+      "bytes": 7469,
+      "pem_bytes": 10170,
+      "limit": 5500,
+      "within_limit": false,
+      "headroom": -4670
+    },
+    {
+      "group": "post-quantum X.509 (not used on the wire; pure-PQC future work)",
+      "label": "Server certificate",
+      "algorithm": "ML-DSA-87",
+      "bytes": 7494,
+      "pem_bytes": 10203,
+      "limit": 5500,
+      "within_limit": false,
+      "headroom": -4703
+    },
+    {
+      "group": "post-quantum X.509 (not used on the wire; pure-PQC future work)",
+      "label": "Root CA certificate",
+      "algorithm": "ML-DSA-87",
+      "bytes": 7449,
+      "pem_bytes": 10142,
+      "limit": 5500,
+      "within_limit": false,
+      "headroom": -4642
+    },
+    {
+      "group": "post-quantum X.509 (not used on the wire; pure-PQC future work)",
+      "label": "Chain (station + root)",
+      "algorithm": "ML-DSA-87",
+      "bytes": 14918,
+      "pem_bytes": 20312,
+      "limit": 10000,
+      "within_limit": false,
+      "headroom": -10312
+    }
+  ],
+  "findings": [
+    "ML-DSA-44: station certificate 5449 chars (fits 5500); station + root chain 10870 chars (exceeds 10000)",
+    "ML-DSA-65: station certificate 7517 chars (exceeds 5500); station + root chain 15010 chars (exceeds 10000)",
+    "ML-DSA-87: station certificate 10170 chars (exceeds 5500); station + root chain 20312 chars (exceeds 10000)"
+  ]
+}
