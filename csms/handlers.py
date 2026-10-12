@@ -577,6 +577,14 @@ class CSMSHandlers(CpBase):
             reading_at=reading.reading_at,
             seq_no=int(seq_no),
             offline=offline,
+            measured_mw=reading.measured_mw,
+            power_source=reading.power_source,
+        )
+        # L37 (A-F10): the Pi's real milliwatts go into the event-log line
+        # only when it sent them, so every other charger's line is unchanged.
+        hardware = (
+            {"measured_mw": reading.measured_mw, "power_source": reading.power_source}
+            if reading.measured_mw is not None else {}
         )
 
         if reading.unrecognised or reading.unknown_units:
@@ -630,6 +638,7 @@ class CSMSHandlers(CpBase):
             offline=offline,
             applied_to_live_state=applied,
             station_timestamp=timestamp,
+            **hardware,
         )
         LOGGER.info(
             "transaction %s: %s tx=%s seq=%s power=%sW energy=%sWh%s",
