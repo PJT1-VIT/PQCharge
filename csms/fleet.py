@@ -258,6 +258,16 @@ class StationView:
     """Cumulative energy for the active transaction, in watt-hours.
     Matching Contract 5."""
 
+    measured_mw: float | None = None
+    """L37 (A-F10): the Pi's (CP0000) real INA219 reading in milliwatts,
+    from customData on its power sample (Track B, B-F10). A number only
+    for the Pi; None for every simulated charger -- Track C's page treats
+    a number here as "this is the Pi". Last-known when power_is_stale."""
+
+    power_source: str | None = None
+    """L37 (A-F10): "scaled" when power_w is the INA219 reading scaled up
+    to charger size; None otherwise."""
+
     bytes_tx: int = 0
     bytes_rx: int = 0
     """OCPP payload bytes on the CURRENT connection, application layer

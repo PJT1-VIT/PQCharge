@@ -230,6 +230,15 @@ class StationState:
     energy_wh: float | None = None
     """Last known cumulative energy for the active transaction."""
 
+    measured_mw: float | None = None
+    power_source: str | None = None
+    """L37 (A-F10): the Pi's real INA219 milliwatts and its power_basis,
+    from customData on the power sample (csms/metering.py). Updated with
+    every applied power reading -- None again if one arrives without
+    them. In memory only: not in persistence.STATE_COLUMNS, so the
+    database schema is unchanged; after a restart they return with the
+    Pi's next reading."""
+
     last_meter_at: datetime | None = None
     """The station's own timestamp on the newest reading applied.
 
@@ -809,9 +818,16 @@ class SessionRegistry(FleetView):
         reading_at: datetime | None = None,
         seq_no: int | None = None,
         offline: bool = False,
+        measured_mw: float | None = None,
+        power_source: str | None = None,
     ) -> bool:
         """
         Apply meter values from a TransactionEvent to live state.
+
+        measured_mw / power_source (L37, A-F10) ride with power_w: set
+        whenever a power reading is applied (None if that reading had no
+        hardware note), under the same stale-reading rule. Not written to
+        the meter_values table (schema unchanged).
 
         Watts and watt-hours, matching Contract 5's units.
 
@@ -844,6 +860,8 @@ class SessionRegistry(FleetView):
         if not stale:
             if power_w is not None:
                 state.power_w = power_w
+                state.measured_mw = measured_mw
+                state.power_source = power_source if measured_mw is not None else None
             if energy_wh is not None:
                 state.energy_wh = energy_wh
             if reading_at is not None:
@@ -1086,6 +1104,8 @@ class SessionRegistry(FleetView):
             active_transaction_id=state.active_transaction_id,
             power_w=state.power_w,
             energy_wh=state.energy_wh,
+            measured_mw=state.measured_mw,
+            power_source=state.power_source,
             power_is_stale=session is None,
             current_algorithm=identity.current_algorithm or None,
             supported_algorithms=list(identity.supported_algorithms),

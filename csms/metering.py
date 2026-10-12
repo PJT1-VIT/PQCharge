@@ -99,6 +99,18 @@ class MeterReading:
     with samples but no recognised values is the signature of a
     measurand mismatch."""
 
+    measured_mw: float | None = None
+    """L37 (A-F10): the Pi's real INA219 reading in milliwatts, taken from
+    the customData on the SAME power sample (Track B, B-F10). None for
+    every simulated charger, and None when the latest power sample came
+    without it -- never an old value presented as current. power_w is not
+    affected by it."""
+
+    power_source: str | None = None
+    """L37 (A-F10): customData power_basis next to measured_mw ("scaled":
+    power_w is the INA219 reading scaled up to charger size). None when
+    measured_mw is None."""
+
 
 def _parse_timestamp(value: Any) -> datetime | None:
     """Parse an ISO-8601 string, tolerating a trailing Z."""
@@ -141,6 +153,39 @@ def _scaled_value(sample: dict[str, Any]) -> tuple[float | None, str | None]:
     if unit not in _UNIT_SCALE_TO_BASE:
         return raw, unit
     return raw * _UNIT_SCALE_TO_BASE[unit], None
+
+
+HARDWARE_VENDOR_ID = "pqcharge.hw"
+"""customData vendorId the Pi's agent puts on its power sample (Track B,
+agent/gpio_power.py meter_custom_data, B-F10). Anything else is ignored."""
+
+
+def _hardware_reading(custom_data: Any) -> tuple[float | None, str | None]:
+    """
+    L37 (A-F10): (measured_mw, power_source) from a power sample's customData.
+
+    The ocpp library turns the wire's camelCase (vendorId, measuredMw,
+    powerBasis) into snake_case on the way in; both spellings are accepted
+    so a change there cannot silently blank the dashboard. A missing note,
+    another vendor, or a value that is not a finite number gives
+    (None, None) -- the sample's power value is used as before.
+    """
+    if not isinstance(custom_data, dict):
+        return None, None
+    vendor = custom_data.get("vendor_id", custom_data.get("vendorId"))
+    if vendor != HARDWARE_VENDOR_ID:
+        return None, None
+    raw = custom_data.get("measured_mw", custom_data.get("measuredMw"))
+    if isinstance(raw, bool):
+        return None, None
+    try:
+        mw = float(raw)
+    except (TypeError, ValueError):
+        return None, None
+    if mw != mw or mw in (float("inf"), float("-inf")):
+        return None, None
+    basis = custom_data.get("power_basis", custom_data.get("powerBasis"))
+    return mw, (str(basis) if basis is not None else None)
 
 
 def parse_meter_values(meter_values: Any) -> MeterReading:
@@ -186,6 +231,9 @@ def parse_meter_values(meter_values: Any) -> MeterReading:
 
             if measurand in POWER_MEASURANDS:
                 reading.power_w = value
+                reading.measured_mw, reading.power_source = _hardware_reading(
+                    sample.get("custom_data")
+                )
             elif measurand in ENERGY_MEASURANDS:
                 reading.energy_wh = value
             elif measurand not in reading.unrecognised:
