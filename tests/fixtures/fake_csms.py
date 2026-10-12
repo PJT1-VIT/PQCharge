@@ -888,7 +888,11 @@ class FakeCSMS:
     async def start(self) -> None:
         """Begin listening. Returns once the socket is open."""
         self._server = await serve(
-            self._on_connect, self.host, self.port, subprotocols=SUBPROTOCOLS
+            self._on_connect,
+            self.host,
+            self.port,
+            subprotocols=SUBPROTOCOLS,
+            reuse_address=True,
         )
         self.log.info(
             "fake CSMS listening on ws://%s:%d  interval=%ds  faults=%s",
