@@ -200,8 +200,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mock-no-tls", action="store_true")
     p.add_argument("--mock-halt", action="store_true",
                    help="CP0021-CP0025 refuse their key: the wave rolls back and the migration halts")
-    p.add_argument("--mock-pi-mw", action="store_true",
-                   help="the Pi also reports measured_mw (L37 rehearsal; the real server does not send it yet)")
     p.add_argument("--cert-dir", default="certs", help="TLS --api only")
     p.add_argument("--cert-station", default="CP0001", help="TLS --api only (L08 stand-in)")
     return p
@@ -212,7 +210,7 @@ def main(argv: list[str] | None = None) -> int:
     mock = None
     if args.mock:
         mock = MockFleet(n=args.mock_n, mode=args.mock_mode, tls=not args.mock_no_tls,
-                         halt=args.mock_halt, pi_mw=args.mock_pi_mw)
+                         halt=args.mock_halt)
     ssl_context = None if args.mock else _ssl_for(args.api, args.cert_dir, args.cert_station)
     handler = make_handler(mock=mock, api=args.api, ssl_context=ssl_context)
     httpd = ThreadingHTTPServer((args.host, args.port), handler)

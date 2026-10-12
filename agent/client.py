@@ -223,11 +223,6 @@ class StationCommands:
 
     # -- Phase C8: the post-quantum migration path (Option B) --------------
 
-    def handle_install_pq_auth(self, data: Any) -> tuple[bool, str]:
-        """The orchestrator is installing this station's ML-DSA key.
-        DEPRECATED (Contract 7 section 7.8)."""
-        return False, "no station is attached to this connection"
-
     def handle_pq_enrolment(
         self, data: Any
     ) -> tuple[bool, str, str | None]:
@@ -834,14 +829,16 @@ class StationClient(CpBase):
     ):
         """
         The one OCPP message that carries PQCharge's post-quantum
-        exchanges. Three ride on it, all under one vendor id:
+        exchanges. Two ride on it, under one vendor id:
 
             RequestPQEnrolment  the server asks the station to make its own
                                 key pair; the station answers with the
                                 PUBLIC key (Contract 7)
             PQAuthChallenge     the server asks the station to sign a nonce
-            InstallPQAuth       DEPRECATED: the orchestrator installs a
-                                server-made key (until Contract 7 section 7.8)
+
+        (The old InstallPQAuth, a server-made private key, was removed on
+        2026-10-12, Contract 7 section 7.8; if one ever arrives it is
+        answered UnknownMessageId like any other unknown id.)
 
         Anything else -- a different vendor, an unknown message id -- is
         answered with the OCPP-correct status and nothing happens. That
@@ -850,21 +847,13 @@ class StationClient(CpBase):
         is untroubled by a migration protocol it has never heard of.
 
         See agent/pqc_messages.py for the wire shape, which is the SAME
-        definition the orchestrator's install_message_factory builds
-        from -- one source of truth, both sides.
+        definition the orchestrator's enrolment_request_factory and
+        challenge_message_factory build from -- one source of truth,
+        both sides.
         """
         if vendor_id != pqc.PQC_VENDOR_ID:
             self.log.debug("DataTransfer for %r ignored (not ours)", vendor_id)
             return call_result.DataTransfer(status=pqc.STATUS_UNKNOWN_VENDOR)
-
-        if message_id == pqc.MSG_INSTALL:
-            accepted, reason = self._decide(
-                "InstallPQAuth", self.commands.handle_install_pq_auth, data
-            )
-            return call_result.DataTransfer(
-                status=pqc.STATUS_ACCEPTED if accepted else pqc.STATUS_REJECTED,
-                status_info=None if accepted else self._status_info(reason),
-            )
 
         if message_id == pqc.MSG_CHALLENGE:
             return self._answer_pq_challenge(data)

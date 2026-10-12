@@ -184,8 +184,8 @@ class _FakeDispatcher:
                           (Rejected for a station listed in `refuse`)
       PQAuthChallenge     signs the nonce with the key named by key_id,
                           packed by Track C's real pack_signature
-      InstallPQAuth       (deprecated) never expected since A-P4; if it
-                          arrives the test fails on `sent`
+      InstallPQAuth       removed from every track (L42); if one is
+                          ever sent the test fails on `sent`
 
     Returns Track A's real DispatchResult, built with the real dispatcher's
     own status and outcome rules, so the orchestrator reads exactly the
@@ -366,7 +366,7 @@ def test_real_orchestrator_through_the_wiring(tmp_path):
         "CP0003": MigrationState.INCOMPATIBLE,
     }
     # A-P4: each capable station is ASKED to make its key, THEN challenged;
-    # InstallPQAuth is never sent; the legacy one got nothing
+    # InstallPQAuth (removed, L42) is never sent; the legacy one got nothing
     for sid in ("CP0001", "CP0002"):
         assert [m for s, m in dispatcher.sent if s == sid] == ["RequestPQEnrolment", "PQAuthChallenge"]
     assert "CP0003" not in {s for s, _ in dispatcher.sent}

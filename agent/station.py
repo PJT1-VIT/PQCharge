@@ -332,9 +332,10 @@ class ChargingStation(StationCommands):
         self.offline_queue = OfflineQueue(station_id=config.station_id)
 
         # Phase C8. This station's post-quantum identity: empty until the
-        # migration orchestrator sends an InstallPQAuth. STATION-scoped,
-        # so a station migrated before an E2 outage is still migrated
-        # after it. quantcrypt is not touched until the first challenge.
+        # migration orchestrator sends a RequestPQEnrolment (or a key file
+        # is loaded below). STATION-scoped, so a station migrated before an
+        # E2 outage is still migrated after it. quantcrypt is not touched
+        # until it is needed.
         #
         # Contract 7 (C-P2): the station makes and keeps its OWN key. With
         # a key folder configured, a key saved by an earlier run is loaded
@@ -433,8 +434,7 @@ class ChargingStation(StationCommands):
         connection of a charger that already held a key, that is the
         secure-ready time: dial -> TLS -> WebSocket -> boot -> key check
         answered. sign_ms is the signing alone. key_id is the key used
-        (the one the server asked for, else the current one; None for a
-        key from the deprecated InstallPQAuth). The load generator writes
+        (the one the server asked for, else the current one). The load generator writes
         a station_authenticated line from it. Same rules as on_connected.
         """
         self._dial_started: float | None = None
@@ -698,30 +698,12 @@ class ChargingStation(StationCommands):
     #
     # These are the station's half of Track B's migration. Both are
     # synchronous like every other StationCommands method, and both are
-    # deliberately transaction-safe: installing a key stores bytes and
+    # deliberately transaction-safe: making a key stores bytes and
     # signing a nonce is pure CPU, so neither touches the contactor, the
     # meter or the state machine. A migration that lands mid-charge --
     # which, across a fleet, is most of them -- does not perturb the
     # session. That is the "rotate without losing a transaction"
     # guarantee, met by construction rather than by careful sequencing.
-
-    def handle_install_pq_auth(self, data: Any) -> tuple[bool, str]:
-        """
-        Store the ML-DSA private key the orchestrator sent.
-
-        This is what turns a classical station into a migrated one. A
-        malformed payload is answered Rejected with the reason, never a
-        crash -- the CSMS learns the key did not take, rather than seeing
-        a fault.
-        """
-        try:
-            algorithm, private_key = pqc.parse_install_data(data)
-        except ValueError as exc:
-            self.log.warning("InstallPQAuth rejected: %s", exc)
-            return False, str(exc)
-
-        self.pq.install(private_key, algorithm)
-        return True, f"{algorithm} key installed; station migrated"
 
     def handle_pq_enrolment(
         self, data: Any
@@ -730,7 +712,7 @@ class ChargingStation(StationCommands):
         RequestPQEnrolment (Contract 7 section 7.2): make a new key pair on
         THIS station, save it, and answer with the public key only.
 
-        Like install, it touches no physical state, so it is safe mid-charge.
+        It touches no physical state, so it is safe mid-charge.
         Refused (never a crash) when the payload is malformed, the
         algorithm is not supported, or the key cannot be saved -- a station
         must not hand out a public key whose private half is not stored.

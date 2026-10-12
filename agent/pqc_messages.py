@@ -15,11 +15,11 @@ untouched. But new exchanges still have to cross the wire:
                  own ML-DSA key pair; the station keeps the private key and
                  answers with the PUBLIC key only.
     2. CHALLENGE the server sends a nonce; the station signs it.
-    3. INSTALL   (DEPRECATED, Contract 7 section 7.8) the orchestrator
-                 gives a station a private key it generated. Kept only
-                 until Track B's orchestrator and Track A's wiring switch
-                 to ENROLMENT; then removed from both sides (closes L04:
-                 a private key on the wire ends up in server logs).
+
+(The old InstallPQAuth exchange, in which the server made the key pair and
+sent the PRIVATE key down the wire, was removed on 2026-10-12 after the
+A+B+C re-test -- Contract 7 section 7.8, L42; it is why L01 and L04 existed.
+No private key is ever on the wire now.)
 
 OCPP 2.0.1 has no native message for either. Its designed extension
 point is DataTransfer -- a generic (vendorId, messageId, data) envelope
@@ -38,19 +38,20 @@ Contract 7 (PQCharge_Interface_Contracts.md, section 7.2) is the written
 specification of every message here. Change this file only together with
 that contract, and tell Tracks A and B first.
 
-`build_install_message` IS the `install_message_factory` that Track B's
-MigrationOrchestrator takes as a constructor argument (its harness stubs
-it as `lambda sid, priv: ("InstallPQAuth", sid)`). Track C provides the
-real one, from here, so the bytes the orchestrator sends are the exact
-bytes the agent parses. This is the same discipline Track B applied to
-`sign_challenge`: one definition of what crosses, shared by both sides,
-rather than two hand-written encoders that drift.
+`build_enrolment_request` / `parse_enrolment_reply` and
+`build_challenge_message` / `parse_signature` ARE the factories and parsers
+Track B's MigrationOrchestrator and BootVerifier take as constructor
+arguments (wired by Track A in csms/migration.py). Track C provides them,
+from here, so the bytes the server sends are the exact bytes the agent
+parses. This is the same discipline Track B applied to `sign_challenge`:
+one definition of what crosses, shared by both sides, rather than two
+hand-written encoders that drift.
 
 --------------------------------------------------------------------
 ENCODING
 
 The payload is JSON in DataTransfer.data (a string on the wire). Key and
-signature bytes are ML-DSA artifacts -- a 2560-byte private key, a
+signature bytes are ML-DSA artifacts -- a 1312-byte public key, a
 2420-byte signature -- which are not text, so they are base64-encoded
 inside the JSON. base64, not hex, to keep the DataTransfer.data field
 small: these ride inside an OCPP message that has a size budget, and the
@@ -75,15 +76,11 @@ PQC_VENDOR_ID = "pqcharge.pqc"
 # The two message ids under that vendor. Plain strings, spelled once
 # here, so a typo on either side is a single-file fix rather than a
 # silent mismatch that looks like a crypto failure.
-MSG_INSTALL = "InstallPQAuth"
-"""DEPRECATED (Contract 7 section 7.8): carries a private key. Removed once
-the orchestrator uses MSG_REQUEST_ENROLMENT."""
-
 MSG_CHALLENGE = "PQAuthChallenge"
 
 MSG_REQUEST_ENROLMENT = "RequestPQEnrolment"
 """Contract 7 section 7.2: server -> station, 'make your own key pair and
-send me the public key'. Replaces MSG_INSTALL."""
+send me the public key'."""
 
 KEY_ID_HEX_CHARS = 16
 """Length of a key_id: the first 16 hex characters (64 bits) of the SHA-256
@@ -92,9 +89,9 @@ apart and to correlate log lines; it is an identifier, not a security
 check -- verification always uses the full enrolled public key."""
 
 DEFAULT_ALGORITHM = "ML-DSA-44"
-"""Tagged on every install so a station can refuse a key for an
-algorithm it was not built to sign with, rather than producing a
-signature nobody can verify."""
+"""Named in every enrolment request so a station can refuse an algorithm it
+was not built to sign with, rather than producing a signature nobody can
+verify."""
 
 
 def _loads(data: Any) -> dict:
@@ -128,75 +125,6 @@ def _b64decode(value: Any, field: str) -> bytes:
     if not raw:
         raise ValueError(f"{field} decoded to empty bytes")
     return raw
-
-
-# =====================================================================
-# INSTALL — orchestrator -> station
-# =====================================================================
-
-
-def build_install_message(
-    station_id: str,
-    private_key: bytes,
-    *,
-    algorithm: str = DEFAULT_ALGORITHM,
-) -> Any:
-    """
-    *** DEPRECATED (Contract 7 section 7.8) -- use build_enrolment_request. ***
-    Kept, unchanged, until Track B's orchestrator and Track A's wiring use
-    the enrolment flow; then removed from both sides.
-
-    *** THIS IS `install_message_factory`. ***
-
-    Track C hands this exact function to Track B's MigrationOrchestrator
-    when the orchestrator is wired into the live CSMS:
-
-        MigrationOrchestrator(
-            ...,
-            install_message_factory=build_install_message,
-            ...,
-        )
-
-    The orchestrator calls it `(station_id, private_key)` -- matching the
-    harness's `lambda sid, priv: (...)` -- and dispatches the result to
-    the station through csms.dispatch.CommandDispatcher.send().
-
-    station_id is accepted for symmetry with the factory signature and
-    for logging; the payload does not carry it, because the message is
-    already addressed to that station by the dispatcher and the station
-    knows its own id.
-
-    The public key is NOT sent: the orchestrator has already enrolled it
-    in the CSMS authenticator (`enrol(station_id, public_key)`), and the
-    station needs only the private key to sign challenges.
-    """
-    return call.DataTransfer(
-        vendor_id=PQC_VENDOR_ID,
-        message_id=MSG_INSTALL,
-        data=json.dumps(
-            {
-                "algorithm": algorithm,
-                "private_key": base64.b64encode(bytes(private_key)).decode("ascii"),
-            }
-        ),
-    )
-
-
-def parse_install_data(data: Any) -> tuple[str, bytes]:
-    """
-    Station side. Returns (algorithm, private_key_bytes).
-
-    Raises ValueError on any malformation. The agent's handler catches
-    that and answers a Rejected DataTransfer -- never a CALLError, which
-    would tell the CSMS this station is faulty when the truth is the
-    message was bad.
-    """
-    obj = _loads(data)
-    algorithm = obj.get("algorithm")
-    if not isinstance(algorithm, str) or not algorithm:
-        raise ValueError("InstallPQAuth payload missing 'algorithm'")
-    private_key = _b64decode(obj.get("private_key"), "private_key")
-    return algorithm, private_key
 
 
 # =====================================================================
@@ -234,7 +162,7 @@ def build_enrolment_request(
 ) -> Any:
     """
     *** THIS IS THE ORCHESTRATOR'S `enrolment_request_factory`. ***
-    (Contract 7 section 7.4; replaces build_install_message.)
+    (Contract 7 section 7.4.)
 
     Called as factory(station_id). station_id is accepted for symmetry and
     logging only; the payload does not carry it, because the dispatcher

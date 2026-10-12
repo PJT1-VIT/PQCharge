@@ -154,13 +154,13 @@ def test_a_challenge_with_a_bad_key_id_is_a_value_error(bad):
         pqcm.challenge_key_id({"nonce": "AA==", "key_id": bad})
 
 
-# -- the deprecated install message is untouched until section 7.8 ------------------------
+# -- section 7.8: the old install message is gone (L42) ----------------------------------
 
 
-def test_the_deprecated_install_message_still_round_trips():
-    key = os.urandom(2560)
-    algorithm, parsed = pqcm.parse_install_data(pqcm.build_install_message("CP0001", key).data)
-    assert (algorithm, parsed) == ("ML-DSA-44", key)
+def test_the_old_install_message_is_gone_from_the_wire_module():
+    """No builder or parser for a server-made private key is left to wire up."""
+    for name in ("MSG_INSTALL", "build_install_message", "parse_install_data"):
+        assert not hasattr(pqcm, name)
 
 
 # -- real ML-DSA: the key that crosses is the key that verifies ---------------------------

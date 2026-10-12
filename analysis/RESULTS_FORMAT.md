@@ -29,6 +29,7 @@ Key: `experiment|n<N>|<mode>|tls` or `...|plain` — e.g. `e2|n500|pqc|tls`.
 |---|---|
 | `experiment`, `n_stations`, `crypto_mode`, `tls` | The setup. |
 | `harness_run_id`, `server_run_ids[]` | The tester's run id; every server run id seen (several after an E2 restart). |
+| `joined_from[]` | **C-F5 part 2 (L38).** Empty for an ordinary run. When one run was started as two load generators (the L09 halt run, the demo fleet), the tester runs it was joined from: `{run_id, harness_log, experiment, n_stations}` each. The slot then has N = their sum, `harness_run_id` = their ids joined with `+`, `harness_log` = their files joined with ` + `, and is `completed` only if every part finished. Parts are joined when they share mode and TLS, overlap in time, started no charger in common, and their experiment names match (or one is the other plus `_<suffix>`, e.g. `demo` / `demo_legacy`). `sources.tester_runs` and `sources.runs_joined` count them. |
 | `started_at`, `finished_at`, `wall_s`, `completed` | Timing; `completed=false` means the run was stopped early. |
 | `trust` | `{status: pass/warn/fail, issues[{level, code, message}]}`. **Show it next to every number.** |
 | `overview` | `stations`, `connections`, `sessions`, `meter`, `offline_queue`, and `timeline` (`connected`, `charging`, `power_w` as `[[seconds, value], ...]`). |

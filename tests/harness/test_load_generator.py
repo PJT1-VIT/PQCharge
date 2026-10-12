@@ -512,19 +512,32 @@ async def test_every_stations_connect_time_reaches_the_harness_log(tmp_path):
 # =====================================================================
 #
 # Each station reports, in its station_finished row, whether it holds a
-# post-quantum key, which algorithm, how many keys it received and how many
+# post-quantum key, which algorithm, how many keys it made and how many
 # key checks it signed. The analysis compares this with what the server
 # says, so a station the server calls migrated but which holds no key is
 # caught.
 
 
-def test_a_pq_identity_counts_the_keys_it_was_given():
+class _FakeProvider:
+    """Stands in for crypto.pq.PQProvider: distinct key pairs, no quantcrypt."""
+
+    signature_algorithm = "ML-DSA-44"
+
+    def __init__(self) -> None:
+        self.made = 0
+
+    def generate_keypair(self) -> tuple[bytes, bytes]:
+        self.made += 1
+        return bytes([self.made]) * 32, bytes([self.made]) * 16
+
+
+def test_a_pq_identity_counts_the_keys_it_made():
     from agent.pq_identity import PQIdentity
 
-    identity = PQIdentity("CP0001")
+    identity = PQIdentity("CP0001", provider=_FakeProvider())
     assert identity.installs == 0 and identity.is_migrated is False
-    identity.install(b"\x01" * 32, "ML-DSA-44")
-    identity.install(b"\x02" * 32, "ML-DSA-44")          # a rotation
+    identity.enrol("ML-DSA-44")
+    identity.enrol("ML-DSA-44")                         # a rotation
     assert identity.installs == 2 and identity.is_migrated
 
 
@@ -533,7 +546,8 @@ async def test_the_stations_own_pq_view_reaches_the_harness_log(tmp_path, monkey
     from agent.station import ChargingStation
 
     async def migrated_run(self):
-        self.pq.install(b"\x01" * 32, "ML-DSA-44")
+        self.pq._provider = _FakeProvider()             # no quantcrypt needed
+        self.pq.enrol("ML-DSA-44")
         self.pq.challenges_signed = 1
         return True
 
