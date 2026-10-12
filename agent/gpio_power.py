@@ -208,3 +208,35 @@ def build_power(config: Any) -> SimulatedPower:
             shunt_ohms=getattr(config, "ina219_shunt_ohms", DEFAULT_SHUNT_OHMS),
         )
     return SimulatedPower(max_power_w=config.max_power_w)
+
+
+def _selftest() -> None:  # pragma: no cover - needs the real Pi
+    """
+    python -m agent.gpio_power  -- on the Pi, no server needed (B-F9).
+
+    Steps the LED through off / 25 % / 50 % / 100 % / off and prints the
+    INA219 reading at each step, so the wiring can be checked before the
+    charger joins the fleet: the milliwatts must rise with the brightness.
+    """
+    import sys
+
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    try:
+        power = GPIOPower()
+    except GPIOPowerUnavailable as exc:
+        print(exc)
+        sys.exit(1)
+    power.close_contactor()
+    for watts in (0.0, 1850.0, 3700.0, 7400.0):
+        power.set_power_limit(watts)
+        time.sleep(1.5)
+        raw = power.raw_reading()
+        print(f"limit {watts:6.0f} W -> LED duty {power.duty:4.0%} -> "
+              f"INA219 {raw['mw']} mW, {raw['ma']} mA, {raw['v']} V")
+    power.open_contactor()
+    power.close()
+    print("LED off. If the mW did not rise with the duty, check the wiring and i2cdetect -y 1.")
+
+
+if __name__ == "__main__":  # pragma: no cover
+    _selftest()

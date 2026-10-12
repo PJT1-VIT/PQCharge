@@ -15,11 +15,11 @@ it proves, on Track B's side alone:
   - overlap safety: a failed dispatch un-enrols that station
   - migration events are emitted for E3
 
-WHAT REMAINS FOR DAY 10-11 (with Track C): swap the FakeDispatcher for the
-real csms.dispatch.CommandDispatcher and the FakeFleet for a real
-SessionRegistry via FleetAdapter, and Track C's agent/certificate.py must
-answer the InstallPQAuth message this harness stubs. Everything on Track
-B's side is proven here first.
+Since B-F1b (2026-10-12) the fake stations speak Contract 7: each makes its
+own ML-DSA key, answers the enrolment request with the public key, and
+signs the challenge (the old InstallPQAuth flow is removed). The live path
+(real CommandDispatcher, SessionRegistry, Track C's agent) is wired in
+csms/migration.py and proven in the A+B+C sessions.
 
 Run:
     python experiments/rotation_harness.py
@@ -42,23 +42,36 @@ from idmanager.api import MigrationPhase
 
 
 class _FakeResult:
-    def __init__(self, ok: bool) -> None:
+    def __init__(self, ok: bool, response=None) -> None:
         self.ok = ok
         self.outcome = "success" if ok else "failure"
+        self.response = response
+        self.duration_ms = 1.0
 
 
 class FakeDispatcher:
-    """Stands in for csms.dispatch.CommandDispatcher until the live-station
-    path is proven. send() returns ok unless the station is in fail_ids."""
+    """Fake chargers speaking Contract 7 with real ML-DSA: ("enrol", id) ->
+    the station makes a key pair and answers with the public key;
+    ("challenge", nonce, key_id) -> it signs the nonce. Stations in
+    fail_ids refuse the enrolment."""
 
-    def __init__(self, fail_ids: set[str] | None = None) -> None:
+    def __init__(self, provider, fail_ids: set[str] | None = None) -> None:
+        self.provider = provider
         self.fail_ids = set(fail_ids or [])
+        self.keys: dict[str, bytes] = {}
         self.sent: list[str] = []
 
     async def send(self, station_id, request, *, timeout_s=None):
-        self.sent.append(station_id)
         await asyncio.sleep(0)
-        return _FakeResult(ok=station_id not in self.fail_ids)
+        if request[0] == "enrol":
+            self.sent.append(station_id)
+            if station_id in self.fail_ids:
+                return _FakeResult(ok=False)
+            priv, pub = self.provider.generate_keypair()
+            self.keys[station_id] = priv
+            return _FakeResult(ok=True, response=pub)
+        return _FakeResult(ok=True, response=sign_challenge(
+            self.provider, self.keys[station_id], request[1]))
 
 
 class FakeFleet:
@@ -132,15 +145,17 @@ async def _run_to_completion(orch) -> None:
 def _build(capabilities, provider, authenticator, *, fail_ids=None, events=None):
     fleet = FakeFleet(capabilities)
     adapter = _FakeAdapter(fleet)
-    dispatcher = FakeDispatcher(fail_ids=fail_ids)
+    dispatcher = FakeDispatcher(provider, fail_ids=fail_ids)
     emitter = (lambda ev, **k: events.append(ev)) if events is not None else None
     orch = MigrationOrchestrator(
         dispatcher=dispatcher,
         authenticator=authenticator,
         fleet=adapter,
-        keypair_factory=provider.generate_keypair,
-        install_message_factory=lambda sid, priv: ("InstallPQAuth", sid),
         event_emitter=emitter,
+        enrolment_request_factory=lambda sid, algorithm: ("enrol", sid),
+        public_key_parser=lambda pub: ("ML-DSA-44", pub, pub[:4].hex()),
+        challenge_message_factory=lambda nonce, key_id=None: ("challenge", nonce, key_id),
+        signature_parser=lambda response: response,
     )
     return orch, fleet
 
@@ -208,11 +223,8 @@ async def main() -> None:
 
     print("\n" + "=" * 60)
     if ok:
-        print("SUCCESS — orchestrator proven end to end with real ML-DSA.")
-        print("\nFor Day 10-11 with Track C: swap FakeDispatcher for")
-        print("csms.dispatch.CommandDispatcher and FakeFleet for a real")
-        print("SessionRegistry via FleetAdapter. Track C's agent must answer")
-        print("the InstallPQAuth message this harness stubs.")
+        print("SUCCESS — orchestrator proven end to end with real ML-DSA "
+              "(Contract 7: station-made keys, proof of possession).")
     else:
         print("FAILED — see scenarios above.")
         sys.exit(1)

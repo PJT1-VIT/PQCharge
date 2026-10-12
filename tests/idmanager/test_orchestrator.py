@@ -4,6 +4,10 @@ Orchestrator tests — the pytest form of the rotation harness.
 Proves the Contract 4 controller end to end with real ML-DSA against a fake
 dispatcher and a fake fleet mirroring Contract 6. These are the assertions
 behind E3 (migration under load) and the rollback / overlap-safety claims.
+
+B-F1b (2026-10-12): the InstallPQAuth path is gone, so every test here now
+runs the Contract 7 flow -- the fake station makes its own key, answers the
+enrolment request with the public key, and signs the challenge.
 """
 
 import asyncio
@@ -11,27 +15,67 @@ import asyncio
 import pytest
 
 from crypto.pq import PQProvider
-from crypto.pq_auth import PQAuthenticator
+from crypto.pq_auth import PQAuthenticator, sign_challenge
 from crypto.identity import StationIdentity, MigrationState
 from idmanager.orchestrator import MigrationOrchestrator
 from idmanager.api import MigrationPhase
 
 
-class _FakeResult:
-    def __init__(self, ok):
+ALG = "ML-DSA-44"
+
+
+class _Result:
+    def __init__(self, ok, response=None):
         self.ok = ok
-        self.outcome = "success" if ok else "failure"
+        self.outcome = "success" if ok else "rejected"
+        self.status = "Accepted" if ok else "Rejected"
+        self.response = response
+        self.duration_ms = 1.0
 
 
-class _FakeDispatcher:
-    def __init__(self, fail_ids=None):
-        self.fail_ids = set(fail_ids or [])
-        self.sent = []
+class _Stations:
+    """
+    Fake chargers speaking Contract 7 with real ML-DSA. A request is
+    ("enrol", station_id) or ("challenge", nonce, key_id). Stations in
+    fail_ids refuse the enrolment; wrong_key ones sign with another key;
+    refuse_challenge ones refuse the challenge.
+    """
+
+    def __init__(self, provider, *, fail_ids=(), wrong_key=(), refuse_challenge=()):
+        self.provider = provider
+        self.fail_ids = set(fail_ids)
+        self.wrong_key = set(wrong_key)
+        self.refuse = set(refuse_challenge)
+        self.keys = {}
+        self.sent = []        # station ids sent an enrolment request
+        self.kinds = []       # (station_id, "enrol" | "challenge")
 
     async def send(self, station_id, request, *, timeout_s=None):
-        self.sent.append(station_id)
+        kind = request[0]
+        self.kinds.append((station_id, kind))
         await asyncio.sleep(0)
-        return _FakeResult(ok=station_id not in self.fail_ids)
+        if kind == "enrol":
+            self.sent.append(station_id)
+            if station_id in self.fail_ids:
+                return _Result(ok=False)
+            priv, pub = self.provider.generate_keypair()
+            self.keys[station_id] = priv
+            return _Result(ok=True, response=pub)
+        if station_id in self.refuse:
+            return _Result(ok=False)
+        key = self.keys[station_id]
+        if station_id in self.wrong_key:
+            key, _ = self.provider.generate_keypair()
+        return _Result(ok=True, response=sign_challenge(self.provider, key, request[1]))
+
+
+def _contract7_options():
+    return dict(
+        enrolment_request_factory=lambda sid, algorithm: ("enrol", sid),
+        public_key_parser=lambda pub: (ALG, pub, pub[:4].hex()),
+        challenge_message_factory=lambda nonce, key_id=None: ("challenge", nonce, key_id),
+        signature_parser=lambda response: response,
+    )
 
 
 class _FakeFleet:
@@ -93,12 +137,11 @@ def _build(caps, *, fail_ids=None, events=None):
     auth = PQAuthenticator(provider)
     emitter = (lambda ev, **k: events.append(ev)) if events is not None else None
     orch = MigrationOrchestrator(
-        dispatcher=_FakeDispatcher(fail_ids=fail_ids),
+        dispatcher=_Stations(provider, fail_ids=fail_ids or ()),
         authenticator=auth,
         fleet=_Adapter(fleet),
-        keypair_factory=provider.generate_keypair,
-        install_message_factory=lambda sid, priv: ("InstallPQAuth", sid),
         event_emitter=emitter,
+        **_contract7_options(),
     )
     return orch, fleet, auth
 
@@ -192,7 +235,6 @@ async def test_double_start_raises():
 # Day 12 -- fixes before the A+B+C session
 # =====================================================================
 
-from crypto.pq_auth import sign_challenge  # noqa: E402
 
 
 def _counts_sum(st):
@@ -244,14 +286,13 @@ def _build_with(caps, *, offline=(), skip_offline=False, fail_ids=None):
     fleet = _FakeFleet(caps)
     auth = PQAuthenticator(provider)
     # an offline station cannot answer, so the fake dispatcher fails it
-    dispatcher = _FakeDispatcher(fail_ids=set(fail_ids or ()) | set(offline))
+    dispatcher = _Stations(provider, fail_ids=set(fail_ids or ()) | set(offline))
     orch = MigrationOrchestrator(
         dispatcher=dispatcher,
         authenticator=auth,
         fleet=_AdapterWithLiveness(fleet, offline),
-        keypair_factory=provider.generate_keypair,
-        install_message_factory=lambda sid, priv: ("InstallPQAuth", sid),
         skip_offline=skip_offline,
+        **_contract7_options(),
     )
     return orch, fleet, auth, dispatcher
 
@@ -283,60 +324,18 @@ async def test_offline_station_still_fails_when_skip_offline_is_off():
     assert _counts_sum(st)
 
 
-class _ChallengeResult:
-    def __init__(self, ok, response=None):
-        self.ok = ok
-        self.outcome = "success" if ok else "rejected"
-        self.status = "Accepted" if ok else "Rejected"
-        self.response = response
-        self.duration_ms = 1.0
-
-
-class _StationsThatSign:
-    """
-    A dispatcher that behaves like real stations: it keeps the private key
-    each station is installed with, and answers a challenge by signing the
-    nonce with it -- or, for chosen stations, with the wrong key, or not at
-    all. Real ML-DSA throughout.
-    """
-
-    def __init__(self, provider, *, wrong_key=(), refuse_challenge=()):
-        self.provider = provider
-        self.wrong_key = set(wrong_key)
-        self.refuse = set(refuse_challenge)
-        self.keys = {}
-        self.sent = []
-
-    async def send(self, station_id, request, *, timeout_s=None):
-        kind, payload = request
-        self.sent.append((station_id, kind))
-        await asyncio.sleep(0)
-        if kind == "install":
-            self.keys[station_id] = payload
-            return _ChallengeResult(ok=True)
-        if station_id in self.refuse:
-            return _ChallengeResult(ok=False)
-        key = self.keys[station_id]
-        if station_id in self.wrong_key:
-            key, _ = self.provider.generate_keypair()
-        return _ChallengeResult(ok=True, response=sign_challenge(self.provider, key, payload))
-
-
 def _build_verifying(caps, **station_kw):
     provider = PQProvider()
     fleet = _FakeFleet(caps)
     auth = PQAuthenticator(provider)
-    stations = _StationsThatSign(provider, **station_kw)
+    stations = _Stations(provider, **station_kw)
     events = []
     orch = MigrationOrchestrator(
         dispatcher=stations,
         authenticator=auth,
         fleet=_Adapter(fleet),
-        keypair_factory=provider.generate_keypair,
-        install_message_factory=lambda sid, priv: ("install", priv),
-        challenge_message_factory=lambda nonce: ("challenge", nonce),
-        signature_parser=lambda response: response,
         event_emitter=lambda ev, **k: events.append((ev, k)),
+        **_contract7_options(),
     )
     return orch, fleet, auth, stations, events
 
@@ -348,8 +347,8 @@ async def test_station_migrates_only_after_proving_possession():
     orch.start_migration(wave_size=3, canary_count=1, target_mode="pqc")
     st = await _run(orch)
     assert st.phase == MigrationPhase.COMPLETED and st.migrated == 4
-    # every station got an install AND a challenge
-    assert sorted(k for _, k in stations.sent) == ["challenge"] * 4 + ["install"] * 4
+    # every station got an enrolment request AND a challenge
+    assert sorted(k for _, k in stations.kinds) == ["challenge"] * 4 + ["enrol"] * 4
     checks = [k for ev, k in events if ev == "connection_attempt"]
     assert len(checks) == 4
     assert all(k["transition"] == "pq_auth" and k["result"] == "success" for k in checks)
@@ -385,12 +384,37 @@ async def test_refused_challenge_fails_the_station():
 
 def test_challenge_factory_without_parser_is_rejected():
     provider = PQProvider()
+    opts = _contract7_options()
+    opts.pop("signature_parser")
     with pytest.raises(ValueError):
         MigrationOrchestrator(
-            dispatcher=_FakeDispatcher(),
+            dispatcher=_Stations(provider),
             authenticator=PQAuthenticator(provider),
             fleet=_Adapter(_FakeFleet({})),
-            keypair_factory=provider.generate_keypair,
-            install_message_factory=lambda sid, priv: None,
-            challenge_message_factory=lambda nonce: None,
+            **opts,
         )
+
+
+def test_the_enrolment_options_are_now_required():
+    """B-F1b: without enrolment_request_factory + public_key_parser there is
+    no way to migrate any more (the server-made-key path is gone)."""
+    provider = PQProvider()
+    opts = _contract7_options()
+    opts.pop("enrolment_request_factory")
+    opts.pop("public_key_parser")
+    with pytest.raises(ValueError, match="required"):
+        MigrationOrchestrator(dispatcher=_Stations(provider),
+                              authenticator=PQAuthenticator(provider),
+                              fleet=_Adapter(_FakeFleet({})), **opts)
+
+
+def test_old_keyword_arguments_are_accepted_and_ignored_until_track_a_drops_them():
+    """csms/migration.py still passes keypair_factory / install_message_factory
+    until Track A's A-F3; they must not break the server in the meantime."""
+    provider = PQProvider()
+    MigrationOrchestrator(dispatcher=_Stations(provider),
+                          authenticator=PQAuthenticator(provider),
+                          fleet=_Adapter(_FakeFleet({})),
+                          keypair_factory=provider.generate_keypair,
+                          install_message_factory=lambda sid, priv: None,
+                          **_contract7_options())

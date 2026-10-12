@@ -36,28 +36,20 @@ a migration id; get_migration_status reads a snapshot; rollback signals
 the task. This matches Contract 4's stated intent exactly ("returns
 immediately; the work proceeds in the background").
 
-PROOF OF POSSESSION (added Day 12, before the A+B+C session):
-Accepting InstallPQAuth only proves a station received a key. When the
-orchestrator is built with challenge_message_factory and signature_parser,
-each station is then sent a PQAuthChallenge straight after the install, and
-is marked MIGRATED only if its ML-DSA signature verifies against the key
-just enrolled. Without those two arguments the behaviour is exactly as
-before (install accepted = migrated), so existing callers keep working.
-
-ENROLMENT BY PUBLIC KEY (Contract 7 section 7.4, B-P1, added 2026-10-09):
-Built with enrolment_request_factory and public_key_parser (always given
-together), the orchestrator no longer makes any key. It sends each station
-a RequestPQEnrolment; the station makes its own ML-DSA key pair, keeps the
+HOW A STATION IS MIGRATED (Contract 7 section 7.4; the only flow since
+B-F1b, 2026-10-12):
+The orchestrator never makes a key. It sends each station a
+RequestPQEnrolment; the station makes its own ML-DSA key pair, keeps the
 private half, and answers with {algorithm, public_key, key_id}. Only then is
 the public key enrolled -- the server cannot enrol a key it does not have --
-and the station is challenged with that key_id. The overlap guarantee is
-unchanged: the station only USES the key when challenged, and the challenge
-is sent only after enrolment. In this mode keypair_factory and
-install_message_factory are not used and may be omitted, and proof of
-possession (challenge_message_factory + signature_parser) is required: a
-public key alone proves nothing about who holds the private half. Without
-the two new arguments the old InstallPQAuth flow runs exactly as before,
-until it is removed after the A+B+C re-test (Contract 7 section 7.8, B-P5).
+and the station is challenged (PQAuthChallenge with that key_id). It is
+marked MIGRATED only if its ML-DSA signature verifies (proof of possession,
+added Day 12). The overlap guarantee holds: the station only USES the key
+when challenged, and the challenge is sent only after enrolment.
+enrolment_request_factory, public_key_parser, challenge_message_factory and
+signature_parser are all required. The old InstallPQAuth flow (the server
+made the private key and sent it) was removed in B-F1b, after the A+B+C
+re-test (Contract 7 section 7.8, closes L04 with A-F3 and C-F9).
 
 OFFLINE STATIONS (added Day 12):
 By default a station that is not connected fails its install and counts
@@ -228,19 +220,24 @@ class MigrationOrchestrator(MigrationController):
                 "together (Contract 7 section 7.4): a request whose answer "
                 "cannot be read enrols nothing"
             )
-        if enrolment_request_factory is not None:
-            if challenge_message_factory is None:
-                raise ValueError(
-                    "enrolment by public key needs challenge_message_factory "
-                    "and signature_parser: a public key alone does not prove "
-                    "the station holds the private half"
-                )
-        elif keypair_factory is None or install_message_factory is None:
+        # B-F1b (2026-10-12, Contract 7 section 7.8): the server-made-key
+        # InstallPQAuth path is removed. The station makes its own key, so
+        # the enrolment pair is REQUIRED, and so is proof of possession.
+        if enrolment_request_factory is None:
             raise ValueError(
-                "keypair_factory and install_message_factory are required "
-                "unless enrolment_request_factory and public_key_parser are "
-                "given (Contract 7 section 7.4)"
+                "enrolment_request_factory and public_key_parser are required "
+                "(Contract 7 section 7.4; the InstallPQAuth path was removed in B-F1b)"
             )
+        if challenge_message_factory is None:
+            raise ValueError(
+                "enrolment by public key needs challenge_message_factory "
+                "and signature_parser: a public key alone does not prove "
+                "the station holds the private half"
+            )
+        # keypair_factory / install_message_factory: still ACCEPTED and
+        # IGNORED, only so csms/migration.py (Track A) keeps starting until
+        # A-F3 stops passing them. Remove both parameters after that.
+        del keypair_factory, install_message_factory
         self._make_enrolment_req = enrolment_request_factory
         self._parse_public_key = public_key_parser
         self._make_challenge_msg = challenge_message_factory
@@ -249,8 +246,6 @@ class MigrationOrchestrator(MigrationController):
         self._dispatch = dispatcher
         self._auth = authenticator
         self._fleet = fleet
-        self._make_keypair = keypair_factory
-        self._make_install_msg = install_message_factory
         self._emit = event_emitter or (lambda *a, **k: None)
         self._threshold = failure_threshold
         self._dispatch_timeout_s = dispatch_timeout_s
@@ -507,35 +502,7 @@ class MigrationOrchestrator(MigrationController):
 
         self._fleet.set_state(station_id, MigrationState.IN_PROGRESS, wave_id)
 
-        if self._make_enrolment_req is not None:
-            return await self._enrol_by_public_key(station_id, wave_id)
-
-        # --- Deprecated InstallPQAuth flow (server makes the key). Kept
-        # --- until the A+B+C re-test; removed in B-P5 (Contract 7 section 7.8).
-
-        # Step 1: enrol the new identity FIRST -- overlap window opens.
-        private_key, public_key = self._make_keypair()
-        self._auth.enrol(station_id, public_key)
-        self._enrolled_this_run[wave_id].append(station_id)
-
-        # Step 2: instruct the station to begin using its PQC identity.
-        install_msg = self._make_install_msg(station_id, private_key)
-        result = await self._dispatch.send(
-            station_id, install_msg, timeout_s=self._dispatch_timeout_s
-        )
-        if not getattr(result, "ok", False):
-            return self._fail_station(station_id, wave_id)
-
-        # Step 3 (when wired): the station must PROVE it holds the key by
-        # signing a fresh challenge. Without this, "migrated" only means
-        # "the station accepted a message".
-        if self._make_challenge_msg is not None:
-            verified = await self._check_and_report(station_id, wave_id, key_id=None)
-            if not verified:
-                return self._fail_station(station_id, wave_id)
-
-        # Step 4: confirmed.
-        return self._mark_migrated(station_id, wave_id)
+        return await self._enrol_by_public_key(station_id, wave_id)
 
     async def _enrol_by_public_key(self, station_id: str, wave_id: int) -> MigrationState:
         """
@@ -698,8 +665,7 @@ class MigrationOrchestrator(MigrationController):
         identity check, so Track C's E5 measure counts both. station_id
         travels as `station` because the orchestrator's emitter writes
         events with no top-level station (a wave is not one station).
-        key_id is None on the deprecated InstallPQAuth path. "source" is
-        added by Track A's emitter, not here (see the module docstring).
+        "source" is added by Track A's emitter, not here (see the module docstring).
         """
         verified, detail, duration_ms = await self._verify_possession(
             station_id, key_id=key_id

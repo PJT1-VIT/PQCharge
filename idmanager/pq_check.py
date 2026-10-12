@@ -60,9 +60,8 @@ async def challenge_and_verify(
     Run one challenge-response check against the station's enrolled key.
 
     key_id (Contract 7 section 7.2) names which of the station's keys must
-    sign. It is passed to make_challenge only when known, so a factory
-    written as `lambda nonce: ...` keeps working on the deprecated
-    InstallPQAuth path.
+    sign. It is passed to make_challenge only when known (a factory written
+    as `lambda nonce: ...` still works when no key_id is given).
     """
     try:
         nonce = authenticator.issue_challenge(station_id)
