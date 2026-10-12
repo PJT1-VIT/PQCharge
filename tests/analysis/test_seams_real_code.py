@@ -240,7 +240,8 @@ async def test_end_to_end_stage6_shape_with_every_track_real(tmp_path):
     pytest.importorskip("quantcrypt", reason="PQ backend; see requirements.txt")
     from agent.client import StationClient
     from agent.config import AgentConfig
-    from agent.pqc_messages import build_challenge_message, build_install_message, parse_signature
+    from agent.pqc_messages import (build_challenge_message, build_enrolment_request,
+                                     parse_enrolment_reply, parse_signature)
     from agent.station import ChargingStation
     from crypto.pq import PQProvider
     from crypto.pq_auth import PQAuthenticator
@@ -275,8 +276,8 @@ async def test_end_to_end_stage6_shape_with_every_track_real(tmp_path):
         dispatcher=_Dispatcher(clients, refusers={"EXT01", "EXT02"}),
         authenticator=PQAuthenticator(provider),
         fleet=fleet,
-        keypair_factory=provider.generate_keypair,
-        install_message_factory=build_install_message,
+        enrolment_request_factory=build_enrolment_request,
+        public_key_parser=lambda response: parse_enrolment_reply(response.data),
         event_emitter=migration_mod.orchestrator_emitter(log),
         failure_threshold=0.2,
         challenge_message_factory=build_challenge_message,
