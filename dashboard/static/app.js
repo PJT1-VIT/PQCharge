@@ -296,14 +296,35 @@
     stations.forEach(function (s) { counts[s.migration_state] = (counts[s.migration_state] || 0) + 1; });
     var col = { pending: "var(--st-pending)", in_progress: "var(--st-progress)", migrated: "var(--st-migrated)",
                 rolled_back: "var(--st-rolled)", incompatible: "var(--st-incompat)" };
+    var rotated = (S.mig || {}).kind === "rotation"
+      ? stations.filter(function (s) { return rotationResult(s, S.mig) === "ok"; }).length : null;
     $("legend").innerHTML = STATES.map(function (k) {
       return '<span><i style="background:' + col[k] + '"></i>' + esc(STATE_LABEL[k]) + " " + (counts[k] || 0) + "</span>";
-    }).join("");
+    }).join("") + (rotated === null ? "" :
+      '<span><i style="background:var(--rotation)"></i>new key (rotated) ' + rotated + "</span>");
   }
+
+  // 6c (500-charger demo): above DENSE_FROM chargers each charger is a small
+  // colour square, so the whole fleet -- and a wave sweeping across it -- fits
+  // on one projector screen. The Pi keeps its large tile; click still inspects.
+  var DENSE_FROM = 100;
+  var DENSE_WAVES = { canary: 10, wave: 50 };   // the runbook's 500-charger settings
 
   function buildGrid(stations) {
     var grid = $("grid");
+    var dense = stations.length > DENSE_FROM;
     grid.innerHTML = "";
+    grid.classList.toggle("dense", dense);
+    $("gridHint").textContent = dense
+      ? "One square per charger (" + stations.length + "); hover for its id, click for its security details. " +
+        "White dot = post-quantum key verified on this connection."
+      : "Click a charger for its security details. 🔒 = TLS on this connection · ✓ = post-quantum key verified on this connection.";
+    // Large fleet: suggest the runbook's canary and wave size, unless someone already changed them.
+    if (dense && !S.wavesTouched) {
+      $("inCanary").value = DENSE_WAVES.canary;
+      $("inWave").value = DENSE_WAVES.wave;
+    }
+    S.dense = dense;
     S.tiles = {};
     stations.forEach(function (st) {
       var b = document.createElement("button");
@@ -314,6 +335,16 @@
       grid.appendChild(b);
       S.tiles[st.station_id] = b;
     });
+  }
+
+  // 6c: during (and after) a key rotation, which chargers already proved their
+  // NEW key in this rotation run -- from last_pq_check (A-F4), so it needs
+  // no extra server field. "ok" = rotated, "bad" = rotation failed (old key kept).
+  function rotationResult(st, m) {
+    if (!m || m.kind !== "rotation" || !m.started_at) return null;
+    var c = st.last_pq_check;
+    if (!c || c.trigger !== "rotation" || !c.at || new Date(c.at) < new Date(m.started_at)) return null;
+    return c.result === "success" ? "ok" : "bad";
   }
 
   function renderGrid() {
@@ -327,17 +358,25 @@
       var el = S.tiles[st.station_id];
       var on = st.connection_state === "connected";
       var pi = isPi(st);
-      var cls = "tile st-" + st.migration_state + (on ? "" : " off") + (pi ? " pi" : "");
+      // "Verified" only means something for a charger that HAS an enrolled key
+      // (pq_check_required); a legacy charger is never checked.
+      var verified = st.pq_verified && st.pq_check_required;
+      var rot = rotationResult(st, S.mig);
+      var cls = "tile st-" + st.migration_state + (on ? "" : " off") + (pi ? " pi" : "") +
+        (S.dense && verified ? " ver" : "") + (rot === "ok" ? " rot" : rot === "bad" ? " rotbad" : "");
       ["flash-good", "flash-bad"].forEach(function (f) { if (el.classList.contains(f)) cls += " " + f; });
       el.className = cls;
-      var badges = (st.tls_version ? "🔒" : "") + (st.pq_verified ? "✓" : "");
+      var badges = (st.tls_version ? "🔒" : "") + (verified ? "✓" : "");
       var label = st.station_id + ": " + STATE_LABEL[st.migration_state] + (on ? "" : ", disconnected") +
-        (st.tls_version ? ", TLS" : "") + (st.pq_verified ? ", key verified" : "");
+        (st.tls_version ? ", TLS" : "") + (verified ? ", key verified" : "") +
+        (rot === "ok" ? ", key rotated" : rot === "bad" ? ", rotation failed (old key kept)" : "");
       el.title = label;
       el.setAttribute("aria-label", label);
       if (!pi) {
-        el.innerHTML = '<span class="id">' + esc(short(st.station_id)) + '</span><span class="badges">' + badges + "</span>";
-        return;
+        if (!S.dense) {
+          el.innerHTML = '<span class="id">' + esc(short(st.station_id)) + '</span><span class="badges">' + badges + "</span>";
+        }
+        return;                                   // dense: colour (and the white dot) say it all
       }
       var frac = on && st.charging_state === "Charging" ? Math.max(0, Math.min(1, (st.power_w || 0) / MAX_W)) : 0;
       var mw = typeof st.measured_mw === "number" ? st.measured_mw.toFixed(1) + " mW" : "on the Pi's console";
@@ -387,14 +426,18 @@
       var ids = w.station_ids || [];
       var cells = ids.map(function (sid) {
         var st = byId[sid] || {};
-        return '<i class="st-' + esc(st.migration_state || "pending") + '" title="' + esc(sid) + '"></i>';
+        // 6c: in a rotation every charger stays "migrated"; colour by its rotation result instead.
+        var r = rotation ? rotationResult(st, m) : null;
+        var cls = rotation ? (r === "ok" ? "st-rotated" : r === "bad" ? "st-rolled_back" : "st-pending")
+                           : "st-" + (st.migration_state || "pending");
+        return '<i class="' + esc(cls) + '" title="' + esc(sid) + '"></i>';
       }).join("");
       var legacy = ids.filter(function (sid) { return (byId[sid] || {}).migration_state === "incompatible"; }).length;
       var res = String(w.phase || "") === "rolled_back" ? "rolled back"
         : (w.migrated_count || 0) + " ✓" + (w.failed_count ? " " + w.failed_count + " ✗" : "") +
           (legacy ? " · " + legacy + " legacy" : "");
       return '<div class="wave' + (w.phase === "rolled_back" ? " rolled" : "") + '"><span class="w">' +
-        (w.is_canary ? "Canary" : "Wave " + esc(w.wave_id)) + '</span><span class="cells">' + cells +
+        (w.is_canary ? "Canary" : "Wave " + esc(w.wave_id)) + '</span><span class="cells' + (ids.length > 20 ? " many" : "") + '">' + cells +
         '</span><span class="res">' + esc(w.phase === "queued" ? "queued" : res) + "</span></div>";
     }).join("");
 
@@ -533,6 +576,9 @@
       var w = $("selWave").value;
       control("/api/migration/rollback?wave_id=" + encodeURIComponent(w),
         function (b) { return b.reverted ? "Wave " + w + " rolled back." : "Nothing to roll back in wave " + w + "."; });
+    });
+    ["inCanary", "inWave"].forEach(function (id) {   // 6c: keep what the operator typed
+      $(id).addEventListener("input", function () { S.wavesTouched = true; });
     });
     $("inLimit").addEventListener("input", function () { $("limitOut").textContent = kw(+$("inLimit").value); });
     $("btnLimit").addEventListener("click", function () {

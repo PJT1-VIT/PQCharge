@@ -135,6 +135,27 @@ code { font-family: Consolas, "SF Mono", monospace; }
   background: #fab219; box-shadow: 0 0 14px 4px rgba(250, 178, 25, .6);
 }
 
+/* 6c: a large fleet (more than 100 chargers) is drawn as small squares */
+.grid.dense { grid-template-columns: repeat(auto-fill, minmax(17px, 1fr)); gap: 3px; }
+.grid.dense .tile { height: 17px; padding: 0; border-radius: 3px; border-width: 1px; }
+.grid.dense .tile.ver::after {
+  content: ""; position: absolute; left: 50%; top: 50%; width: 5px; height: 5px;
+  margin: -2.5px 0 0 -2.5px; border-radius: 50%; background: #f0efec;
+}
+.grid.dense .tile.off { background-image: none; }
+/* 6c: chargers that proved their NEW key in the current rotation */
+.tile.rot { border-color: var(--rotation); }
+.grid.dense .tile.rot { background: var(--rotation); }
+.tile.rotbad { border-color: var(--critical); }
+.grid.dense .tile.flash-bad { animation: flashBadSmall 1.2s ease-out; }
+.grid.dense .tile.flash-good { animation: flashGoodSmall 1.2s ease-out; }
+@keyframes flashBadSmall { 0% { box-shadow: 0 0 0 4px var(--critical); } 100% { box-shadow: 0 0 0 0 transparent; } }
+@keyframes flashGoodSmall { 0% { box-shadow: 0 0 0 3px var(--ink); } 100% { box-shadow: 0 0 0 0 transparent; } }
+.grid.dense .tile.pi {
+  grid-column: span 10; grid-row: span 6; height: auto; min-height: 0;
+  padding: 6px 8px; border-width: 2px; border-radius: 8px;
+}
+
 /* ------------------------------------------------------------ migration */
 .phase {
   font-weight: 700; padding: 2px 10px; border-radius: 6px; background: var(--surface-2);
@@ -155,6 +176,9 @@ code { font-family: Consolas, "SF Mono", monospace; }
 .wave .cells i.st-in_progress { background: var(--st-progress); }
 .wave .cells i.st-rolled_back { background: var(--st-rolled); }
 .wave .cells i.st-incompatible { background: var(--st-incompat); outline: 1px solid var(--line); }
+.wave .cells i.st-rotated { background: var(--rotation); }
+.wave .cells.many { gap: 1px; }
+.wave .cells.many i { width: 6px; height: 10px; border-radius: 1px; }   /* 6c: waves of 50 */
 .wave .res { font-variant-numeric: tabular-nums; }
 .wave.rolled { color: var(--critical); }
 .kindRotation { color: var(--rotation); font-weight: 600; }
