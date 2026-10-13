@@ -1,6 +1,6 @@
 # PQCharge — Open Items and Limitations
 
-**The single register of everything not yet resolved.** Started 2026-10-03, after the A+B+C integration. **Updated 2026-10-09:** fleet-migration audit added L26–L29. **Later, 2026-10-09 (Track B, B-P1):** L01 progress, L08 verified, L31 added. **2026-10-10 (Track B, B-P2):** L02 progress, Track B agrees to L34, L35 found and fixed, L36 added. **2026-10-10 (Track B, B-F1/F3/F4/F8):** L06 resolved; L28 B side done; L09 profile ready; L32 decided and built; L17, L29, L27, L08 moved to Accepted (FINAL 2-DAY PLAN). **B-F2:** L26 resolved (rotation with overlap window). **2026-10-11 (Track C):** work tracker added (§0); L38–L43 added; L13 and L37 updated. **2026-10-12 (Track B, B-F5 + B-F10):** L43 decided and closed; L37 decided (customData), Track B half built. **2026-10-12 (Track B, B-F1b + B-F9 prep):** orchestrator side of `InstallPQAuth` removed (merge after step 9); L42 updated; Pi set-up script. **2026-10-12 (Track B, step 16 part 1, after the step 9 re-test):** L02 and L32 closed; L01, L42, L13 updated; L20 wording corrected; steps 8 (Track B), 9 and 11 (B-F1b, PR #49) ticked; `docs/limitations.md` R4 corrected and Track B's closed items recorded there. **2026-10-12 (Track C, step 3 + L42):** C-F5 part 2 built (L38: a run started as two load generators is analysed as one); L34 agreed by A, B, C and closed; L37 closed (A-F10, PR #51, + the dashboard mock); `InstallPQAuth` removed from every track (A-F3 + C-F9, and the orchestrator's last compatibility keywords) — L42, L01 and L04 closed; steps 2, 3, 5, 11, 12 ticked. **2026-10-12 (Track C, for Track A — step 4 + register clean-up):** Stage 1 complete ✅; demo runbook v1.0 (`docs/Demo_Runbook.md`, A-F8) — step 4 ticked; L05 and L31 closed; L04 GitGuardian incident confirmed closed; L38–L40 notes updated (what is and is not checked yet). **Earlier, 2026-10-08:** every team item is agreed by A, B and C. **Contract 7 is frozen** (approved by A, B, C), so L03 (meaning of the modes) and L18 (contract approval) are resolved and removed.
+**The single register of everything not yet resolved.** Started 2026-10-03, after the A+B+C integration. **Updated 2026-10-09:** fleet-migration audit added L26–L29. **Later, 2026-10-09 (Track B, B-P1):** L01 progress, L08 verified, L31 added. **2026-10-10 (Track B, B-P2):** L02 progress, Track B agrees to L34, L35 found and fixed, L36 added. **2026-10-10 (Track B, B-F1/F3/F4/F8):** L06 resolved; L28 B side done; L09 profile ready; L32 decided and built; L17, L29, L27, L08 moved to Accepted (FINAL 2-DAY PLAN). **B-F2:** L26 resolved (rotation with overlap window). **2026-10-11 (Track C):** work tracker added (§0); L38–L43 added; L13 and L37 updated. **2026-10-12 (Track B, B-F5 + B-F10):** L43 decided and closed; L37 decided (customData), Track B half built. **2026-10-12 (Track B, B-F1b + B-F9 prep):** orchestrator side of `InstallPQAuth` removed (merge after step 9); L42 updated; Pi set-up script. **2026-10-12 (Track B, step 16 part 1, after the step 9 re-test):** L02 and L32 closed; L01, L42, L13 updated; L20 wording corrected; steps 8 (Track B), 9 and 11 (B-F1b, PR #49) ticked; `docs/limitations.md` R4 corrected and Track B's closed items recorded there. **2026-10-12 (Track C, step 3 + L42):** C-F5 part 2 built (L38: a run started as two load generators is analysed as one); L34 agreed by A, B, C and closed; L37 closed (A-F10, PR #51, + the dashboard mock); `InstallPQAuth` removed from every track (A-F3 + C-F9, and the orchestrator's last compatibility keywords) — L42, L01 and L04 closed; steps 2, 3, 5, 11, 12 ticked. **2026-10-12 (Track C, for Track A — step 4 + register clean-up):** Stage 1 complete ✅; demo runbook v1.0 (`docs/Demo_Runbook.md`, A-F8) — step 4 ticked; L05 and L31 closed; L04 GitGuardian incident confirmed closed; L38–L40 notes updated (what is and is not checked yet). **2026-10-13 (Track C, for Track A):** step 6 (A-F6) ✅ laptop side — hotspot IP 172.20.10.6, firewall, server on the LAN; Stage 2 split into software (2S: new steps 6a–6d) and hardware (2H: steps 7, 10) so the Pi no longer blocks the software fleet, the experiment runs or the results page. **Earlier, 2026-10-08:** every team item is agreed by A, B and C. **Contract 7 is frozen** (approved by A, B, C), so L03 (meaning of the modes) and L18 (contract approval) are resolved and removed.
 
 ## Rules (all three tracks)
 
@@ -36,6 +36,7 @@ Old numbers (F1, F13, F14, R11, …) differed between the dev plans; F14 meant t
 - Stages run top to bottom. A task needs everything under **Needs first**. Tasks in the same stage that do not depend on each other can run at the same time.
 - **Tests and integration come late (team decision 2026-10-11).** Build everything first (Stages 1–2). Then write the missing tests and run the A+B+C re-test (Stage 3). Then do the experiment runs (Stage 5).
 - Removing `InstallPQAuth` (A-F3, B-F1b, C-F9) waited for the re-test, as in the dev plans. The re-test passed on 2026-10-12 (step 9), and the removal was finished the same day (steps 11–12).
+- **Hardware does not block software (2026-10-13):** Stage 2 is split into 2S (software, real server, no Pi) and 2H (the Pi). Only steps 10 and 17 need the Pi.
 - Task ids are the dev plans' ids; **(new)** marks an id added here.
 - When a PR finishes a task, change ☐ to ✅ and add the PR number (rule 6).
 
@@ -51,12 +52,12 @@ Old numbers (F1, F13, F14, R11, …) differed between the dev plans; F14 meant t
 
 | # | Scene (FINAL 2-DAY PLAN storyline) | Code ready? | Still needed (step numbers below) |
 |---|---|---|---|
-| 1 | Fleet up over mutual TLS 1.3, Pi tile, security inspector | ✅ | Pi on the LAN (6, 7, 10) |
+| 1 | Fleet up over mutual TLS 1.3, Pi tile, security inspector | ✅ | Software fleet live (6b); the Pi (7, 10) |
 | 2 | Migration to hybrid while charging, canary → waves | ✅ | Live check (9) |
 | 3 | Halt: refusers mid-fleet, wave rolled back | ✅ | Halt run (13); shown once on the results page: code ✅ (3), checked on the real evidence in 15 (L38) |
 | 4 | Reconnect storm: every charger re-proves its key at boot | ✅ | Live check (9) |
 | 5 | Attack: stolen certificate → 1008; wrong identity refused (victim CP0045) | ✅ | Live check (9), rehearsal (17) |
-| 6 | Curtailment: Pi LED dims, power chart drops, mW shown | ✅ (mW number too: B-F10 + A-F10) | Pi (7, 10) |
+| 6 | Curtailment: Pi LED dims, power chart drops, mW shown | ✅ (mW number too: B-F10 + A-F10) | Fleet power part: 6b; LED and mW: the Pi (7, 10) |
 | 7 | Key rotation without disconnection | ✅ | Live rotation (9, L40) |
 | 8 | Results page: E1–E5 + S1 | ✅ (E4 certificate rows too: B-F5) | Runs (13), rebuild (15) |
 
@@ -90,18 +91,67 @@ Old numbers (F1, F13, F14, R11, …) differed between the dev plans; F14 meant t
 - **Needs first:** nothing.
 - **Unblocks:** removing L34; one sentence for Contract 7 §7.7.
 
-### Stage 2 — demo set-up (hardware and network, team together)
+### Stage 2 — demo set-up, split so the hardware does not block the software (restructured 2026-10-13)
 
-**6. A-F6 — the server on the LAN (Koshambi's laptop is the demo server)** ☐ (commands: runbook §1a and §3) · Bhargavi (A), with Koshambi
-- **What:** use a phone hotspot; add a Windows firewall rule for port 9000; run the server with `--host 0.0.0.0 --tls`.
-- **Certificates:** make new ones that include the hotspot IP: `python -m experiments.bootstrap_pki --count 50 --also CP0000 --server-san <laptop-ip>`. New certificates mean: restart the server, archive `certs\pq` and use a new `--db`.
-- **Needs first:** B-F3 ✅; the hotspot IP.
-- **Unblocks:** step 7.
+**Two tracks from here.** Software (2S) runs today, on Koshambi's laptop, with real data from the real server; no Pi needed. Hardware (2H) starts tomorrow, when the Pi is wired. The Pi is just one more charger (CP0000), so it joins whichever software fleet is running, without changing anything else. **Steps 8, 13 and 15 do not need the Pi either.**
+
+| Order | Software, today (no Pi) | Hardware, tomorrow |
+|---|---|---|
+| 1 | 6 ✅ → **6a** certificates for 500 | — |
+| 2 | **6b** software rehearsal at 50 (real data; a simulated stand-in for CP0000) | 7 Pi bring-up (needs 6, 6a) |
+| 3 | **6c** 500-charger build (needs a team OK) → **6d** software rehearsal at 500 | 10 the Pi in the live fleet (needs 7, 6b or 6d) |
+| 4 | 8 tests, 13 experiment runs → 15 results page (any time, one thing at a time on the laptop) | — |
+| 5 | 16 clean-up, 17 dress rehearsal with the Pi (needs everything) | ← |
+
+#### Stage 2S — software (today)
+
+**6. A-F6 — the server on the LAN (Koshambi's laptop is the demo server)** ✅ (2026-10-13, laptop side; done by Koshambi for Track A) · Bhargavi (A), with Koshambi
+- **Done:** iPhone hotspot (Maximize Compatibility on); laptop IP **172.20.10.6**; new certificates with that IP in the server certificate; firewall rule `pqcharge` (TCP 9000, inbound, every profile); hybrid server on `0.0.0.0:9000` over mutual TLS.
+- **Checked:** `/api/health` over `https://172.20.10.6:9000` with the Pi's own certificate → `tls: true`, `identity_check: enforce`, `boot_check: true`; a test charger as CP0000 over the IP → TLS 1.3, `identity_ok: true`, booted and charging; Safari on the iPhone reached the port (TLS refused without a client certificate — the expected answer).
+- **Left for step 7:** the Pi's own `curl` to `/api/health` — the only true test of the firewall (the laptop calling its own IP skips the inbound rule).
+- **Found:** Windows `curl.exe` (Schannel) cannot load a PEM client certificate, so the `api` helper in runbook §3 W6 and `experiments/e5_attack.md` fails on this laptop. **Working helper (PowerShell):**
+  ```powershell
+  # GET an /api path from the server with a CA-signed client certificate (Python instead of curl.exe).
+  function api($p) { $env:API_PATH = $p; python -c "import os, urllib.request, ssl; c=ssl.create_default_context(cafile='certs/root.pem'); c.load_cert_chain(certfile='certs/CP0049.crt.pem', keyfile='certs/CP0049.key.pem'); r=urllib.request.urlopen('https://localhost:9000'+os.environ['API_PATH'], context=c, timeout=10); print(r.read().decode())" }
+  ```
+- **The hotspot IP can change between days:** run `ipconfig` first; if it is not 172.20.10.6, redo the certificates (6a) and copy the Pi's three files again.
+
+**6a (new). Certificates for every run size** ☐ · Koshambi (C), 5 min, **today, before step 7 copies files to the Pi**
+- **What:** today's certificates cover only CP0001–CP0050 + CP0000, but E1/E2 run at N = 100 (step 13) and the 500-charger demo (6c) needs CP0001–CP0499. Make them once, for everything: `python -m experiments.bootstrap_pki --count 500 --also CP0000 --server-san 172.20.10.6`.
+- **Needs first:** step 6. **Stop every server first**; afterwards archive `certs\pq` and use a new `--db` (the root CA is new).
+- **Unblocks:** 6b, 6d, 7, 13.
+
+**6b (new). Software rehearsal at 50, real server, real data** ☐ · Koshambi (C), A and B welcome
+- **What:** runbook §3 and §3b exactly, except: the Pi line is replaced by a simulated stand-in for CP0000 on the laptop (same id and certificate, `--power sim`), and W6 uses the Python `api` helper above. Then scenes 1–5 and 7 on tab 8080/8081, and scene 6 without the LED (fleet power still drops and recovers).
+- **Pass:** dashboard shows 50 connected with no MOCK badge; migration canary → waves; the halt stops at wave 2 (15 / 10 / 25); storm → every migrated charger boot-checked; impostor cut off with 1008; rotation with no disconnect.
+- **Also closes L39 and L40** if: `python -m experiments.e5_check logs\<run>_events.jsonl` gives the same verdicts as the results page's E5 for the same log, and `/api/migration` rotation counts equal the `rotation_completed` / `rotation_failed` lines.
+- **Needs first:** 6a. **Unblocks:** 6d, 10, 17.
+
+**6c (new, needs a team OK). The 500-charger demo build** ☐ · B (profile), C (dashboard, runbook)
+- **Why:** to show the panel the whole fleet migrating at scale — 499 simulated chargers + the Pi. S1 showed one laptop holds 500 chargers (CPU p95 19 %, no TLS); the dashboard today draws 500 full-size tiles (a 3,300-px page, so the wave sweep cannot be seen on one screen).
+- **What:**
+  1. Track B: `tests/fixtures/fleet_profile_demo_n500.json` — CP0000 + CP0001–CP0449 capable, CP0450–CP0499 legacy (10 %).
+  2. Track C: the dashboard draws small colour squares instead of numbered tiles when the fleet has more than 100 chargers (the Pi tile stays large; click still opens the inspector).
+  3. Track C: runbook §3 variant for 500 (load generators `--n 44` + `--n 454 --start-index 46`, victim CP0045 unchanged; canary 10, waves of 50; `--watch-machine` on).
+- **Needs first:** a team OK (it changes what the panel sees), 6a.
+- **Unblocks:** 6d.
+
+**6d (new). Software rehearsal at 500** ☐ · Koshambi (C)
+- **What:** 6b at 500 chargers.
+- **Pass:** as 6b, plus the laptop not saturated (`machine_saturated` off: CPU p95 < 85 %, loop lag p95 < 50 ms) and the storm recovered within about a minute. **If not, the demo stays at 50** — every step works at both sizes.
+- **Needs first:** 6c. **Unblocks:** 17 (decides the demo size).
+
+#### Stage 2H — hardware (tomorrow; blocks only steps 10 and 17)
 
 **7. B-F9 — Pi bring-up** ☐ (commands: runbook §1b and §3; software prepared: `scripts/pi_setup.sh` does every install step below, incl. the F8 folder trap, and `python -m agent.gpio_power` checks LED + INA219 without a server) · Amal (B); the wiring is done by the team
 - **What:** install Raspberry Pi OS, clone the repo, create a venv and install `requirements.txt`. Install quantcrypt and compile it (**without** `--with-opt`), then run the 1312 check. Copy `certs/CP0000.*` and `root.pem` to the Pi. Run `bash scripts/pi_charger.sh <laptop-ip>`.
-- **Needs first:** step 6; LED + INA219 wired; `gpiozero` and the INA219 library installed on the Pi (they are not in `requirements.txt`).
+- **Needs first:** steps 6 and 6a (copy the certificates made in 6a); LED + INA219 wired; `gpiozero` and the INA219 library installed on the Pi (they are not in `requirements.txt`).
 - **Unblocks:** step 10; scenes 1 and 6. Closes L13.
+
+**10. T-3 (new) — the Pi in the live fleet** ☐ · team
+- **What:** the Pi joins over TLS. Its tile is visible. It migrates in the canary (CP0000 sorts first) and passes its boot checks. The LED dims when the limit slider is moved.
+- **Needs first:** steps 7 and 9, and a software fleet running (6b or 6d) — the Pi simply joins it.
+- **Unblocks:** step 17.
 
 ### Stage 3 — tests and integration (moved here, after building)
 
@@ -128,11 +178,6 @@ Old numbers (F1, F13, F14, R11, …) differed between the dev plans; F14 meant t
 - **Closes:** L39; L40 (live part). It is the remaining step of L01 and L02.
 - **Unblocks:** Stage 4 and step 13.
 
-**10. T-3 (new) — the Pi in the live fleet** ☐ · team
-- **What:** the Pi joins over TLS. Its tile is visible. It migrates in the canary (CP0000 sorts first) and passes its boot checks. The LED dims when the limit slider is moved.
-- **Needs first:** steps 7 and 9.
-- **Unblocks:** step 17.
-
 ### Stage 4 — remove the old key flow (after the re-test)
 
 **11. A-F3 ✅ + B-F1b ✅ (PR #49, merged after step 9) — the server and orchestrator stop using `InstallPQAuth`** · Bhargavi (A) and Amal (B). **A-F3 was done in Track C's L42 PR (2026-10-12), by team decision, together with dropping the orchestrator's last "accepted and ignored" keywords** (`keypair_factory`, `install_message_factory`, now refused) — Track A and Track B please review.
@@ -156,7 +201,7 @@ Old numbers (F1, F13, F14, R11, …) differed between the dev plans; F14 meant t
   - E3: N = 100 clean; N = 50 halt (Track A's `fake_station` CP0021–25); N = 50 rotation.
   - E5: the small run.
 - **Evidence:** only `*.jsonl` and `*.json`, into `evidence/2026-10-12_final/`, then a PR.
-- **Needs first:** Stage 4 (the runs use the final code); step 9.
+- **Needs first:** Stage 4 (the runs use the final code); step 9; 6a (certificates for N = 100). **Does not need the Pi** — can run today, but not at the same time as a rehearsal (the laptop must run one thing at a time for clean timings).
 - **Closes:** L09, L11, L40.
 - **Unblocks:** step 15.
 
