@@ -1,8 +1,17 @@
 # PQCharge — Demo Runbook (A-F8, tracker step 4)
 
-**v1.0, 2026-10-12.** Written by Track C (Koshambi) for Track A's task A-F8, from the v0.1 draft (Track A, 2026-10-11). Every command below was checked against `main` = `034bcb4` (PR #52): the flags exist and the files are where it says. Lead on the day: Bhargavi.
+**v1.1, 2026-10-13** (v1.0: 2026-10-12). Written by Track C (Koshambi) for Track A's task A-F8, from the v0.1 draft (Track A, 2026-10-11). Every command below was checked against `main`: the flags exist and the files are where it says. Lead on the day: Bhargavi.
 
-**What changed since v0.1:**
+**What changed in v1.1 (tracker steps 6–6c):**
+
+- **Every load generator now says `--crypto-mode hybrid`.** Without it the tester diary is labelled `classical` (file `<run>_n<N>_classical.jsonl`) while the server is hybrid, and the analysis flags a mode mismatch. Behaviour is unchanged; only the label.
+- **Two fleet sizes:** the 50-charger layout (§3) and the **500-charger layout** (§3c: 499 simulated chargers + the Pi). The dashboard switches to small squares above 100 chargers and pre-fills canary 10 / wave 50.
+- **`api` helper (W6) uses Python, not `curl.exe`:** Windows `curl.exe` cannot load our PEM client certificates (found in A-F6).
+- **No Pi yet?** §3 has a simulated stand-in for CP0000, so the software fleet can be rehearsed without the hardware.
+- **Certificates for up to 500 chargers** (`--count 500`), made once.
+- **Koshambi's laptop runs global Python 3.13** (no venv); the venv lines are only for machines that use one.
+
+**What changed in v1.0 (from v0.1):**
 
 - The demo laptop is decided: Koshambi's.
 - Scene 6 now shows the Pi's real milliwatts **on the dashboard tile**; L37 is closed.
@@ -16,7 +25,7 @@
 
 > **Fill in these blanks before the first rehearsal** (they are marked **⟦like this⟧**):
 > - **Demo laptop:** Koshambi's Windows laptop (decided). Commands are **PowerShell**. On a Mac, use `/` for `\` and `curl` for `curl.exe`, and skip the firewall step.
-> - ⟦LAPTOP-IP⟧: the laptop's IP on the phone hotspot.
+> - ⟦LAPTOP-IP⟧: the laptop's IP on the phone hotspot (iPhone hotspot, 13 Oct: **172.20.10.6** — check with `ipconfig` each day; if it changed, redo the certificates and copy them to the Pi again).
 > - ⟦PI-USER@PI⟧: how we SSH into the Pi (e.g. `pi@raspberrypi.local`).
 > - ⟦PI-REPO⟧: the repo folder on the Pi (e.g. `~/PQCharge`).
 > - ⟦RUN⟧: a new name per rehearsal (`demo1`, `demo2`, `final`).
@@ -28,7 +37,7 @@
 
 | # | Scene | ~min | Shown on | Proves |
 |---|---|---|---|---|
-| 1 | Fleet up: 49 chargers + the Pi (CP0000), mutual TLS 1.3 | 1.5 | Dashboard (tab 8080) | Classical baseline; real hardware in the fleet |
+| 1 | Fleet up: 49 (or 499) simulated chargers + the Pi (CP0000), mutual TLS 1.3 | 1.5 | Dashboard (tab 8080) | Classical baseline; real hardware in the fleet |
 | 2 | Migration to hybrid (canary → waves) | 2 | Dashboard + W5 | Live migration, sessions not lost (core claim) |
 | 3 | Halt: a bad wave is rolled back, the migration stops | 1.5 | Dashboard (tab 8081) | Safety: threshold, rollback, halt |
 | 4 | Reconnect storm: every charger re-proves its key | 1.5 | Dashboard | Hybrid = a real check at every boot |
@@ -40,6 +49,7 @@
 - **Driver** (types commands): Bhargavi.
 - **Narrator** (talks to the panel): ⟦name⟧.
 - **Pi minder** (watches the Pi console and the LED): ⟦name⟧.
+- **Fleet size:** 50 (§3) or 500 (§3c). Decided by the 500-charger rehearsal (tracker step 6d): 500 if the laptop is not saturated, else 50. Every scene works at both sizes; scene 3 (halt) always uses its own 50-charger fleet.
 
 ---
 
@@ -50,7 +60,7 @@
 ```powershell
 # Get the frozen code (tag v1.0 after CP4; main until then).
 git checkout main; git pull origin main
-# Turn on the project's Python environment (do this in EVERY window).
+# ONLY if this machine uses a venv: turn it on (do this in EVERY window). Koshambi's laptop uses global Python 3.13: skip.
 .\.venv\Scripts\Activate.ps1
 # Must print 3.13.x (L05: every track is on 3.13).
 python --version
@@ -64,8 +74,8 @@ ipconfig
 
 **Certificates.** This makes a **new** root CA, so run it **once** and copy to the Pi afterwards:
 ```powershell
-# Certificates for CP0001-CP0050 + the Pi (CP0000); the server certificate also covers the hotspot IP.
-python -m experiments.bootstrap_pki --count 50 --also CP0000 --server-san ⟦LAPTOP-IP⟧
+# Certificates for CP0001-CP0500 (both fleet sizes and the N = 100 experiment runs) + the Pi (CP0000); the server certificate also covers the hotspot IP.
+python -m experiments.bootstrap_pki --count 500 --also CP0000 --server-san ⟦LAPTOP-IP⟧
 ```
 
 **Firewall** (once, in an **admin** PowerShell):
@@ -139,7 +149,7 @@ Then pick a **new** ⟦RUN⟧ name, so the server gets a new `--db` and new log 
 | **H1**, **H2a–c**, **H3** | Halt server (port 9001), its fleet, its proxy on `8081` | §3b |
 | **Pi** | CP0000 (SSH session or the Pi's own screen) | §3 |
 
-In **every** PowerShell window: `cd <repo>` then `.\.venv\Scripts\Activate.ps1`.
+In **every** PowerShell window: `cd <repo>` (and, only on a machine with a venv, `.\.venv\Scripts\Activate.ps1`).
 
 ---
 
@@ -159,11 +169,11 @@ Get-Content logs\⟦RUN⟧_server.log -Tail 5
 **W2 and W2b, the fleet.** Both use the same experiment name plus `_legacy`, so the analysis can join them (L38):
 ```powershell
 # 44 simulated chargers CP0001-CP0044, ML-DSA capable, charging for 40 min, quick reconnects, watching the fleet.
-python -m harness.load_generator --n 44 --experiment ⟦RUN⟧ --csms-url wss://localhost:9000 --cert-dir certs --pq-key-dir certs\pq --charge-for 2400 --reconnect-max-delay 5 --watch-fleet https://localhost:9000/api/fleet --watch-every 2
+python -m harness.load_generator --n 44 --experiment ⟦RUN⟧ --csms-url wss://localhost:9000 --cert-dir certs --crypto-mode hybrid --pq-key-dir certs\pq --charge-for 2400 --reconnect-max-delay 5 --watch-fleet https://localhost:9000/api/fleet --watch-every 2
 ```
 ```powershell
 # 4 legacy chargers CP0046-CP0049 (the profile marks them classical-only, so the migration skips them).
-python -m harness.load_generator --n 4 --start-index 46 --experiment ⟦RUN⟧_legacy --csms-url wss://localhost:9000 --cert-dir certs --pq-key-dir certs\pq --charge-for 2400 --reconnect-max-delay 5
+python -m harness.load_generator --n 4 --start-index 46 --experiment ⟦RUN⟧_legacy --csms-url wss://localhost:9000 --cert-dir certs --crypto-mode hybrid --pq-key-dir certs\pq --charge-for 2400 --reconnect-max-delay 5
 ```
 
 **W3, the victim CP0045:**
@@ -178,6 +188,13 @@ python -m agent.station --station-id CP0045 --csms-url wss://localhost:9000 --ce
 python -m agent.station --station-id CP0000 --csms-url wss://⟦LAPTOP-IP⟧:9000 --cert-dir certs --power gpio --pq-key-dir certs/pq --crypto-mode hybrid --supported-algorithms ECDSA-P256,ML-DSA-44 --charge-for 3600 --reconnect-max-delay 5
 ```
 This is `scripts/pi_charger.sh` plus `--reconnect-max-delay 5`; without it, the Pi can take about 30 s to come back in scene 4. The LED lights when the Pi starts charging.
+
+**No Pi yet (software rehearsal, tracker step 6b/6d)** — run a simulated stand-in on the laptop instead, in its own window:
+```powershell
+# Simulated CP0000 (same id and certificate as the Pi, simulated power) so the fleet and the big Pi tile are complete.
+python -m agent.station --station-id CP0000 --csms-url wss://localhost:9000 --cert-dir certs --pq-key-dir certs\pq --crypto-mode hybrid --charge-for 2400 --reconnect-max-delay 5
+```
+Its tile says "measured: on the Pi's console" (no INA219). **Before the real Pi joins, reset the state (§1c):** the stand-in enrols its own key, and a server that still holds it would cut off the real Pi with 1008.
 
 **W4, dashboard proxy (main):**
 ```powershell
@@ -194,12 +211,13 @@ python -m harness.watch_migration --url https://localhost:9000 --cert-dir certs
 **W6, command helper:**
 ```powershell
 # Defines `api`: a GET to the server with a CA-signed client certificate (L08: any station certificate opens /api).
-function api($p) { curl.exe -s --cacert certs\root.pem --cert certs\CP0049.crt.pem --key certs\CP0049.key.pem "https://localhost:9000$p" }
+# Python, not curl.exe: Windows curl.exe (Schannel) cannot load our PEM client certificates.
+function api($p) { $env:API_PATH = $p; python -c "import os, urllib.request, ssl; c=ssl.create_default_context(cafile='certs/root.pem'); c.load_cert_chain(certfile='certs/CP0049.crt.pem', keyfile='certs/CP0049.key.pem'); r=urllib.request.urlopen('https://localhost:9000'+os.environ['API_PATH'], context=c, timeout=10); print(r.read().decode())" }
 # Server settings: expect "tls": true, "identity_check": "enforce", "boot_check": true, "pq_algorithm": "ML-DSA-44".
 api "/api/health"
 ```
 
-**Ready when** tab 8080 shows **50 connected, 50 charging**, and the Pi tile (CP0000, three columns wide) shows "measured: NN mW". The header must say Mode hybrid, TLS 🔒 TLSv1.3, Identity check enforce, Boot key check on, and must not show a **MOCK** badge.
+**Ready when** tab 8080 shows **50 connected, 50 charging** (500 with §3c), and the Pi tile (CP0000, three columns wide) shows "measured: NN mW". The header must say Mode hybrid, TLS 🔒 TLSv1.3, Identity check enforce, Boot key check on, and must not show a **MOCK** badge.
 
 ### 3b. The halt server (H1–H3); start it before the panel arrives
 
@@ -213,7 +231,7 @@ cmd /c "python -m csms.server --port 9001 --tls --mode hybrid --db logs\⟦RUN�
 **H2a, H2b, H2c** (one window each):
 ```powershell
 # Halt fleet part 1: CP0001-CP0020.
-python -m harness.load_generator --n 20 --experiment halt_⟦RUN⟧ --csms-url wss://localhost:9001 --cert-dir certs --pq-key-dir certs\pq_halt --charge-for 2400
+python -m harness.load_generator --n 20 --experiment halt_⟦RUN⟧ --csms-url wss://localhost:9001 --cert-dir certs --crypto-mode hybrid --pq-key-dir certs\pq_halt --charge-for 2400
 ```
 ```powershell
 # Track A's 5 refusers CP0021-CP0025 over TLS: they answer the enrolment request with UnknownVendorId.
@@ -221,7 +239,7 @@ python -m tests.fixtures.fake_station CP0021 CP0022 CP0023 CP0024 CP0025 --tls -
 ```
 ```powershell
 # Halt fleet part 2: CP0026-CP0050 (same experiment name, so it is analysed as one run with part 1).
-python -m harness.load_generator --n 25 --start-index 26 --experiment halt_⟦RUN⟧ --csms-url wss://localhost:9001 --cert-dir certs --pq-key-dir certs\pq_halt --charge-for 2400
+python -m harness.load_generator --n 25 --start-index 26 --experiment halt_⟦RUN⟧ --csms-url wss://localhost:9001 --cert-dir certs --crypto-mode hybrid --pq-key-dir certs\pq_halt --charge-for 2400
 ```
 **H3, its dashboard proxy:**
 ```powershell
@@ -229,6 +247,38 @@ python -m harness.load_generator --n 25 --start-index 26 --experiment halt_⟦RU
 python -m dashboard.serve --api https://localhost:9001 --cert-dir certs --port 8081
 ```
 Tab 8081 should show 50 connected.
+
+### 3c. The 500-charger layout (499 simulated + the Pi) — tracker steps 6c/6d
+
+Same windows as §3, with **three** changes. Everything else (W3 victim CP0045, the Pi or its stand-in, W4, W5, W6, the halt server §3b) is unchanged.
+
+**W1** — the 500-charger profile (CP0000 + CP0001–CP0449 capable, CP0450–CP0499 legacy):
+```powershell
+# Hybrid server over mutual TLS for the 500-charger demo fleet; output goes to a log file.
+cmd /c "python -m csms.server --host 0.0.0.0 --port 9000 --tls --mode hybrid --db logs\⟦RUN⟧.db --log logs\⟦RUN⟧_events.jsonl --fleet-profile tests\fixtures\fleet_profile_demo_n500.json --ws-ping-interval 0 > logs\⟦RUN⟧_server.log 2>&1"
+```
+**W2** — CP0001–CP0044 (no `--watch-fleet` at this size: 500-charger snapshots every 2 s would make a diary of hundreds of MB, L33):
+```powershell
+# 44 simulated chargers CP0001-CP0044, charging for 40 min, quick reconnects.
+python -m harness.load_generator --n 44 --experiment ⟦RUN⟧ --csms-url wss://localhost:9000 --cert-dir certs --crypto-mode hybrid --pq-key-dir certs\pq --charge-for 2400 --reconnect-max-delay 5
+```
+**W2b** — CP0046–CP0499 (CP0450–0499 are the legacy chargers), with the laptop's CPU and lag recorded:
+```powershell
+# 454 simulated chargers CP0046-CP0499, staggered start, and machine readings (CPU, memory, loop lag) in the diary.
+python -m harness.load_generator --n 454 --start-index 46 --experiment ⟦RUN⟧_b --csms-url wss://localhost:9000 --cert-dir certs --crypto-mode hybrid --pq-key-dir certs\pq --charge-for 2400 --reconnect-max-delay 5 --watch-machine
+```
+The two load generators share the experiment name (`⟦RUN⟧` / `⟦RUN⟧_b`), so the analysis joins them into one run (L38).
+
+**Ready when** tab 8080 shows **500 connected** (499 + the Pi or its stand-in), the fleet as small squares, and Controls pre-filled with **canary 10, wave size 50**.
+
+**Measured on a 2-core Linux test machine (13 Oct, 499 chargers over TLS, hybrid):** all 499 connected within about a minute; the migration (449 chargers, canary 10, waves of 50) finished in **about 5 s**; a server restart (scene 4) had all 499 back and boot-checked within **about 10 s**; a key rotation took **about 10 s**. **Not yet measured on the Windows demo laptop: that is step 6d.**
+
+**After the 500 rehearsal, check the laptop was not saturated:**
+```powershell
+# Analyse the 500-charger run (main server log + both diaries); its summary line shows machine CPU p95 and loop lag p95, and "SATURATED" if over the limits.
+python -m analysis.run --events logs\⟦RUN⟧_events.jsonl --harness-log logs\⟦RUN⟧_n44_hybrid.jsonl --harness-log logs\⟦RUN⟧_b_n454_hybrid.jsonl --out analysis\output_⟦RUN⟧
+```
+**Saturated, or the dashboard lags behind → use the 50-charger layout (§3) for the demo.**
 
 ---
 
@@ -248,7 +298,8 @@ For each scene: **Do**, then **See**, then **Say**, then **If not**.
   - The cipher is blank, or the page will not load: you are on `:9000/dashboard/` directly. Use the proxy tab `:8080`.
 
 ### Scene 2 — Migration to hybrid (tab 8080)
-- **Do:** Start migration (canary **5**, wave **10**).
+- **Do:** Start migration (canary **5**, wave **10**; at 500 chargers the dashboard pre-fills canary **10**, wave **50**).
+- **At 500:** the whole migration takes only a few seconds, so **say the "Say" line first, then press the button**; for a slower sweep use wave size **25**.
 - **See:**
   - The Pi is in the canary (CP0000 sorts first).
   - Tiles turn amber, then green, wave by wave.
@@ -320,8 +371,9 @@ For each scene: **Do**, then **See**, then **Say**, then **If not**.
 ### Scene 7 — Key rotation (tab 8080)
 - **Do:**
   1. **First restart W5** (the W5 command in §3); it exited after scene 2. Open it **before** pressing the button (L41).
-  2. Press Rotate keys (canary 5, wave 10).
+  2. Press Rotate keys (canary 5, wave 10; at 500: canary 10, wave 50).
 - **See:**
+  - Tiles (or squares) turn **purple** wave by wave as each charger proves its new key; the legend counts "new key (rotated)", and the wave rows fill purple.
   - The ticker shows "↻ CP00xx key rotated · `aaaa…` → `bbbb…` · no disconnect" per charger.
   - The inspector's `pq_key_id` changes.
   - W5 turns letters into **N** (new key).
@@ -388,6 +440,8 @@ For each scene: **Do**, then **See**, then **Say**, then **If not**.
 | Server refuses to start: "--mode hybrid needs post-quantum migration" | The 1312 check fails on this laptop (quantcrypt engine): fix it with the quantcrypt steps in the dev plans |
 | Everyone closed with `pq_auth_failed` after a restart | Key folder and `--db` don't match: reset both (§5) |
 | W5 shows "waiting for a NEW migration" | Normal after a migration ended: it waits for the next one (scene 7) |
+| `api` prints nothing / curl errors about the certificate | Use the Python `api` helper (§3 W6): Windows `curl.exe` cannot load PEM client certificates |
+| 500 chargers: dashboard updates lag, or Task Manager shows CPU near 100 % | Fall back to the 50-charger layout (§3): stop everything, reset (§5), start §3 |
 | Projector or dashboard dies | Narrate from **W5** (console migration view) and W6 `api "/api/fleet"` |
 
 ---

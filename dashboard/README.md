@@ -19,6 +19,14 @@ from `static/vendor/` (a copy of `analysis/web/vendor/`, Apache 2.0).
 On a projector: full screen (F11) and browser zoom to taste; the layout stacks
 below 1100 px wide.
 
+**Large fleets (tracker step 6c):** above 100 chargers each charger is drawn as
+a small colour square, so the whole fleet fits on one screen (a white dot =
+post-quantum key verified on this connection; purple = new key proven in the
+current key rotation). The Pi keeps its large tile, and Controls are pre-filled
+with canary 10 / wave size 50. Rehearse it with `python -m dashboard.serve
+--mock --mock-n 499` (the mock then follows `fleet_profile_demo_n500.json`:
+CP0450–CP0499 legacy).
+
 ## What it reads (GET only)
 
 - `/api/fleet` every 1 s: every charger + the migration status (Contract 6/4).

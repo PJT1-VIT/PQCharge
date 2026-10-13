@@ -63,6 +63,8 @@ ALGORITHM = "ML-DSA-44"
 MAX_POWER_W = 7400.0
 PI_ID = "CP0000"              # Track A/B: the Pi's id (a dashed id breaks fleet profiles)
 LEGACY_IDS = range(46, 50)    # CP0046-CP0049, as in fleet_profile_demo.json
+LEGACY_IDS_N500 = range(450, 500)   # CP0450-CP0499, as in fleet_profile_demo_n500.json (6c)
+LARGE_FLEET = 100             # above this many chargers the mock follows the 500-charger profile
 VICTIM_ID = "CP0045"          # E5 victim in the demo fleet (experiments/e5_attack.md)
 PI_MAX_MW = 25.0              # what the LED circuit draws at full brightness (made up)
 STEP_S = 0.25                 # one charger handled per step during a wave
@@ -107,7 +109,9 @@ class MockFleet:
             # The demo fleet (fleet_profile_demo.json). The Pi first: its id
             # sorts first, so the real orchestrator puts it in the canary.
             ids = [PI_ID] + [f"CP{i:04d}" for i in range(1, n + 1)]
-            self.legacy = {f"CP{i:04d}" for i in LEGACY_IDS}
+            # 6c: --mock-n 499 rehearses the 500-charger demo (fleet_profile_demo_n500.json).
+            legacy_ids = LEGACY_IDS_N500 if n > LARGE_FLEET else LEGACY_IDS
+            self.legacy = {f"CP{i:04d}" for i in legacy_ids}
         self.refusers = {f"CP{i:04d}" for i in range(21, 26)} if halt else set()
         self.stations: dict[str, dict[str, Any]] = {}
         for k, sid in enumerate(ids):
@@ -409,8 +413,14 @@ class MockFleet:
             wave = self.status["waves"][w]
             ids = wave["station_ids"]
             if self._cursor < len(ids):
-                self._handle_one(ids[self._cursor], w, wave)
-                self._cursor += 1
+                # The real orchestrator handles a wave's chargers concurrently;
+                # the mock walks through them, a tenth of the wave per step
+                # (one at a time for small waves), so a wave of 50 takes ~2.5 s.
+                for _ in range(max(1, len(ids) // 10)):
+                    if self._cursor >= len(ids):
+                        break
+                    self._handle_one(ids[self._cursor], w, wave)
+                    self._cursor += 1
                 continue
             self._finish_wave(w, wave)
 

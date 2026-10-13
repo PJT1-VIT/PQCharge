@@ -1,0 +1,25 @@
+{
+  "description": "500-charger demo fleet (tracker step 6c, agreed by A, B and C on 2026-10-13): 499 simulated chargers + the Raspberry Pi. CP0000: the PHYSICAL charger (Raspberry Pi, GPIOPower), ML-DSA capable; its id sorts first, so with canary_count >= 1 the Pi is migrated in the canary. CP0001-CP0449: Track C agents, ML-DSA capable (CP0045 is the E5 victim and runs in its own window). CP0450-CP0499: Track C agents declared LEGACY (skipped as incompatible - the heterogeneous fleet, 10 %). Run: load_generator --n 44 (CP0001-0044) and --n 454 --start-index 46 (CP0046-0499), agent.station CP0045, the Pi CP0000. Suggested: canary_count 10, wave_size 50. Same structure as fleet_profile_demo.json (the 50-charger demo).",
+  "groups": [
+    {
+      "stations": "CP0000",
+      "supported_algorithms": [
+        "ECDSA-P256",
+        "ML-DSA-44"
+      ]
+    },
+    {
+      "stations": "CP0001-CP0449",
+      "supported_algorithms": [
+        "ECDSA-P256",
+        "ML-DSA-44"
+      ]
+    },
+    {
+      "stations": "CP0450-CP0499",
+      "supported_algorithms": [
+        "ECDSA-P256"
+      ]
+    }
+  ]
+}
