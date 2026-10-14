@@ -112,6 +112,11 @@ def mock_api(mock: MockFleet, path: str, query: dict[str, list[str]]) -> tuple[i
         return mock.storm(_q(query, "outage_s", 3.0, float))
     if path == "/api/mock/impostor":
         return mock.impostor(_q(query, "station_id", VICTIM_ID, str))
+    if path == "/api/mock/intruder":
+        return mock.intruder()
+    if path == "/api/mock/wrong-identity":
+        return mock.wrong_identity(_q(query, "station_id", VICTIM_ID, str),
+                                   _q(query, "cert_for", "CP0004", str))
     return 404, {"error": "unknown path", "path": path}
 
 
@@ -200,6 +205,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mock-no-tls", action="store_true")
     p.add_argument("--mock-halt", action="store_true",
                    help="CP0021-CP0025 refuse their key: the wave rolls back and the migration halts")
+    p.add_argument("--mock-connect-s", type=float, default=8.0,
+                   help="chargers connect one by one over this many seconds (0 = all at once)")
     p.add_argument("--cert-dir", default="certs", help="TLS --api only")
     p.add_argument("--cert-station", default="CP0001", help="TLS --api only (L08 stand-in)")
     return p
@@ -210,7 +217,7 @@ def main(argv: list[str] | None = None) -> int:
     mock = None
     if args.mock:
         mock = MockFleet(n=args.mock_n, mode=args.mock_mode, tls=not args.mock_no_tls,
-                         halt=args.mock_halt)
+                         halt=args.mock_halt, connect_over_s=args.mock_connect_s)
     ssl_context = None if args.mock else _ssl_for(args.api, args.cert_dir, args.cert_station)
     handler = make_handler(mock=mock, api=args.api, ssl_context=ssl_context)
     httpd = ThreadingHTTPServer((args.host, args.port), handler)

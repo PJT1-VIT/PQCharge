@@ -11,6 +11,11 @@ THE HARDWARE (wired by the team, out of scope here)
         contactor closed  -> LED on
         power limit       -> LED brightness (PWM duty = limit / max power)
         contactor open    -> LED off
+        being migrated    -> LED blinks for MIGRATION_BLINK_S seconds, then
+                             returns to the above (2026-10-14, runbook V2:
+                             agent/station.py calls indicate_migration() when
+                             a RequestPQEnrolment arrives -- migration or key
+                             rotation, never a boot check)
   - an INA219 current/voltage sensor on I2C (address 0x40 by default),
     measuring the LED circuit -- tens of milliwatts.
 
@@ -41,6 +46,7 @@ create the venv with --system-site-packages). I2C must be enabled
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from typing import Any, Callable
 
@@ -58,6 +64,14 @@ DEFAULT_INA219_ADDRESS = 0x40
 
 LOG_EVERY_S = 5.0
 """How often the raw INA219 reading is logged on the Pi's console."""
+
+MIGRATION_BLINK_S = 3.0
+"""How long the LED blinks when the Pi is migrated or its key is rotated. A
+real enrolment takes ~0.1 s -- far too short to see -- so the blink has a
+fixed, visible length."""
+
+MIGRATION_BLINK_PERIOD_S = 0.3
+"""One on + off cycle of the blink."""
 
 
 class GPIOPowerUnavailable(RuntimeError):
@@ -97,10 +111,15 @@ class GPIOPower(SimulatedPower):
         led_factory: Callable[[int], Any] | None = None,
         sensor_factory: Callable[[float, int], Any] | None = None,
         clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         super().__init__(max_power_w=max_power_w)
         self._led = (led_factory or _default_led)(led_pin)
         self._clock = clock
+        self._sleep = sleep
+        self._blink_lock = threading.Lock()
+        self._blink_until = float("-inf")
+        self._blinker: threading.Thread | None = None
         self._last_log = float("-inf")
         try:
             self._sensor = (sensor_factory or _default_sensor)(shunt_ohms, ina219_address)
@@ -122,7 +141,42 @@ class GPIOPower(SimulatedPower):
         return max(0.0, min(1.0, self._draw_w() / self._max_power_w))
 
     def _apply_led(self) -> None:
+        if self.blinking:
+            return                    # the blink thread restores the right value when it ends
         self._led.value = self.duty
+
+    # -- runbook V2: the LED blinks while the Pi is being migrated ----------
+
+    @property
+    def blinking(self) -> bool:
+        return self._clock() < self._blink_until
+
+    def indicate_migration(self, seconds: float = MIGRATION_BLINK_S) -> None:
+        """
+        Blink the LED for `seconds` (called by agent/station.py when a
+        RequestPQEnrolment arrives). A second call while blinking extends
+        the blink. Returns at once: the blink runs on a small daemon
+        thread, then sets the LED back to what the contactor and the power
+        limit say -- including any limit changed during the blink.
+        """
+        with self._blink_lock:
+            self._blink_until = max(self._blink_until, self._clock() + seconds)
+            if self._blinker is not None and self._blinker.is_alive():
+                return
+            self._blinker = threading.Thread(target=self._blink, name="led-blink", daemon=True)
+            self._blinker.start()
+        LOG.info("LED blinking: this charger is being migrated (%.1f s)", seconds)
+
+    def _blink(self) -> None:
+        on = False
+        try:
+            while self.blinking:
+                on = not on
+                # Blink at the charging brightness; full brightness if not charging.
+                self._led.value = (self.duty or 1.0) if on else 0.0
+                self._sleep(MIGRATION_BLINK_PERIOD_S / 2)
+        finally:
+            self._led.value = self.duty
 
     def close_contactor(self) -> None:
         super().close_contactor()

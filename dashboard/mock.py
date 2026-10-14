@@ -26,6 +26,17 @@ same JSON shapes:
     /api/mock/storm                every charger reconnects and re-proves its key
     /api/mock/impostor             a stolen certificate without the ML-DSA key
                                    (CP0045: the demo victim, experiments/e5_attack.md)
+    /api/mock/intruder             a forged certificate refused at the TLS handshake
+                                   (the real server's connection_failed / tls_rejected
+                                   line, added 2026-10-14; no charger id is known)
+    /api/mock/wrong-identity       CP0045 presents CP0004's certificate: the
+                                   identity check refuses it (1008)
+
+connect_over_s > 0 (what `python -m dashboard.serve --mock` uses): the chargers
+are provisioned but "never_seen" at first, connect one after another over that
+many seconds, and start charging CHARGE_DELAY_S after connecting -- so the page
+shows its empty state, then tiles popping in, then turning green. The default 0
+keeps the old behaviour (everything connected and charging at once).
 
 NOTHING HERE IS A RESULT. Times and key ids are invented. The page shows a
 large "MOCK" badge whenever /api/health says mock, so a screenshot of it can
@@ -68,6 +79,7 @@ LARGE_FLEET = 100             # above this many chargers the mock follows the 50
 VICTIM_ID = "CP0045"          # E5 victim in the demo fleet (experiments/e5_attack.md)
 PI_MAX_MW = 25.0              # what the LED circuit draws at full brightness (made up)
 STEP_S = 0.25                 # one charger handled per step during a wave
+CHARGE_DELAY_S = 1.5          # connect_over_s > 0: charging starts this long after connecting
 FAILURE_THRESHOLD = 0.2
 EVENT_BUFFER = 2000
 
@@ -84,7 +96,7 @@ class MockFleet:
     """The whole pretend server. Thread-safe: every public method locks."""
 
     def __init__(self, *, n: int = 49, mode: str = "hybrid", tls: bool = True,
-                 halt: bool = False, seed: int = 7,
+                 halt: bool = False, seed: int = 7, connect_over_s: float = 0.0,
                  clock: Callable[[], float] = time.time) -> None:
         self.clock = clock
         self.mode = mode
@@ -114,8 +126,14 @@ class MockFleet:
             self.legacy = {f"CP{i:04d}" for i in legacy_ids}
         self.refusers = {f"CP{i:04d}" for i in range(21, 26)} if halt else set()
         self.stations: dict[str, dict[str, Any]] = {}
+        self._connect_at: dict[str, float] = {}    # connect_over_s > 0: when each one connects
+        self._charge_at: dict[str, float] = {}     # ... and when it starts charging
         for k, sid in enumerate(ids):
             self.stations[sid] = self._new_station(sid, k)
+            if connect_over_s > 0:
+                self._never_seen(self.stations[sid])
+                self._connect_at[sid] = self.started + connect_over_s * k / max(1, len(ids) - 1)
+                continue
             self._emit("connection_established", sid, outcome="success",
                        handshake_scope="server_upgrade",
                        tls_version="TLSv1.3" if tls else None)
@@ -175,6 +193,30 @@ class MockFleet:
         st["measured_mw"] = PI_MAX_MW if sid == PI_ID else None
         st["power_source"] = "scaled" if sid == PI_ID else None
         return st
+
+    def _never_seen(self, st: dict[str, Any]) -> None:
+        """Provisioned but not connected yet (the real server's "never_seen")."""
+        st.update(connection_state="never_seen", boot_accepted=False, connected_since=None,
+                  last_seen_at=None, last_heartbeat_at=None, seconds_since_heartbeat=None,
+                  last_handshake_ms=None, ocpp_status=None, charging_state=None,
+                  active_transaction_id=None, power_w=0.0, tls_version=None, tls_cipher=None,
+                  peer_cert_bytes=None, identity_ok=None)
+        if st["station_id"] == PI_ID:
+            st["measured_mw"] = 0.0
+
+    def _connect(self, sid: str, now: float) -> None:
+        st = self.stations[sid]
+        st.update(connection_state="connected", boot_accepted=True, connected_since=_iso(now),
+                  last_seen_at=_iso(now), last_heartbeat_at=_iso(now), seconds_since_heartbeat=1.0,
+                  last_handshake_ms=round(0.3 + self.rng.random() * 0.2, 3), ocpp_status="Available",
+                  tls_version="TLSv1.3" if self.tls else None,
+                  tls_cipher="TLS_AES_256_GCM_SHA384" if self.tls else None,
+                  peer_cert_bytes=612 if self.tls else None,
+                  identity_ok=True if self.tls else None)
+        self._emit("connection_established", sid, outcome="success", handshake_scope="server_upgrade",
+                   tls_version="TLSv1.3" if self.tls else None)
+        self._emit("state_changed", sid, outcome="success", transition="booted")
+        self._charge_at[sid] = now + CHARGE_DELAY_S
 
     def _idle_status(self, kind: str = "migration") -> dict[str, Any]:
         return {
@@ -361,6 +403,28 @@ class MockFleet:
             self._impostor_next = self.clock()
             return 200, {"ok": True, "station_id": station_id}
 
+    def intruder(self) -> tuple[int, dict[str, Any]]:
+        """A device with a certificate our CA never signed: refused during TLS.
+
+        Same line as the real server writes (csms/server.py _tls_refused): no
+        station id -- the handshake failed before the charger could say who it is.
+        """
+        with self.lock:
+            self._emit("connection_failed", None, outcome="rejected", reason="tls_rejected",
+                       tls_error="CERTIFICATE_VERIFY_FAILED",
+                       detail="certificate not signed by our CA (forged, or from an old CA)",
+                       tls_detail="certificate verify failed: unable to get local issuer certificate")
+            return 200, {"ok": True}
+
+    def wrong_identity(self, station_id: str = VICTIM_ID,
+                       cert_for: str = "CP0004") -> tuple[int, dict[str, Any]]:
+        """station_id connects with cert_for's certificate: the identity check refuses it."""
+        with self.lock:
+            self._emit("connection_attempt", station_id, outcome="rejected",
+                       transition="identity_check", certificate_common_name=cert_for,
+                       identity_matches=False, identity_check="enforce" if self.tls else "off")
+            return 200, {"ok": True, "station_id": station_id, "certificate_of": cert_for}
+
     # =================================================================
     # time passes
     # =================================================================
@@ -368,11 +432,26 @@ class MockFleet:
     def tick(self) -> None:
         with self.lock:
             now = self.clock()
+            self._tick_connect(now)
             self._tick_energy(now)
             self._tick_waves(now)
             self._tick_storm(now)
             self._tick_impostor(now)
             self._recount()
+
+    def _tick_connect(self, now: float) -> None:
+        for sid, at in list(self._connect_at.items()):
+            if now >= at:
+                del self._connect_at[sid]
+                if self.stations[sid]["connection_state"] == "never_seen":
+                    self._connect(sid, at)        # at its scheduled time, even if polled later
+        for sid, at in list(self._charge_at.items()):
+            if now >= at:
+                del self._charge_at[sid]
+                st = self.stations[sid]
+                if st["connection_state"] == "connected":
+                    st.update(charging_state="Charging", ocpp_status="Occupied",
+                              active_transaction_id=f"tx-{sid}")
 
     def _apply_power(self, st: dict[str, Any]) -> None:
         cap = MAX_POWER_W if self.limit_w is None else min(MAX_POWER_W, self.limit_w)

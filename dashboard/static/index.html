@@ -9,15 +9,16 @@
 </head>
 <body>
 <!--
-  PQCharge live dashboard (Track C, C-F6). Reads only GET /api/... on the
-  server that serves this page: the CSMS itself (/dashboard/, Track A A-F4)
-  or `python -m dashboard.serve` (pass-through or --mock). No build step.
+  PQCharge live dashboard (Track C; C-F6, redesigned 2026-10-14 for the runbook
+  variants V1-V8). Reads only GET /api/... on the server that serves this page:
+  the CSMS itself (/dashboard/, Track A A-F4) or `python -m dashboard.serve`
+  (pass-through, or --mock). No build step.
 -->
 <header class="top">
   <div class="brand">
     <span class="logo" aria-hidden="true">⚡</span>
     <div>
-      <h1>PQCharge · live fleet</h1>
+      <h1>PQCharge <span class="thin">· live fleet</span></h1>
       <p class="sub" id="serverLine">connecting…</p>
     </div>
     <span class="mockBadge" id="mockBadge" hidden>MOCK DATA · not a measurement</span>
@@ -26,22 +27,32 @@
   <div class="counts" id="counts"></div>
 </header>
 
+<div class="alertBar" id="alertBar" role="alert" hidden></div>
+
 <main class="layout">
   <section class="panel fleet" aria-labelledby="hFleet">
     <div class="panelHead">
       <h2 id="hFleet">Fleet</h2>
-      <div class="legend" id="legend"></div>
+      <ol class="stepper" id="stepper" aria-label="migration stage"></ol>
+    </div>
+    <div class="legend" id="legend"></div>
+    <div class="empty" id="empty">
+      <div class="radar" aria-hidden="true"><span></span><span></span><span></span></div>
+      <p class="emptyTitle">No chargers connected</p>
+      <p class="sub">Tiles appear here, one per charger, the moment a charger connects —
+        start the fleet (runbook V1).</p>
     </div>
     <div class="grid" id="grid" role="list"></div>
-    <p class="hint" id="gridHint">Click a charger for its security details. 🔒 = TLS on this connection · ✓ = post-quantum key verified on this connection.</p>
+    <p class="hint" id="gridHint"></p>
   </section>
 
   <aside class="side">
-    <section class="panel" aria-labelledby="hMig">
+    <section class="panel migPanel" aria-labelledby="hMig">
       <div class="panelHead"><h2 id="hMig">Migration</h2><span class="phase" id="phase">—</span></div>
       <p class="phaseWords" id="phaseWords"></p>
       <div class="bar" id="progress" aria-label="migration progress"></div>
       <div class="waves" id="waves"></div>
+      <div class="summary" id="summary" hidden></div>
     </section>
 
     <section class="panel" aria-labelledby="hCtl">
@@ -68,7 +79,11 @@
       </div>
       <div class="ctlRow mockOnly" hidden>
         <button id="btnStorm">Mock: reconnect storm</button>
-        <button id="btnImpostor">Mock: impostor CP0045</button>
+        <button id="btnImpostor">Mock: stolen cert CP0045</button>
+      </div>
+      <div class="ctlRow mockOnly" hidden>
+        <button id="btnIntruder">Mock: forged certificate</button>
+        <button id="btnWrongId">Mock: wrong identity CP0045</button>
       </div>
       <p class="toast" id="toast" role="status" aria-live="polite"></p>
     </section>
@@ -79,9 +94,14 @@
     </section>
   </aside>
 
+  <section class="panel chartPanel timeline" aria-labelledby="hTimeline">
+    <h2 id="hTimeline">Migration, live</h2>
+    <p class="sub">Chargers in each state, every second. Watch green (classical) turn blue (migrating), then purple (post-quantum hybrid).</p>
+    <div class="chart" id="cTimeline"></div>
+  </section>
   <section class="panel chartPanel" aria-labelledby="hPower">
     <h2 id="hPower">Fleet power</h2>
-    <p class="sub">Sum of the chargers' latest readings (kW). A curtailment shows as a step down.</p>
+    <p class="sub">Sum of the chargers' latest readings (kW). A curtailment shows as a step down; a migration should not dip it.</p>
     <div class="chart" id="cPower"></div>
   </section>
   <section class="panel chartPanel" aria-labelledby="hLat">
