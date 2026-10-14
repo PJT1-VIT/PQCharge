@@ -21,8 +21,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
+from pathlib import Path
+
 from dashboard import serve
 from dashboard.mock import ALGORITHM, MAX_POWER_W, PI_ID, STEP_S, MockFleet
+
+ROOT = Path(__file__).resolve().parents[2]
 
 
 class Clock:
@@ -254,3 +258,129 @@ def test_an_unreachable_csms_is_a_502_not_a_crash():
         assert status == 502 and body["error"] == "CSMS not reachable"
     finally:
         dash.shutdown()
+
+
+# -- 6c: the 500-charger demo -------------------------------------------------------
+
+
+def test_the_mock_of_499_follows_the_500_charger_profile():
+    """The mock's legacy chargers are exactly the profile's (Track A's own parser)."""
+    from csms.migration import load_fleet_profile
+
+    profile = load_fleet_profile(str(ROOT / "tests" / "fixtures" / "fleet_profile_demo_n500.json"))
+    assert len(profile) == 500 and profile[PI_ID] == ["ECDSA-P256", ALGORITHM]
+    profile_legacy = {sid for sid, algs in profile.items() if ALGORITHM not in algs}
+    fleet = MockFleet(n=499, clock=Clock())
+    assert fleet.legacy == profile_legacy == {f"CP{i:04d}" for i in range(450, 500)}
+    assert set(fleet.stations) == set(profile)                    # CP0000-CP0499, nothing else
+
+
+def test_a_500_charger_migration_runs_in_waves_of_50():
+    clock = Clock()
+    fleet = MockFleet(n=499, clock=clock)
+    fleet.start(wave_size=50, canary_count=10)
+    status = run_to_end(fleet, clock, limit_s=60.0)                # mock time
+    assert status["phase"] == "completed"
+    assert (status["migrated"], status["incompatible"], status["pending"]) == (450, 50, 0)
+    assert len(status["waves"][0]["station_ids"]) == 10 and status["waves"][0]["station_ids"][0] == PI_ID
+    assert {len(w["station_ids"]) for w in status["waves"][1:-1]} == {50}
+
+
+def test_the_page_has_the_large_fleet_mode():
+    """The dense grid (6c) is wired: the hint the page rewrites, the switch, the styles."""
+    index, _ = serve.static_file("/dashboard/index.html")
+    app, _ = serve.static_file("/dashboard/app.js")
+    css, _ = serve.static_file("/dashboard/style.css")
+    assert b'id="gridHint"' in index
+    assert b"var DENSE_FROM = 100;" in app and b'classList.toggle("dense", dense)' in app
+    assert b"function rotationResult(" in app
+    assert b".grid.dense" in css and b".tile.rot" in css
+
+
+def test_the_page_script_parses():
+    """app.js has no build step; a syntax error would only show in the browser."""
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed on this machine")
+    result = subprocess.run([node, "--check", str(ROOT / "dashboard" / "static" / "app.js")],
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+
+
+# -- runbook v1.2 (2026-10-14): the animated page, attack tiles, gradual connect ----
+
+
+def test_chargers_connect_one_by_one_and_then_start_charging():
+    """--mock: the page starts empty, tiles pop in, then turn green (V1)."""
+    from dashboard.mock import CHARGE_DELAY_S
+
+    clock = Clock()
+    fleet = MockFleet(n=9, connect_over_s=4.0, clock=clock)
+    first = fleet.fleet()
+    assert first["connected_count"] == 1                      # only the Pi at t = 0
+    assert {s["connection_state"] for s in first["stations"][1:]} == {"never_seen"}
+    assert first["charging_count"] == 0
+    clock.advance(2.0)
+    middle = fleet.fleet()["connected_count"]
+    assert 1 < middle < 10
+    clock.advance(2.0 + CHARGE_DELAY_S + 0.1)
+    last = fleet.fleet()
+    assert last["connected_count"] == 10 and last["charging_count"] == 10
+    kinds = [e["event_type"] for e in fleet.events_after(0, 2000)["events"]]
+    assert kinds.count("connection_established") == 10
+
+
+def test_a_never_seen_mock_row_has_the_same_fields():
+    fleet = MockFleet(n=2, connect_over_s=10.0, clock=Clock())
+    rows = fleet.fleet()["stations"]
+    assert set(rows[0]) == set(rows[1]) == set(rows[2])
+
+
+def test_mock_intruder_is_the_servers_tls_refusal_line():
+    """Same shape as csms/server.py _tls_refused: no station id, reason tls_rejected."""
+    from csms.transport import TLS_REFUSAL_WORDS
+
+    fleet = MockFleet(n=2, clock=Clock())
+    assert serve.mock_api(fleet, "/api/mock/intruder", {})[0] == 200
+    ev = fleet.events_after(0, 2000)["events"][-1]
+    assert ev["event_type"] == "connection_failed" and ev["station_id"] is None
+    assert ev["outcome"] == "rejected"
+    p = ev["payload"]
+    assert p["reason"] == "tls_rejected" and p["detail"] == TLS_REFUSAL_WORDS[p["tls_error"]]
+
+
+def test_mock_wrong_identity_is_the_servers_identity_check_line():
+    fleet = MockFleet(n=2, clock=Clock())
+    status, body = serve.mock_api(fleet, "/api/mock/wrong-identity", {})
+    assert status == 200 and body["certificate_of"] == "CP0004"
+    ev = fleet.events_after(0, 2000)["events"][-1]
+    assert (ev["event_type"], ev["station_id"], ev["outcome"]) == ("connection_attempt", "CP0045", "rejected")
+    assert ev["payload"]["transition"] == "identity_check"
+    assert ev["payload"]["certificate_common_name"] == "CP0004"
+    assert ev["payload"]["identity_matches"] is False
+
+
+def test_the_page_has_the_v12_pieces():
+    """The redesign is wired: empty state, stepper, alert banner, summary, timeline,
+    attack handling, wave replay, mock attack buttons and the colour per state."""
+    index, _ = serve.static_file("/dashboard/index.html")
+    app, _ = serve.static_file("/dashboard/app.js")
+    css, _ = serve.static_file("/dashboard/style.css")
+    for el in (b'id="empty"', b'id="stepper"', b'id="alertBar"', b'id="summary"',
+               b'id="cTimeline"', b'id="btnIntruder"', b'id="btnWrongId"'):
+        assert el in index, el
+    for code in (b'"tls_rejected"', b'"identity_check"', b'"pq_auth_failed"', b"var HOLD_MS =",
+                 b"/api/mock/intruder", b"/api/mock/wrong-identity", b"function renderSummary(",
+                 b'"never_seen"'):
+        assert code in app, code
+    for state in (b"idle", b"charging", b"migrating", b"hybrid", b"rolled", b"legacy", b"offline", b"alert"):
+        assert b"--v-" + state + b":" in css and b".tile.v-" + state in css, state
+
+
+def test_serve_mock_defaults_to_a_gradual_start():
+    args = serve.build_parser().parse_args(["--mock"])
+    assert args.mock_connect_s > 0
+    assert serve.build_parser().parse_args(["--mock", "--mock-connect-s", "0"]).mock_connect_s == 0

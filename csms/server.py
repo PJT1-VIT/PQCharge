@@ -103,6 +103,7 @@ from csms.transport import (
     DEFAULT_IDENTITY_CHECK,
     DEFAULT_SERVER_NAME,
     IDENTITY_CHECK_MODES,
+    observe_tls_refusals,
     TlsConfigError,
     build_server_context,
     check_identity,
@@ -444,6 +445,14 @@ class CSMS:
         # nothing. Hybrid without migration raises RuntimeError -> main()
         # refuses to start, rather than run "hybrid" with no checks.
         self.boot_verifier = None
+
+        # Step 8 / runbook V3: a charger refused DURING the TLS handshake
+        # (forged, old or missing client certificate) used to leave no trace.
+        # Each refusal is now one connection_failed line, reason
+        # "tls_rejected" -- no station id: the handshake fails before the
+        # charger's id (in the URL) is ever sent.
+        if self.ssl_context is not None:
+            observe_tls_refusals(self.ssl_context, self._tls_refused)
         if crypto_mode == "hybrid":
             self.boot_verifier = install_boot_check(
                 self.migration,
@@ -550,6 +559,19 @@ class CSMS:
         finally:
             self.registry.deregister(station_id, charge_point)
             LOGGER.info("station disconnected: %s", station_id)
+
+    def _tls_refused(self, code: str, words: str, detail: str) -> None:
+        """observe_tls_refusals' callback: one Contract 3 line per refused handshake."""
+        self.log.emit(
+            EventType.CONNECTION_FAILED,
+            None,
+            outcome=Outcome.REJECTED,
+            reason="tls_rejected",
+            tls_error=code,
+            detail=words,
+            tls_detail=detail,
+        )
+        LOGGER.warning("TLS handshake refused: %s (%s)", words, detail)
 
     # -- Contract 6 HTTP side -------------------------------------------
 

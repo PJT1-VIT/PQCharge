@@ -730,8 +730,25 @@ class ChargingStation(StationCommands):
         except OSError as exc:
             self.log.error("RequestPQEnrolment failed: key could not be saved: %s", exc)
             return False, f"key could not be saved: {exc}", None
+        self._indicate_migration()
         return True, f"{algorithm} key made on this station (key_id {key_id})", \
             pqc.pack_enrolment_reply(algorithm, public_key)
+
+    def _indicate_migration(self) -> None:
+        """
+        Runbook V2: show that THIS charger is being migrated (or rotated) -- a
+        RequestPQEnrolment is sent only by a migration or a key rotation, never
+        by a boot check. Only the Raspberry Pi's GPIOPower has a way to show it
+        (the LED blinks for a few seconds); every simulated charger has no
+        indicate_migration() and nothing happens. Never raises.
+        """
+        hook = getattr(self.power, "indicate_migration", None)
+        if not callable(hook):
+            return
+        try:
+            hook()
+        except Exception:  # noqa: BLE001 - an LED fault never refuses a key
+            self.log.warning("indicate_migration failed", exc_info=True)
 
     def handle_pq_challenge(
         self, data: Any
@@ -1912,4 +1929,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    main()

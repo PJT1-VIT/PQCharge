@@ -190,6 +190,57 @@ def build_server_context(
     return context
 
 
+TLS_REFUSAL_WORDS = {
+    "CERTIFICATE_VERIFY_FAILED": "certificate not signed by our CA (forged, or from an old CA)",
+    "PEER_DID_NOT_RETURN_A_CERTIFICATE": "no client certificate presented",
+    "HTTP_REQUEST": "not a TLS connection (plain HTTP/WebSocket to a TLS port)",
+    "WRONG_VERSION_NUMBER": "not a TLS connection",
+    "UNSUPPORTED_PROTOCOL": "TLS version too old",
+    "NO_SHARED_CIPHER": "no common cipher",
+}
+"""Plain words for the dashboard and the event log, by OpenSSL's reason code."""
+
+
+def observe_tls_refusals(context: ssl.SSLContext, on_refused: Any) -> None:
+    """
+    Report every TLS handshake this server context REFUSES (2026-10-14,
+    tracker step 8 / runbook variant V3; asked by Track C, agreed by the team).
+
+    A charger with a forged, old or missing client certificate is turned
+    away inside the TLS handshake -- before the server ever sees an HTTP
+    request, so before it knows which charger id was dialled. asyncio
+    logs nothing about it (only in debug mode), so until now such an
+    attack left no trace. This hooks the one place every handshake passes
+    through: asyncio's TLS layer wraps each connection in
+    `context.sslobject_class`; a subclass whose do_handshake() reports a
+    failure, then re-raises it unchanged, changes nothing about the
+    refusal itself.
+
+    on_refused(reason_code, words, detail) is called on the event loop
+    thread; any error inside it is swallowed (never turns a refusal into
+    something else). There is no station id or peer address at this
+    point -- the report says what was wrong, not who it was.
+    """
+    base = context.sslobject_class
+
+    class _ObservedSSLObject(base):  # type: ignore[misc, valid-type]
+        def do_handshake(self) -> None:
+            try:
+                return super().do_handshake()
+            except (ssl.SSLWantReadError, ssl.SSLWantWriteError):
+                raise                                   # handshake still in progress
+            except ssl.SSLError as exc:
+                try:
+                    code = getattr(exc, "reason", None) or type(exc).__name__
+                    detail = getattr(exc, "verify_message", None) or str(exc)
+                    on_refused(code, TLS_REFUSAL_WORDS.get(code, "TLS handshake refused"), detail)
+                except Exception:  # noqa: BLE001 - reporting must never change the refusal
+                    LOGGER.exception("could not report a refused TLS handshake")
+                raise
+
+    context.sslobject_class = _ObservedSSLObject
+
+
 def build_client_context(
     certfile: str | Path,
     keyfile: str | Path,

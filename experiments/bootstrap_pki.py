@@ -23,6 +23,16 @@ compares the CN with the id in the connection URL (finding F1).
 Every run makes a NEW root CA, so all certificates are regenerated together:
 a certificate from an earlier run will not verify against the new root.
 
+Every run therefore also DELETES the certificate files an earlier run left
+in certs/ (root.pem and every *.crt.pem / *.key.pem directly in certs/)
+before writing the new set (2026-10-14). Without this, a smaller run after a
+bigger one (--count 50 after --count 500) left CP0051-CP0500 behind, signed
+by a root that no longer exists: files that look valid and fail every
+handshake. Sub-folders are NEVER touched: certs/pq/ holds the chargers'
+ML-DSA keys (Contract 7), which belong with the server's --db, not with the
+TLS certificates. Extra ids (E6-SAP-01, the Pi's CP0000) must be named with
+--also on every run, or they are gone afterwards -- the script says so.
+
 Output: certs/ (at the project root) populated with root.pem,
 localhost.crt.pem / localhost.key.pem (server identity), and one
 .crt.pem / .key.pem pair per demo station. certs/ is gitignored --
@@ -71,12 +81,45 @@ def station_ids(count: int, also: list[str] | None = None) -> list[str]:
     return ids
 HANDSHAKE_TEST_PORT = 8943
 
+OLD_CERT_PATTERNS = ("root.pem", "*.crt.pem", "*.key.pem")
+"""What clear_old_certificates() deletes: only files directly in certs/."""
+
+
+def clear_old_certificates(directory: Path | None = None) -> list[str]:
+    """
+    Delete the certificate files a previous run left in `directory`
+    (default certs/): root.pem and every *.crt.pem / *.key.pem directly in
+    it. Sub-folders -- certs/pq/ with the chargers' ML-DSA keys, archived
+    key folders -- and any other file are left alone. Returns the names
+    deleted, sorted.
+    """
+    directory = CERT_DIR if directory is None else Path(directory)
+    if not directory.is_dir():
+        return []
+    removed: list[str] = []
+    for pattern in OLD_CERT_PATTERNS:
+        for path in directory.glob(pattern):
+            if path.is_file():
+                path.unlink()
+                removed.append(path.name)
+    return sorted(removed)
+
 
 def build_pki(ids: list[str], server_san: list[str] | None = None) -> CertificateAuthority:
     """Create the CA and write the root, server, and the given station
     certificates to disk under the project root's certs/ directory."""
     print("Building PKI...")
     ca = CertificateAuthority(ClassicalProvider())
+
+    # Old certificates are deleted first, so certs/ holds exactly this run's set.
+    removed = clear_old_certificates(CERT_DIR)
+    old_ids = sorted({n[: -len(".crt.pem")] for n in removed if n.endswith(".crt.pem")}
+                     - {SERVER_COMMON_NAME} - set(ids))
+    print(f"  removed {len(removed)} old certificate file(s) from {CERT_DIR} "
+          f"(sub-folders such as certs/pq are kept)")
+    if old_ids:
+        shown = old_ids if len(old_ids) <= 6 else old_ids[:3] + ["..."] + old_ids[-2:]
+        print(f"  no longer issued (add --also <id> to keep one): {', '.join(shown)}")
 
     CERT_DIR.mkdir(parents=True, exist_ok=True)
     (CERT_DIR / "root.pem").write_bytes(
