@@ -84,6 +84,14 @@ The joined run has N = the sum, the charger lists of both, every line of
 both in time order, starts when the first part started and is complete
 only if EVERY part finished. Its `parts` lists the original runs. Nothing
 is joined that was not started together, so an ordinary run is untouched.
+
+2026-10-14 (found in the real demo2 halt logs): the rule must hold for
+EVERY pair inside a group, not only pair by pair. The same part was
+started twice in two windows (two runs of CP0026-CP0050), and each copy
+matched CP0001-CP0020, so both were chained into one run of "70
+chargers". Now a part joins a group only if it shares no charger with any
+member; when two copies compete, the one that ran longer alongside the
+group wins and the other stays a run of its own.
 """
 
 from __future__ import annotations
@@ -569,31 +577,39 @@ def join_split_runs(runs: list[HarnessRun]) -> list[HarnessRun]:
     Join tester runs that are parts of ONE run (see the module notes, L38).
     Runs that are not parts of anything come back unchanged, in their
     original order; a joined run takes the place of its first part.
+    Inside a group no two parts share a charger (2026-10-14).
     """
-    group_of = list(range(len(runs)))
+    order = sorted(range(len(runs)), key=lambda i: (runs[i].started_at or 0.0, i))
+    group_of: dict[int, int] = {}
+    members: dict[int, list[int]] = {}
 
-    def root(i: int) -> int:
-        while group_of[i] != i:
-            group_of[i] = group_of[group_of[i]]
-            i = group_of[i]
-        return i
+    def overlap(a: HarnessRun, b: HarnessRun) -> float:
+        wa, wb = _window(a), _window(b)
+        if wa is None or wb is None:
+            return 0.0
+        return max(0.0, min(wa[1], wb[1]) - max(wa[0], wb[0]))
 
-    for i in range(len(runs)):
-        for j in range(i + 1, len(runs)):
-            if _are_parts_of_one_run(runs[i], runs[j]):
-                group_of[root(j)] = root(i)
-
-    groups: dict[int, list[int]] = {}
-    for i in range(len(runs)):
-        groups.setdefault(root(i), []).append(i)
+    for seed in order:
+        if seed in group_of:
+            continue
+        group_of[seed] = seed
+        members[seed] = [seed]
+        # Candidates: every later part that pairs with the seed, the longest
+        # time alongside it first (a restarted copy loses to the original).
+        cands = [j for j in order if j not in group_of and _are_parts_of_one_run(runs[seed], runs[j])]
+        cands.sort(key=lambda j: -overlap(runs[seed], runs[j]))
+        for j in cands:
+            if all(_are_parts_of_one_run(runs[m], runs[j]) for m in members[seed]):
+                group_of[j] = seed
+                members[seed].append(j)
 
     out: list[HarnessRun] = []
     for i, run in enumerate(runs):
-        members = groups[root(i)]
-        if len(members) == 1:
+        group = members.get(group_of[i], [i])
+        if len(group) == 1:
             out.append(run)
-        elif i == members[0]:
-            out.append(_joined([runs[k] for k in members]))
+        elif i == min(group):
+            out.append(_joined([runs[k] for k in group]))
     return out
 
 

@@ -95,7 +95,9 @@ def test_the_automatic_run_reads_the_server_diary_it_is_given(tmp_path):
     out = tmp_path / "out"
 
     run.analyse_after_run(logs / info["name"], events=[str(named)], out=out)
-    results = json.loads((out / "results.json").read_text())
+    # Since runbook v1.3 the experiment results are saved as experiments.json
+    # (results.json is the page's bundle of every view).
+    results = json.loads((out / "experiments.json").read_text())
     assert results["slots"]["stage6|n3|classical|tls"]["trust"]["status"] == "pass"
 
 

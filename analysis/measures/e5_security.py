@@ -37,6 +37,13 @@ C-F5 (after Track A's A-F7, experiments/e5_attack.md + e5_check.py):
                             "not_seen"  no rejected boot check
         wrong_identity      "stopped"   any identity_check refused, else "not_seen"
         curtailment         "done"      any Set/ClearChargingProfile sent, else "not_seen"
+
+2026-10-14 (runbook v1.2 V3 a): `tls_refusals` counts the server's
+connection_failed lines with reason "tls_rejected" -- a forged, old or
+missing client certificate refused DURING the TLS handshake. Those lines
+have no charger id (the id is never sent), so they are server-wide lines
+in the run's window. Not a verdict: the three verdicts above stay exactly
+the ones `e5_check` prints (L39, L48).
 """
 
 from __future__ import annotations
@@ -115,6 +122,12 @@ def measure(run: MatchedRun) -> dict[str, Any]:
         for e in run.events("connection_failed")
     )
 
+    tls_refused = [
+        e for e in run.server_events
+        if e.get("event_type") == "connection_failed"
+        and (e.get("payload") or {}).get("reason") == "tls_rejected"
+    ]
+
     rows = run.harness.of_type("station_finished", "station_crashed")
     return {
         "identity_checks": len(checks),
@@ -148,6 +161,13 @@ def measure(run: MatchedRun) -> dict[str, Any]:
         "pq_cut_off": len(cut_off),
         "pq_cut_off_ids": sorted({e.get("station_id") for e in cut_off if e.get("station_id")})[:50],
         "connection_failures": dict(failures),
+        "tls_refusals": {
+            "total": len(tls_refused),
+            "by_error": dict(Counter(str((e.get("payload") or {}).get("tls_error") or "unknown")
+                                     for e in tls_refused)),
+            "by_reason": dict(Counter(str((e.get("payload") or {}).get("detail") or "TLS handshake refused")
+                                      for e in tls_refused)),
+        },
         "callerrors": float(sum((r.get("callerrors") or 0) for r in rows)),
         "commands_received": float(sum((r.get("commands_received") or 0) for r in rows)),
         "curtailment": curtailment,

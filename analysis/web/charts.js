@@ -8,6 +8,16 @@
  *
  * Exposed for the dashboard (C7):  window.PQChargeReport.render(data)
  *
+ * Runbook v1.3 (2026-10-14): the results file is a BUNDLE of views
+ * (analysis/store.py rebuild_bundle): every analysed demo run (demo1, demo2,
+ * ...), "All runs combined" and "Experiments" (the step-13 runs). A bar at
+ * the top picks the view; the page opens on the run analysed last
+ * (bundle.current), or on #view=<name> from the address. A demo run or the
+ * experiments are drawn with the usual sections (Runs, E1-E5, nodes); a demo
+ * run starts with its V1-V7 summary, the combined view has its own section.
+ * The old single-view file (format 3) still opens, as "Experiments".
+ * S1 (scale test) is no longer on the page.
+ *
  * Colour rules (one meaning per colour, everywhere on the page):
  *   security mode  classical = blue, hybrid = orange, post-quantum = aqua
  *   trust / state  green = good, yellow = warning, red = critical, grey = pending
@@ -24,7 +34,9 @@
   };
   var RENDERER = /[?&]png\b/.test(location.search) ? "canvas" : "svg";
   var charts = [];
-  var DATA = null;
+  var DATA = null;       // the view being drawn (a demo run or the experiments)
+  var BUNDLE = null;     // every view (format 4)
+  var VIEW = null;       // its name, "combined" or "experiments"
   var selectedSlot = null;
   var e1Exp = null;
 
@@ -182,13 +194,6 @@
     function add(id, text) { lines.push("<li><strong>" + id + "</strong> · " + text + "</li>"); }
     function none(id, what) { lines.push('<li class="sub"><strong>' + id + "</strong> · " + what + " — not in these results yet</li>"); }
 
-    var s1 = all.filter(function (s) { return s.machine; });
-    if (s1.length) {
-      var t = biggest(s1, function (s) { return s.n_stations; }), m = t.machine;
-      add("S1", "One laptop ran <strong>" + int(t.n_stations) + " chargers</strong>: machine CPU p95 " + fmt(m.cpu_pct.p95, 0) +
-        " %, tester loop lag p95 " + ms(m.loop_lag_ms.p95) + " — " + (m.saturated ? "<strong>saturated</strong>" : "not saturated") + "." + trust(t));
-    } else none("S1", "scale test");
-
     var ro = cmp.ready_overhead_vs_classical || [];
     if (ro.length) {
       var r = biggest(ro, function (x) { return x.n + (x.tls ? 0.5 : 0); });
@@ -311,7 +316,7 @@
 
     document.getElementById("runPick").addEventListener("change", function (e) {
       selectedSlot = e.target.value;
-      render(DATA);
+      show();
       var el = document.getElementById("runs");
       if (el) el.scrollIntoView();
     });
@@ -361,7 +366,7 @@
     mountMachine(s);
   }
 
-  // ------------------------------------------------- machine (C-P6, S1)
+  // ------------------------------------------------- machine (C-P6): is the laptop overloaded?
 
   function machineCard(s) {
     var m = s.machine;
@@ -400,64 +405,6 @@
       return o;
     });
   }
-
-  function renderS1(root) {
-    var cmp = (DATA.comparisons || {}).machine_vs_n || {};
-    var names = Object.keys(cmp);
-    var head = '<section id="s1"><h2>S1 · Scale test</h2><p class="lede">Can one laptop run the fleet without ' +
-      "becoming the bottleneck? Each point is one run recorded with <code>--watch-machine</code>. Above the dashed " +
-      "limits (CPU p95 85%, loop lag p95 50 ms) the run's times are partly the laptop's cost.</p>";
-    if (!names.length) {
-      root.insertAdjacentHTML("beforeend", head + empty(
-        "No run with machine readings yet. Run, for example: <code>python -m harness.load_generator --n 500 " +
-        "--experiment s1 --csms-url ws://localhost:9000 --watch-fleet http://localhost:9000/api/fleet " +
-        "--watch-machine --charge-for 120 --pq-key-dir none</code>") + "</section>");
-      return;
-    }
-    var html = head +
-      '<div class="grid two"><div class="card"><h3>Machine CPU (p95) against fleet size</h3><div class="chart" id="cS1cpu"></div></div>' +
-      '<div class="card"><h3>Tester loop lag (p95) against fleet size</h3><div class="chart" id="cS1lag"></div></div></div>' +
-      '<div class="card" style="margin-top:16px"><h3>Numbers</h3>' +
-      table([{ t: "Series" }, { t: "Chargers", num: true }, { t: "CPU p95", num: true }, { t: "Loop lag p95", num: true },
-             { t: "Tester CPU p95", num: true }, { t: "Tester memory", num: true }, { t: "Server CPU p95", num: true },
-             { t: "Server memory", num: true }, { t: "Saturated" }],
-        [].concat.apply([], names.map(function (name) {
-          return cmp[name].map(function (r) {
-            return [esc(name), int(r.n), isNum(r.cpu_p95) ? fmt(r.cpu_p95, 0) + "%" : "—", ms(r.loop_lag_p95),
-              isNum(r.tester_cpu_p95) ? fmt(r.tester_cpu_p95, 0) + "%" : "—",
-              isNum(r.tester_rss_mb_max) ? fmt(r.tester_rss_mb_max, 0) + " MB" : "—",
-              isNum(r.server_cpu_p95) ? fmt(r.server_cpu_p95, 0) + "%" : "—",
-              isNum(r.server_rss_mb_max) ? fmt(r.server_rss_mb_max, 0) + " MB" : "—",
-              r.saturated ? "yes" : "no"];
-          });
-        }))) + "</div></section>";
-    root.insertAdjacentHTML("beforeend", html);
-
-    function vsN(id, file, axisName, key, limit, fmtY) {
-      mount(document.getElementById(id), function (p) {
-        var o = base(p, file);
-        o.tooltip.trigger = "item";
-        o.tooltip.formatter = function (it) { return esc(it.seriesName) + "<br>" + int(it.value[0]) + " chargers: " + fmtY(it.value[1]); };
-        o.xAxis = valueAxis(p, "Chargers in the run", { splitLine: { show: false }, minInterval: 1 });
-        // Always show the limit line, even when every run is far below it.
-        o.yAxis = valueAxis(p, axisName, { max: function (v) { return Math.ceil(Math.max(v.max * 1.1, limit * 1.15)); } });
-        o.series = names.map(function (name, i) {
-          var rows = cmp[name];
-          return line(name, modeColor(p, rows[0].mode), rows.filter(function (r) { return isNum(r[key]); })
-            .map(function (r) { return [r.n, r[key]]; }), {
-              showSymbol: true,
-              markLine: i === 0 ? { symbol: "none", silent: true, lineStyle: { color: p.axis, type: "dashed" },
-                label: { color: p.ink2, formatter: "limit" }, data: [{ yAxis: limit }] } : undefined
-            });
-        });
-        return o;
-      });
-    }
-    vsN("cS1cpu", "s1_cpu_vs_fleet_size", "Machine CPU p95 (%)", "cpu_p95", 85, function (v) { return fmt(v, 0) + "%"; });
-    vsN("cS1lag", "s1_loop_lag_vs_fleet_size", "Loop lag p95 (ms)", "loop_lag_p95", 50, ms);
-  }
-
-  // ---------------------------------------------------------------- E1
 
   function renderE1(root) {
     var all = slots().filter(function (s) { return s.e1 && s.e1.station_connect_ms && s.e1.station_connect_ms.n; });
@@ -564,7 +511,7 @@
     root.insertAdjacentHTML("beforeend", html + "</section>");
     document.getElementById("e1Pick").addEventListener("change", function (ev) {
       e1Exp = ev.target.value;
-      render(DATA);
+      show();
       var el = document.getElementById("e1");
       if (el) el.scrollIntoView();
     });
@@ -1026,7 +973,9 @@
       "mutual TLS (Track A, experiments/e5_attack.md): (a) a <b>stolen certificate</b> without the charger's " +
       "ML-DSA key gets through TLS but fails the key check after boot and is cut off (code 1008); (b) a " +
       "<b>wrong identity</b> (another charger's certificate) is refused at connection time; (c) <b>curtailment</b>: " +
-      "one operator command changes every charger's power. Same rules as <code>python -m experiments.e5_check</code>.</p>";
+      "one operator command changes every charger's power. Same rules as <code>python -m experiments.e5_check</code>. " +
+      "Also counted, not a verdict: devices <b>refused during the TLS handshake</b> (forged, old or missing certificate; " +
+      "runbook V3 a).</p>";
     if (!list.length) {
       root.insertAdjacentHTML("beforeend", html + empty("No runs yet.") + "</section>");
       return;
@@ -1043,6 +992,8 @@
       (e.pq_by_trigger && e.pq_by_trigger.boot.checks ? tile("Boot key checks", int(e.pq_by_trigger.boot.passed) + " / " +
         int(e.pq_by_trigger.boot.checks), "checked after every boot (hybrid)") : "") +
       tile("Cut off", int(e.pq_cut_off), "failed the key check after boot; connection closed") +
+      tile("Refused at TLS", int((e.tls_refusals || {}).total),
+        Object.keys((e.tls_refusals || {}).by_reason || {}).join("; ") || "forged, old or missing certificate (no charger id)") +
       tile("Connection failures", int(failures.reduce(function (a, k) { return a + e.connection_failures[k]; }, 0)), failures.join(", ") || "none") +
       tile("Protocol errors", int(e.callerrors), "CALLErrors reported by chargers") +
       tile("Commands received", int(e.commands_received), "e.g. power limits, remote stop") +
@@ -1110,8 +1061,84 @@
 
   // ================================================================ render
 
+  // ================================================================ views
+
+  var VIEW_LABEL = { combined: "All runs combined", experiments: "Experiments (step 13)" };
+
+  function asBundle(data) {
+    if (data && data.views) return data;
+    // Format 3 (one view, before runbook v1.3): show it as the experiments.
+    return { format_version: data && data.format_version, generated_at: data && data.generated_at,
+             current: "experiments", view_order: ["experiments"],
+             views: { experiments: Object.assign({ kind: "experiments", name: "experiments" }, data) },
+             combined: null };
+  }
+
+  function viewFromHash() {
+    var m = /(?:^|[#&])view=([^&]+)/.exec(location.hash || "");
+    return m ? decodeURIComponent(m[1]) : null;
+  }
+
   function render(data) {
-    DATA = data;
+    BUNDLE = asBundle(data);
+    var order = BUNDLE.view_order || [];
+    var wanted = [viewFromHash(), VIEW, BUNDLE.current, order[0]];
+    VIEW = null;
+    for (var i = 0; i < wanted.length && !VIEW; i++) {
+      if (wanted[i] && order.indexOf(wanted[i]) >= 0) VIEW = wanted[i];
+    }
+    show();
+  }
+
+  function pick(name) {
+    VIEW = name;
+    selectedSlot = null;
+    e1Exp = null;
+    try { history.replaceState(null, "", "#view=" + encodeURIComponent(name)); } catch (e) { /* file: */ }
+    show();
+    window.scrollTo(0, 0);
+  }
+
+  function renderViewBar(root) {
+    var order = BUNDLE.view_order || [];
+    var newest = order.filter(function (n) { return n !== "combined" && n !== "experiments"; })[0];
+    var html = '<nav class="views" aria-label="Which results">' + order.map(function (n) {
+      var v = BUNDLE.views[n] || {}, sum = v.summary || {};
+      var sub = n === "combined" ? int(((BUNDLE.combined || {}).totals || {}).runs) + " runs"
+        : n === "experiments" ? "classical vs hybrid evidence"
+        : ((sum.started_at || "").replace("T", " ").slice(0, 16) + " UTC" + (n === newest ? " · newest" : ""));
+      return '<button type="button" class="view' + (n === VIEW ? " on" : "") + '" data-view="' + esc(n) + '"' +
+        (n === VIEW ? ' aria-current="true"' : "") + "><b>" + esc(VIEW_LABEL[n] || n) + "</b><span>" + esc(sub) +
+        (n === BUNDLE.current ? " · analysed last" : "") + "</span></button>";
+    }).join("") + "</nav>";
+    root.insertAdjacentHTML("beforeend", html);
+    Array.prototype.forEach.call(root.querySelectorAll("nav.views button"), function (b) {
+      b.addEventListener("click", function () { pick(b.getAttribute("data-view")); });
+    });
+  }
+
+  function show() {
+    disposeAll();
+    var root = document.getElementById("root");
+    root.innerHTML = "";
+    var order = BUNDLE.view_order || [];
+    if (!order.length) {
+      root.innerHTML = empty("Nothing analysed yet. After a demo run: <code>python -m analysis.run --run demo3</code> " +
+        "(your run name). For the experiment runs: <code>python -m analysis.run --logs evidence\\&lt;folder&gt;</code>.");
+      document.getElementById("generated").textContent = "";
+      return;
+    }
+    renderViewBar(root);
+    if (VIEW === "combined") {
+      DATA = null;
+      renderCombined(root, BUNDLE.combined);
+      document.getElementById("generated").textContent =
+        "Page built " + (BUNDLE.generated_at || "").replace("T", " ").slice(0, 19) + " UTC";
+      document.getElementById("foot").innerHTML = "Every demo run analysed with <code>python -m analysis.run --run &lt;name&gt;</code>; " +
+        "pooled numbers use every charger and key check of every run. Results format v" + esc(BUNDLE.format_version) + ".";
+      return;
+    }
+    DATA = BUNDLE.views[VIEW];
     var list = slots();
     if (!selectedSlot || !DATA.slots[selectedSlot]) {
       // Default to the most recently started run.
@@ -1120,13 +1147,9 @@
         if (!selectedSlot || (s.started_at_epoch || 0) > (DATA.slots[selectedSlot].started_at_epoch || 0)) selectedSlot = s.key;
       });
     }
-
-    disposeAll();
-    var root = document.getElementById("root");
-    root.innerHTML = "";
-    renderHeadlines(root);
+    if (DATA.kind === "demo") renderDemoSummary(root, DATA);
+    else renderHeadlines(root);
     renderRuns(root);
-    renderS1(root);
     renderE1(root);
     renderE2(root);
     renderE3(root);
@@ -1135,14 +1158,165 @@
     renderNodes(root);
 
     document.getElementById("generated").textContent =
-      "Analysed " + (data.generated_at || "").replace("T", " ").slice(0, 19) + " UTC";
-    var src = data.sources || {};
+      "Analysed " + ((DATA.analysed_at || DATA.generated_at || "")).replace("T", " ").slice(0, 19) + " UTC";
+    var src = DATA.sources || {};
     document.getElementById("foot").innerHTML =
-      "Computed by <code>python -m analysis.run</code> from " + esc(src.server_diary) + " (" +
-      int(src.server_diary_lines) + " lines) and " + int((src.tester_diaries || []).length) +
+      "Computed by <code>python -m analysis.run" + (DATA.kind === "demo" ? " --run " + esc(DATA.name) : "") + "</code> from " +
+      esc(src.server_diary) + " (" + int(src.server_diary_lines) + " lines) and " + int((src.tester_diaries || []).length) +
       " tester diar" + (((src.tester_diaries || []).length === 1) ? "y" : "ies") + ". " +
       int(src.runs_found) + " run(s) found, newest per setup kept (" + int(src.runs_kept) + "). " +
-      "Results format v" + esc(data.format_version) + ". Charts: Apache ECharts.";
+      "Results format v" + esc(BUNDLE.format_version) + ". Charts: Apache ECharts.";
+  }
+
+  // ------------------------------------------------- one demo run: V1-V7 in numbers
+
+  function yesNo(ok, text) {
+    return '<span class="verdict ' + (ok ? "ok" : "none") + '">' + (ok ? "✓ " : "— ") + text + "</span>";
+  }
+
+  function renderDemoSummary(root, v) {
+    var r = v.summary || {}, m = r.migration || {}, a = r.attacks || {}, st = r.storm, rot = r.rotation,
+      h = r.halt, b = r.boot_checks;
+    var attacks = (a.tls_refused || 0) + (a.identity_rejected || 0) + (a.cut_off || 0);
+    var rows = [];
+    function add(id, name, ok, text) {
+      rows.push("<tr><td><strong>" + id + "</strong></td><td>" + name + "</td><td>" + yesNo(ok, text) + "</td></tr>");
+    }
+    add("V1", "Normal charging", r.chargers > 0, int(r.chargers) + " chargers (" + int(r.tester_chargers) + " from the load generators" +
+      ((r.outside_chargers || []).length ? " + " + esc(r.outside_chargers.join(", ")) : "") + "), connect median " + ms(r.connect_median_ms));
+    add("V2", "Migration", (m.hybrid || 0) > 0, int(m.hybrid) + " / " + int(m.eligible) + " hybrid, " + int(m.legacy) + " legacy skipped, " +
+      int(m.rolled_back) + " rolled back, " + int(m.pending) + " not attempted · server time " + sec(m.server_s) +
+      " · key check median " + ms(m.key_check_median_ms) + " · sessions disturbed " + int(m.sessions_disturbed) + " / " + int(m.sessions_running) +
+      ((m.runs || 0) > 1 ? ' <span class="sub">(' + int(m.runs) + " migration runs: every Start enrols every charger again, L46)</span>" : ""));
+    add("V3", "Attack charger", attacks > 0, int(a.tls_refused) + " refused at TLS (forged/old/missing certificate) · " +
+      int(a.identity_rejected) + " wrong identity refused · " + int(a.cut_off) + " stolen-certificate connections cut off (1008)");
+    add("V4", "Reconnect storm", !!st, st ? "95 % recovered in " + sec(st.t95_s) + " (" + int(st.recovered) + " / " + int(st.population) + ")" +
+      (b ? " · boot key checks " + int(b.passed) + " / " + int(b.total) + ", median " + ms(b.median_ms) : "") : "not seen in this run");
+    add("V5", "Key rotation", !!rot, rot ? int(rot.rotated) + " rotated, " + int(rot.failed) + " failed (old key kept), check median " + ms(rot.key_check_median_ms) : "not seen in this run");
+    add("V6", "Halt", !!(h && h.shown), !h ? "no halt fleet in this run" : h.not_started ? "halt fleet connected, but no migration was started on it"
+      : (h.shown ? "halted at wave " + esc(h.wave) + ": " : "no halt: ") + int(h.hybrid) + " hybrid / " + int(h.rolled_back) + " rolled back / " +
+        int(h.never_attempted || h.pending) + " never attempted");
+    add("V7", "Curtailment", a.curtailment === "done", a.curtailment === "done" ? "power limit sent and cleared" : "not seen in this run");
+
+    var html = '<section id="headlines"><h2>Run ' + esc(v.name) + "</h2><p class=\"lede\">One complete demo run, " +
+      "started " + esc((r.started_at || "").replace("T", " ").slice(0, 19)) + " UTC. Main and halt servers are analysed " +
+      "separately, each against its own fleet. Trust: " + badge(r.trust) + "</p>" +
+      '<div class="tiles">' +
+      tile("Chargers", int(r.chargers), "connected in this run") +
+      tile("Post-quantum", int(m.hybrid) + " / " + int(m.eligible), "hybrid at the end of V2") +
+      tile("Key check median", ms(m.key_check_median_ms), "ML-DSA-44, during the migration") +
+      tile("Storm, 95 % back", st ? sec(st.t95_s) : "—", "after the server restart (V4)") +
+      tile("Attacks refused", int(attacks), "V3: TLS, identity, stolen certificate") +
+      "</div>" +
+      '<div class="card"><h3>The variants</h3>' +
+      '<div class="tablewrap"><table class="variants"><tbody>' + rows.join("") + "</tbody></table></div>" +
+      '<details class="issues" style="margin-top:8px"><summary>Files analysed (' + int((v.files || []).length) + "), read from " +
+      esc(v.source) + "</summary><ul>" + (v.files || []).map(function (f) { return "<li><code>" + esc(f) + "</code></li>"; }).join("") +
+      "</ul><p class=\"note\">Saved in <code>" + esc(v.folder) + "</code>. Analysing this run again replaces this result; nothing is added.</p></details>" +
+      "</div></section>";
+    root.insertAdjacentHTML("beforeend", html);
+  }
+
+  // ------------------------------------------------- every demo run together
+
+  var TRIGGER_LABEL = { migration: "Migration", boot: "Boot (after reconnect)", rotation: "Rotation" };
+
+  function triggerColor(p, t) {
+    return { migration: p.mode.hybrid, boot: p.alt, rotation: p.mode.pqc }[t] || p.muted;
+  }
+
+  function renderCombined(root, c) {
+    if (!c || !(c.runs || []).length) {
+      root.insertAdjacentHTML("beforeend", empty("No demo run analysed yet: <code>python -m analysis.run --run demo3</code>."));
+      return;
+    }
+    var t = c.totals || {}, pool = c.pooled || {}, kc = pool.key_check_ms || {};
+    var html = '<section id="headlines"><h2>All runs combined</h2><p class="lede">Every analysed demo run side by side ' +
+      "(oldest first), then every run's numbers pooled together. Each run is still analysed on its own; nothing here " +
+      "is re-measured.</p>" +
+      '<div class="tiles">' +
+      tile("Runs", int(t.runs), (c.runs || []).map(function (r) { return r.name; }).join(", ")) +
+      tile("Chargers migrated", int(t.chargers_migrated), "summed over the runs") +
+      tile("Keys rotated", int(t.keys_rotated), "summed over the runs") +
+      tile("Key checks (pooled)", int((kc.migration || {}).n), "migration, median " + ms((kc.migration || {}).median)) +
+      tile("Connect (pooled)", ms((pool.connect_ms || {}).median), int((pool.connect_ms || {}).n) + " chargers, first connection") +
+      tile("Attacks refused", int((t.tls_refused || 0) + (t.identity_rejected || 0) + (t.cut_off || 0)),
+        int(t.tls_refused) + " TLS · " + int(t.identity_rejected) + " identity · " + int(t.cut_off) + " cut off") +
+      "</div>";
+    html += '<div class="card"><h3>Side by side</h3>' + table(
+      [{ t: "Run" }, { t: "Started (UTC)" }, { t: "Chargers", num: true }, { t: "Connect median", num: true },
+       { t: "Hybrid", num: true }, { t: "Server time", num: true }, { t: "Key check median", num: true },
+       { t: "Storm 95 %", num: true }, { t: "Rotated", num: true }, { t: "Halt" }, { t: "TLS refused", num: true },
+       { t: "Identity refused", num: true }, { t: "Cut off", num: true }, { t: "Disturbed", num: true }, { t: "Trust" }],
+      c.runs.map(function (r) {
+        var m = r.migration || {}, a = r.attacks || {}, h = r.halt;
+        return ['<a href="#view=' + encodeURIComponent(r.name) + '" data-view="' + esc(r.name) + '">' + esc(r.name) + "</a>",
+          esc((r.started_at || "").replace("T", " ").slice(0, 16)), int(r.chargers), ms(r.connect_median_ms),
+          int(m.hybrid) + " / " + int(m.eligible), sec(m.server_s), ms(m.key_check_median_ms),
+          r.storm ? sec(r.storm.t95_s) : "—", r.rotation ? int(r.rotation.rotated) : "—",
+          !h ? "—" : h.not_started ? "not started" : h.shown ? "wave " + esc(h.wave) + " ↩" : "no halt",
+          int(a.tls_refused), int(a.identity_rejected), int(a.cut_off), int(m.sessions_disturbed), badge(r.trust)];
+      })) + "</div>";
+    html += '<div class="grid two" style="margin-top:16px">' +
+      '<div class="card"><h3>Key-check time per run</h3><p class="sub">Median ML-DSA-44 round trip, by kind of check</p><div class="chart" id="cCmbRuns"></div></div>' +
+      '<div class="card"><h3>Every key check, pooled</h3><p class="sub">All runs together, ' + esc(fmt(pool.hist_bin_ms, 0)) +
+      ' ms bins (the last bin holds the slowest 1 %)</p><div class="chart" id="cCmbHist"></div></div>' +
+      "</div>" +
+      '<div class="card" style="margin-top:16px"><h3>Pooled numbers</h3>' + table(
+        [{ t: "What" }, { t: "n", num: true }, { t: "Median", num: true }, { t: "95 % CI of the median", num: true },
+         { t: "p95", num: true }, { t: "Max", num: true }],
+        [["Charger connect (first connection)", pool.connect_ms]].concat(
+          ["migration", "boot", "rotation"].map(function (k) { return ["Key check · " + TRIGGER_LABEL[k], kc[k]]; })
+        ).map(function (row) {
+          var d = row[1] || {};
+          return [esc(row[0]), int(d.n), ms(d.median),
+            d.median_ci95 ? ms(d.median_ci95[0]) + " – " + ms(d.median_ci95[1]) : "—", ms(d.p95), ms(d.max)];
+        })) + '<p class="note">A run that did not do a step (e.g. no storm) simply adds nothing to that row.</p></div>' +
+      '<div class="card" style="margin-top:16px"><h3>Charger connect time, pooled</h3><p class="sub">Share of chargers ' +
+      "connected within a given time (first connection, every run)</p><div class=\"chart\" id=\"cCmbConnect\"></div></div>";
+    root.insertAdjacentHTML("beforeend", html + "</section>");
+    Array.prototype.forEach.call(root.querySelectorAll("a[data-view]"), function (a) {
+      a.addEventListener("click", function (e) { e.preventDefault(); pick(a.getAttribute("data-view")); });
+    });
+
+    var names = (c.per_run_key_checks || []).map(function (r) { return r.name; });
+    mount(document.getElementById("cCmbRuns"), function (p) {
+      var o = base(p, "combined_key_checks_per_run");
+      o.tooltip.trigger = "axis";
+      o.tooltip.valueFormatter = function (v) { return ms(v); };
+      o.xAxis = catAxis(p, names);
+      o.yAxis = valueAxis(p, "ms");
+      o.series = ["migration", "boot", "rotation"].map(function (k) {
+        return { type: "bar", name: TRIGGER_LABEL[k], barMaxWidth: 28, itemStyle: { color: triggerColor(p, k), borderRadius: [3, 3, 0, 0] },
+                 data: (c.per_run_key_checks || []).map(function (r) { return (r[k] || {}).n ? r[k].median : null; }) };
+      });
+      return o;
+    });
+    mount(document.getElementById("cCmbHist"), function (p) {
+      var o = base(p, "combined_key_check_histogram");
+      var hist = pool.key_check_hist || {}, bins = {};
+      ["migration", "boot", "rotation"].forEach(function (k) { (hist[k] || []).forEach(function (b) { bins[b[0]] = true; }); });
+      var xs = Object.keys(bins).map(Number).sort(function (x, y) { return x - y; });
+      o.tooltip.trigger = "axis";
+      o.xAxis = catAxis(p, xs.map(function (x) { return fmt(x, 0); }), { name: "ms", nameLocation: "middle", nameGap: 28 });
+      o.yAxis = valueAxis(p, "Key checks", { minInterval: 1 });
+      o.series = ["migration", "boot", "rotation"].map(function (k) {
+        var m = {};
+        (hist[k] || []).forEach(function (b) { m[b[0]] = b[1]; });
+        return { type: "bar", name: TRIGGER_LABEL[k], stack: "all", itemStyle: { color: triggerColor(p, k) },
+                 data: xs.map(function (x) { return m[x] || 0; }) };
+      });
+      return o;
+    });
+    mount(document.getElementById("cCmbConnect"), function (p) {
+      var o = base(p, "combined_connect_ecdf");
+      o.legend.show = false;
+      o.tooltip.trigger = "axis";
+      o.xAxis = valueAxis(p, "Connect time (ms)", { splitLine: { show: false } });
+      o.yAxis = valueAxis(p, "% of chargers", { max: 100 });
+      o.series = [line("Connected within", p.alt, (pool.connect_ms || {}).ecdf || [], { step: "end" })];
+      return o;
+    });
   }
 
   function load() {
@@ -1165,7 +1339,7 @@
     if (location.protocol === "file:") return;
     setInterval(function () {
       fetch("results.json", { cache: "no-store" }).then(function (r) { return r.ok ? r.json() : null; })
-        .then(function (d) { if (d && DATA && d.generated_at !== DATA.generated_at) render(d); })
+        .then(function (d) { if (d && BUNDLE && d.generated_at !== BUNDLE.generated_at) render(d); })
         .catch(function () { /* the next poll will try again */ });
     }, 10000);
   }
@@ -1197,5 +1371,9 @@
       return;
     }
     load().then(function (d) { render(d); watch(); }).catch(fail);
+    window.addEventListener("hashchange", function () {
+      var v = viewFromHash();
+      if (BUNDLE && v && v !== VIEW && (BUNDLE.view_order || []).indexOf(v) >= 0) { VIEW = v; selectedSlot = null; e1Exp = null; show(); }
+    });
   });
 })();

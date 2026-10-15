@@ -20,8 +20,9 @@ certs/
 *.crt
 *.csr
 
-# Analysis output
+# Analysis output (results pages are rebuilt from evidence; never commit them)
 analysis/output/
+analysis/output*/
 *.png
 !docs/*.png
 
