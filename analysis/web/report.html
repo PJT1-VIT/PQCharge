@@ -160,6 +160,19 @@
   .headlines li { margin: 4px 0; }
   .verdict.ok { color: var(--good-text); }
   .verdict.bad { color: var(--critical); }
+  .verdict.none { color: var(--muted); }
+  nav.views { display: flex; gap: 8px; flex-wrap: wrap; margin: 0 0 20px; }
+  nav.views button {
+    font: inherit; text-align: left; cursor: pointer; color: var(--ink);
+    background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+    padding: 8px 12px; display: flex; flex-direction: column; gap: 1px; min-width: 140px;
+  }
+  nav.views button span { color: var(--muted); font-size: 12px; }
+  nav.views button:hover { border-color: var(--axis); }
+  nav.views button.on { border-color: var(--focus); box-shadow: inset 0 0 0 1px var(--focus); }
+  table.variants td { white-space: normal; vertical-align: top; }
+  table.variants td:first-child { width: 36px; }
+  table.variants td:nth-child(2) { width: 150px; color: var(--ink-2); }
 </style>
 <script>
   // Remembered theme choice: a per-viewer convenience only, and optional.
@@ -176,7 +189,6 @@
     <nav class="sections" aria-label="Sections">
       <a href="#headlines">Headlines</a>
       <a href="#runs">Runs</a>
-      <a href="#s1">S1 Scale</a>
       <a href="#e1">E1 Handshake</a>
       <a href="#e2">E2 Storm</a>
       <a href="#e3">E3 Migration</a>

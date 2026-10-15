@@ -26,6 +26,21 @@ always rebuilds everything from the diaries, so running it twice gives the
 same answer.
 
 --------------------------------------------------------------------
+DEMO RUNS (runbook v1.3, 2026-10-14) -- analysis/demo.py
+
+    python -m analysis.run --run demo3
+
+analyses ONE demo run (only demo3's files; main and halt servers apart),
+copies its diaries to evidence/demos/demo3/, saves analysis/output/runs/
+demo3.json (replacing an earlier analysis of demo3) and rebuilds the page,
+which then opens on demo3; the other analysed runs, "All runs combined" and
+"Experiments" are one click away. --all-runs re-analyses every run in
+evidence/demos/ (e.g. after `git pull` on another laptop).
+
+Without --run, this is the EXPERIMENTS analysis (step 13), as before; it is
+saved as analysis/output/experiments.json and shown as "Experiments".
+
+--------------------------------------------------------------------
 SAFETY
 
 Read-only on every log file. Writes only inside --out (default
@@ -167,6 +182,13 @@ def main(argv: list[str] | None = None) -> int:
         prog="python -m analysis.run",
         description="Turn the server and tester diaries into results (Track C, C6).",
     )
+    parser.add_argument("--run", action="append", default=None, metavar="NAME",
+                        help="analyse ONE demo run (e.g. demo3): its files only, saved as "
+                             "runs/NAME.json (replacing an earlier analysis of it); repeatable")
+    parser.add_argument("--all-runs", action="store_true",
+                        help="re-analyse every demo run saved in --evidence")
+    parser.add_argument("--evidence", default="evidence/demos",
+                        help="where each demo run's diaries are copied (default evidence/demos)")
     parser.add_argument(
         "--events", action="append", default=None,
         help="a server diary (Contract 3); repeatable. Default: every "
@@ -182,6 +204,9 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.WARNING if args.quiet else logging.INFO,
                         format="%(levelname)s analysis: %(message)s")
 
+    if args.run or args.all_runs:
+        return main_demo(args)
+
     results = build(args.events, args.logs, args.harness_log)
     path = store.write(results, args.out)
 
@@ -190,6 +215,66 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\nresults: {path}")
         print(f"page:    {Path(args.out) / 'report.html'}")
     return 0 if results["diary_check"]["status"] != "fail" else 1
+
+
+def main_demo(args: argparse.Namespace) -> int:
+    """--run / --all-runs: analyse demo runs one by one (analysis/demo.py)."""
+    from analysis import demo
+
+    names = list(args.run or [])
+    if args.all_runs:
+        root = Path(args.evidence)
+        names += sorted(p.name for p in root.iterdir() if p.is_dir()) if root.is_dir() else []
+    if not names:
+        print(f"no demo run to analyse (nothing in {args.evidence})", file=sys.stderr)
+        return 1
+    code = 0
+    path = None
+    for name in dict.fromkeys(names):              # each once, in the order given
+        try:
+            view = demo.analyse(name, args.logs, args.evidence)
+        except (demo.RunNotFound, ValueError) as exc:
+            print(f"{name}: {exc}", file=sys.stderr)
+            code = 1
+            continue
+        path = store.write_demo(view, args.out)
+        if not args.quiet:
+            print(demo_summary(view))
+            print(f"  evidence: {Path(args.evidence) / name}   (read from {view['source']})")
+    if path is not None and not args.quiet:
+        print(f"\nresults: {Path(args.out) / store.RUNS_DIR}")
+        print(f"page:    {Path(args.out) / 'report.html'}   (opens on {names[-1]})")
+    return code
+
+
+def demo_summary(view: dict[str, Any]) -> str:
+    """One demo run in a few lines (the same numbers as the page's summary)."""
+    r = view["summary"]
+    m, st, rot, h, a = (r.get("migration") or {}), r.get("storm"), r.get("rotation"), r.get("halt"), r["attacks"]
+    def f(v, unit="", d=1):
+        return "n/a" if v is None else f"{v:.{d}f}{unit}"
+    lines = [f"{view['name']}: trust={r['trust']}  chargers={r.get('chargers')}  "
+             f"connect median={f(r.get('connect_median_ms'), ' ms')}"]
+    if m:
+        lines.append(f"  V2 migration: {m.get('hybrid')}/{m.get('eligible')} hybrid, {m.get('legacy')} legacy, "
+                     f"{m.get('rolled_back')} rolled back, {m.get('pending')} not attempted; server time "
+                     f"{f(m.get('server_s'), ' s', 2)}; key check median {f(m.get('key_check_median_ms'), ' ms')}; "
+                     f"{m.get('runs')} migration run(s); sessions disturbed {m.get('sessions_disturbed')}")
+    lines.append(f"  V3 attacks: TLS refused {a['tls_refused']}, wrong identity {a['identity_rejected']}, "
+                 f"stolen certificate cut off {a['cut_off']} (boot checks failed {a['boot_rejected']})")
+    lines.append("  V4 storm: " + (f"95% recovered in {f(st.get('t95_s'), ' s', 2)} ({st.get('recovered')}/"
+                                   f"{st.get('population')})" if st else "not seen"))
+    lines.append("  V5 rotation: " + (f"{rot.get('rotated')} rotated, {rot.get('failed')} failed" if rot else "not seen"))
+    if not h:
+        lines.append("  V6 halt: no halt fleet in this run")
+    elif h.get("not_started"):
+        lines.append("  V6 halt: halt fleet ran, but no migration was started on it")
+    else:
+        lines.append(f"  V6 halt: {'HALTED at wave ' + str(h.get('wave')) if h.get('shown') else 'no halt'} -- "
+                     f"{h.get('hybrid')} hybrid / {h.get('rolled_back')} rolled back / "
+                     f"{h.get('never_attempted') or h.get('pending')} never attempted")
+    lines.append(f"  V7 curtailment: {a['curtailment']}")
+    return "\n".join(lines)
 
 
 def summary(results: dict[str, Any]) -> str:
@@ -257,7 +342,7 @@ def analyse_after_run(harness_log: str | Path,
         explicit = [events] if isinstance(events, (str, Path)) else list(events or [])
         paths = [Path(p) for p in explicit] + collect.find_server_diaries(log_dir)
         results = build(paths or None, log_dir)
-        store.write(results, out)
+        store.write(results, out, make_current=False)     # never takes the page off a demo run
         print(f"\nanalysis updated: {Path(out) / 'report.html'}")
     except Exception as exc:  # noqa: BLE001
         print(f"\nanalysis skipped ({type(exc).__name__}: {exc}); "

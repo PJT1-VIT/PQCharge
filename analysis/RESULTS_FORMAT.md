@@ -1,4 +1,22 @@
-# analysis/output/results.json — format v3
+# analysis/output/results.json — format v4
+
+**v4 (runbook v1.3, 2026-10-14): results.json is a BUNDLE of views.**
+
+| Key | What it is |
+|---|---|
+| `format_version` | `4` |
+| `generated_at` | When the bundle was rebuilt |
+| `current` | The view the page opens on: the run analysed last (`--run`), or `experiments` after a hand-run experiments analysis. The load generator's automatic analysis never changes it. |
+| `view_order` | Demo runs newest first, then `combined` (if any run), then `experiments` (if analysed) |
+| `views` | `{name: view}`. A view is the **v3 object described below** (`slots`, `comparisons`, `e4`, ...) plus `kind`: `demo` or `experiments`. A demo view adds `name`, `analysed_at`, `source` (`logs` / `evidence`), `folder`, `files[]`, `parts{main, halt, halt_server_log}`, `samples{connect_ms[], key_check_ms{migration, boot, rotation}, migration_runs, rotation_runs}`, `summary` (one row: V1–V7 in numbers), and every slot has `server`: `main` / `halt`. |
+| `combined` | `null` without demo runs; else `{runs[] (each run's summary), totals{}, pooled{connect_ms, key_check_ms{...}, key_check_hist{...}, hist_bin_ms}, per_run_key_checks[]}` |
+
+Saved views: `analysis/output/runs/<name>.json` (one per demo run, replaced on re-analysis) and
+`analysis/output/experiments.json`. The bundle is rebuilt from them every time. **v4 also adds**
+`e5.tls_refusals{total, by_error{}, by_reason{}}` (handshakes refused at TLS; no charger id). The page no
+longer has an S1 section; `machine` / `machine_vs_n` are still computed.
+
+Everything below describes ONE view (the format v3 object, unchanged).
 
 The contract between **C6 (analysis)**, which writes this file, and **C7 (dashboard)**, which
 reads it. Written by `python -m analysis.run` and automatically at the end of every
