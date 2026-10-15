@@ -24,7 +24,7 @@ def _gpio(**kw):
 
 def test_led_follows_contactor_and_limit():
     p = _gpio()
-    assert p._led.pin == 18 and p._led.value == 0.0          # off at start
+    assert p._led.pin == 17 and p._led.value == 0.0          # off at start
     p.close_contactor()
     assert p._led.value == 1.0 and p.read_power() == 7400.0   # full power
     p.set_power_limit(3700)

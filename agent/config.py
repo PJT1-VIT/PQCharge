@@ -192,10 +192,10 @@ class AgentConfig:
 
     power_backend: str = "sim"
     """Contract 5 backend: "sim" (SimulatedPower) or "gpio" (the Raspberry
-    Pi's GPIOPower: LED on GPIO18 + INA219). B-F8, 2026-10-10."""
+    Pi's GPIOPower: LED on GPIO17 + INA219). B-F8, 2026-10-10."""
 
-    led_pin: int = 18
-    """BCM pin of the LED for --power gpio (GPIO18 = hardware PWM)."""
+    led_pin: int = 17
+    """BCM pin of the LED for --power gpio (GPIO17 = physical pin 11, as wired)."""
 
     ina219_shunt_ohms: float = 0.1
     """Shunt resistor of the INA219 board for --power gpio."""
@@ -696,7 +696,7 @@ class AgentConfig:
             pq_key_dir=_pq_key_dir_from(getattr(ns, "pq_key_dir", DEFAULT_PQ_KEY_DIR)),
             max_power_w=ns.max_power_w,
             power_backend=getattr(ns, "power_backend", "sim"),
-            led_pin=getattr(ns, "led_pin", 18),
+            led_pin=getattr(ns, "led_pin", 17),
             ina219_shunt_ohms=getattr(ns, "ina219_shunt_ohms", 0.1),
             response_timeout_s=ns.response_timeout_s,
             connect_timeout_s=getattr(ns, "connect_timeout_s", 5.0),

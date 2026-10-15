@@ -6,7 +6,9 @@ Track B for the final two days; this file is the agreed exception inside
 agent/ (see the FINAL 2-DAY PLAN in the dev plans).
 
 THE HARDWARE (wired by the team, out of scope here)
-  - an LED with a 330 ohm resistor on GPIO18 (hardware PWM pin). It stands
+  - an LED with a 330 ohm resistor on GPIO17 (physical pin 11, as wired on
+    2026-10-15; software PWM via gpiozero -- GPIO18 = hardware PWM is
+    still available with --led-pin 18). It stands
     for the charger's output:
         contactor closed  -> LED on
         power limit       -> LED brightness (PWM duty = limit / max power)
@@ -54,8 +56,10 @@ from agent.simulated_power import DEFAULT_LIMIT_W, SimulatedPower
 
 LOG = logging.getLogger("agent.gpio_power")
 
-DEFAULT_LED_PIN = 18
-"""BCM numbering. GPIO18 = physical pin 12, a hardware-PWM pin."""
+DEFAULT_LED_PIN = 17
+"""BCM numbering. GPIO17 = physical pin 11, where the demo Pi's LED is wired
+(2026-10-15). Not a hardware-PWM pin: gpiozero dims it with software PWM,
+which is fine for an LED. Use --led-pin 18 (physical pin 12) for hardware PWM."""
 
 DEFAULT_SHUNT_OHMS = 0.1
 """The shunt resistor on the common INA219 breakout boards."""
